@@ -1,5 +1,13 @@
 # ThetisLink
 
+> **Current release: [v2.0.0](https://github.com/cjenschede/ThetisLink/releases/tag/v2.0.0)** —
+> single TCI WebSocket transport, wire-protocol VERSION = 2 (breaking change
+> from v0.x). Download `ThetisLink-2.0.0.zip` from the
+> [Releases page](https://github.com/cjenschede/ThetisLink/releases) — the ZIP
+> contains both Windows binaries, the Android APK, all six PDF manuals,
+> `LICENSE` and `SHA256SUMS.txt`. SBOM and third-party license artefacts are
+> attached to the same release as separate download assets.
+
 Remote control for ANAN 7000DLE SDR with Thetis. Audio, spectrum, PTT and full
 radio control over the network via TCI WebSocket.
 
