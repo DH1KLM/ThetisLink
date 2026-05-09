@@ -1,11 +1,19 @@
 name: guard
 
+# This workflow is the publication-gate for the public repo
+# (cjenschede/ThetisLink). It is intentionally a no-op on the
+# private dev repo (cjenschede/sdr-remote), which contains internal
+# audit/AI traces that the public sync explicitly strips out.
+# If the file is ever forked, it stays a no-op there too, only
+# becoming active again when the fork is published as ThetisLink.
+
 on:
   push:
   pull_request:
 
 jobs:
   forbidden-paths:
+    if: github.repository == 'cjenschede/ThetisLink'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,6 +38,7 @@ jobs:
           exit $fail
 
   forbidden-patterns:
+    if: github.repository == 'cjenschede/ThetisLink'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -69,6 +78,7 @@ jobs:
           exit $fail
 
   forbidden-commit-messages:
+    if: github.repository == 'cjenschede/ThetisLink'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -92,6 +102,7 @@ jobs:
           fi
 
   forbidden-tag-annotations:
+    if: github.repository == 'cjenschede/ThetisLink'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
