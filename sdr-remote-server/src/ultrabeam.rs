@@ -193,7 +193,12 @@ fn read_packet(port: &mut Box<dyn serialport::SerialPort>) -> Result<(u8, u8, Ve
                     if payload.len() < 3 {
                         return Err("Packet too short".to_string());
                     }
-                    // Verify: computing checksum over all bytes including CHK should yield 1
+                    // Verify: computing checksum over all bytes including CHK should yield 1.
+                    // Note: ~elke 84-148s stuurt de RCU-06 een unsolicited broadcast frame
+                    // (3 bursts) met een afwijkende checksum-init waardoor verify=0x81. Deze
+                    // worden door read_packet als "Checksum mismatch (got 129)" gerapporteerd
+                    // en in de poll-loop herstelt zich na ~30s. Geen functionele impact —
+                    // motor-positie wordt door de RCU-06 zelf bijgehouden.
                     let verify = compute_checksum(&payload);
                     if verify != 1 {
                         return Err(format!("Checksum mismatch (got {})", verify));
@@ -244,12 +249,17 @@ fn parse_status(data: &[u8]) -> Result<UltraBeamStatus, String> {
     s.frequency_khz = u16::from_le_bytes([data[3], data[4]]);
     s.band = data[5];
     s.direction = data[6];
+    // byte 7 bit 0 = "any motor moving" / busy. Field naam blijft `off_state`
+    // (al is dat misleidend) om de huidige API niet te breken; de UI gebruikt
+    // bit 0 van `motors_moving` voor per-motor weergave.
     let flags = data[7];
     s.off_state = (flags & 0x01) != 0;
-    s.motors_moving = data[8];
-    s.freq_min_mhz = data[9];
+    // byte 8 is een controller-state byte (geen motion-info); momenteel niet
+    // gebruikt door de UI. byte 9 is de echte per-motor moving bitfield —
+    // bit 0 = motor 1, bit 1 = motor 2 (gevalideerd via diagnostic build 2).
+    s.motors_moving = data[9];
     s.freq_max_mhz = data[10];
-    // data[11] may be additional flags or padding
+    // data[11..] = trailing bytes, niet geïnterpreteerd
     Ok(s)
 }
 
@@ -434,7 +444,17 @@ fn ultrabeam_thread(
                 match parse_status(&data) {
                     Ok(parsed) => {
                         let mut s = status.lock().unwrap();
+                        // Behoud elements_mm en motor_progress over status-polls heen —
+                        // die worden door aparte CMD_READ_ELEMENTS / CMD_MOTOR_PROGRESS
+                        // commando's gevuld en moeten niet door elke status-poll naar 0
+                        // gezet worden.
+                        let preserved_elements = s.elements_mm;
+                        let preserved_motor_dist = s.motor_distance_mm;
+                        let preserved_motor_compl = s.motor_completion;
                         *s = parsed;
+                        s.elements_mm = preserved_elements;
+                        s.motor_distance_mm = preserved_motor_dist;
+                        s.motor_completion = preserved_motor_compl;
                         s.connected = true;
                         consecutive_failures = 0;
                     }
@@ -455,7 +475,8 @@ fn ultrabeam_thread(
         }
         seq = seq.wrapping_add(1);
 
-        // If motors are moving, also poll motor progress
+        // Per-motor moving bitfield (motors_moving) bevat bit 0 = motor 1, bit 1 =
+        // motor 2. Beide nul = niemand beweegt; geen progress-poll nodig.
         {
             let moving = status.lock().unwrap().motors_moving;
             if moving != 0 {
@@ -469,7 +490,9 @@ fn ultrabeam_thread(
                             s.motor_completion = compl;
                         }
                     }
-                    Err(_) => {}
+                    Err(e) => {
+                        debug!("UltraBeam motor_progress query failed: {}", e);
+                    }
                 }
                 seq = seq.wrapping_add(1);
             }

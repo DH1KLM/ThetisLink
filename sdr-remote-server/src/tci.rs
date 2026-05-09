@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #![allow(dead_code)]
+
 use std::collections::{HashSet, VecDeque};
 use std::time::Instant;
 
 use futures_util::{SinkExt, StreamExt};
-use log::{info, warn};
+use log::{debug, info, warn};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -51,6 +52,11 @@ pub struct TciConnection {
     pub filter_low_hz: i32,
     pub filter_high_hz: i32,
     pub ctun: bool,
+    /// Per-RX CTUN state cache, gevuld via TCI `rx_ctun_ex` push notifications.
+    /// `ctun` (boven) is voor RX1 (legacy field-naam); `ctun_rx2` voor RX2.
+    /// TL2-1 ctun-auto-recenter gebruikt deze om bij VFO-event te checken of CTUN AAN
+    /// is — zo niet, eerst ZZCN1/ZZCO1 forceren (per owner-keuze 2026-05-08).
+    pub ctun_rx2: bool,
     /// DDS center frequency per receiver (from TCI DDS notification)
     pub dds_freq: [u64; 2],
     // RX2 / VFO-B state
@@ -154,11 +160,21 @@ pub struct TciConnection {
     // --- Extended controls (TCI _ex commands) ---
     pub step_att_rx1: i32,
     pub step_att_rx2: i32,
+    /// Stock v2.10.3.14: rx_step_att_enabled_ex per receiver
+    pub step_att_enabled_rx1: bool,
+    pub step_att_enabled_rx2: bool,
+    /// Stock v2.10.3.14: rx_preamp_att_ex (signed; negative = preamp gain)
+    pub preamp_att_rx1: i32,
+    pub preamp_att_rx2: i32,
+    /// Stock v2.10.3.14: tx_filter_band_ex (Hz)
+    pub tx_filter_low_hz: i32,
+    pub tx_filter_high_hz: i32,
     pub diversity_enabled: bool,
     pub diversity_ref: u8,
     pub diversity_source: u8,
     pub diversity_gain_rx1: u16,
     pub diversity_gain_rx2: u16,
+    pub diversity_gain_multi: u16,  // multi × 100 (range 100..1000 = 1.00..10.00); TL2-1 fork-only
     pub diversity_phase: i32,
 
     // --- DDC sample rate ---
@@ -169,6 +185,40 @@ pub struct TciConnection {
     // --- Server capabilities ---
     /// Feature flags received from Thetis via tci_caps_ex
     pub server_caps: HashSet<String>,
+
+    /// Last poll for filter preset index (ZZFI/ZZFJ via run_cat_ex)
+    /// — stock v2.10.3.14 has no native push for filter preset index.
+    last_filter_preset_poll: Instant,
+
+    /// TL2-1 ctun-auto-recenter: per-RX trigger state-machines + flag-clear timers.
+    /// Cap-gated via `auto_recenter_ex` (advertised by Thetis fork only when the
+    /// extensions vink is on). Serialized via &mut self / single async task —
+    /// no separate mutex needed.
+    pub ctun_recenter: crate::ctun_recenter::CtunRecenterState,
+
+    /// TL2-1 ctun-auto-recenter: track previous PTT state for off-edge detection
+    /// (PTT-off forceert eval). Mirror van self.tx_active.
+    prev_tx_active_for_ctun: bool,
+
+    /// TL2-1 ctun-auto-recenter: previous VFO per RX for band-switch heuristiek
+    /// (VFO-jump > DDC-bandwidth → band-switch detected).
+    prev_vfo_a_for_ctun: u64,
+    prev_vfo_b_for_ctun: u64,
+
+    /// TL2-1 ctun-auto-recenter: cached effective zoom (MIN-aggregatie over alle
+    /// verbonden clients per RX). Network.rs updatet deze waarden bij elke
+    /// client-zoom-change/connect/disconnect. tci.rs gebruikt ze in trigger-eval
+    /// bij vfo-events. None = geen clients met spectrum_enabled voor die RX.
+    pub effective_zoom_rx1_cache: Option<f32>,
+    pub effective_zoom_rx2_cache: Option<f32>,
+
+    /// TL2-1 ctun-auto-recenter: Thetis-originated TX state uit
+    /// `TciNotification::Trx`. `self.tx_active` wordt door PttController gezet
+    /// (TL-server PTT-pad). Bij Thetis-zelf, footswitch, etc. update Thetis ons via
+    /// TRX-notif maar PttController ziet dat niet → ctun trigger zou recenter-burst
+    /// kunnen starten tijdens TX. Deze flag mirrort het TRX-event zodat de
+    /// trigger-eval kan kiezen `tx_active OR thetis_tx_active`.
+    pub thetis_tx_active: bool,
 }
 
 /// Parsed TCI notifications from the reader task
@@ -176,13 +226,22 @@ pub struct TciConnection {
 
 impl TciConnection {
     pub fn new(addr: Option<&str>) -> Self {
+        // Cold-boot defensiveness: on Windows, Instant::now() reflects QPC ticks
+        // since system boot. If the server starts within ~60s of cold-boot, the
+        // raw `Instant::now() - Duration::from_secs(N)` operator panics with
+        // "overflow when subtracting duration from instant" (memory:
+        // project_tl2_coldboot_bind_fail.md, fix verified 2026-05-05). Use
+        // checked_sub with Instant::now() fallback to keep the field safely-set
+        // before any real timing-comparison happens at runtime.
         Self {
             addr: addr.unwrap_or(DEFAULT_TCI_ADDR).to_string(),
             cmd_tx: None,
             bin_tx: None,
             notify_rx: None,
             connected: false,
-            last_connect_attempt: Instant::now() - std::time::Duration::from_secs(10),
+            last_connect_attempt: Instant::now()
+                .checked_sub(std::time::Duration::from_secs(10))
+                .unwrap_or_else(Instant::now),
             vfo_a_freq: 0,
             vfo_a_mode: 0,
             smeter_window: VecDeque::with_capacity(4),
@@ -199,6 +258,7 @@ impl TciConnection {
             filter_low_hz: 0,
             filter_high_hz: 0,
             ctun: false,
+            ctun_rx2: false,
             dds_freq: [0; 2],
             vfo_b_freq: 0,
             vfo_b_mode: 0,
@@ -267,6 +327,12 @@ impl TciConnection {
             iq_sample_rate: 384_000,
             step_att_rx1: 0,
             step_att_rx2: 0,
+            step_att_enabled_rx1: false,
+            step_att_enabled_rx2: false,
+            preamp_att_rx1: 0,
+            preamp_att_rx2: 0,
+            tx_filter_low_hz: 0,
+            tx_filter_high_hz: 0,
             ddc_sample_rate_rx1: 0,
             ddc_sample_rate_rx2: 0,
             ddc_sample_rates: Vec::new(),
@@ -275,8 +341,19 @@ impl TciConnection {
             diversity_source: 0,
             diversity_gain_rx1: 1000,
             diversity_gain_rx2: 1000,
+            diversity_gain_multi: 100,  // 1.00x default (matches DiversityForm spinner default)
             diversity_phase: 0,
             server_caps: HashSet::new(),
+            last_filter_preset_poll: Instant::now()
+                .checked_sub(std::time::Duration::from_secs(60))
+                .unwrap_or_else(Instant::now),
+            ctun_recenter: crate::ctun_recenter::CtunRecenterState::new(),
+            prev_tx_active_for_ctun: false,
+            prev_vfo_a_for_ctun: 0,
+            prev_vfo_b_for_ctun: 0,
+            effective_zoom_rx1_cache: None,
+            effective_zoom_rx2_cache: None,
+            thetis_tx_active: false,
         }
     }
 
@@ -348,11 +425,14 @@ impl TciConnection {
             return; // Not connected, skip (connection managed by background task)
         }
         if let Some(ref tx) = self.cmd_tx {
-            // Log non-trivial commands (skip high-frequency sensor/audio cmds)
+            // Log non-trivial commands (skip high-frequency sensor/audio cmds
+            // and the 2-second ZZFI/ZZFJ filter-preset polls which would
+            // otherwise dominate the log).
             if !cmd.starts_with("AUDIO") && !cmd.starts_with("IQ")
                 && !cmd.starts_with("RX_SENSORS") && !cmd.starts_with("TX_SENSORS")
-                && !cmd.starts_with("VOLUME:") && !cmd.starts_with("tx_profiles") {
-                info!("TCI send: {}", cmd.trim_end_matches(';'));
+                && !cmd.starts_with("VOLUME:") && !cmd.starts_with("tx_profiles")
+                && !cmd.starts_with("run_cat_ex:ZZFI") && !cmd.starts_with("run_cat_ex:ZZFJ") {
+                debug!("TCI send: {}", cmd.trim_end_matches(';'));
             }
             if tx.try_send(cmd.to_string()).is_err() {
                 warn!("TCI cmd channel full or closed, disconnecting");
@@ -378,6 +458,185 @@ impl TciConnection {
         for notif in notifications {
             self.handle_notification(notif).await;
         }
+
+        // Filter preset index (ZZFI/ZZFJ) is not pushed by stock v2.10.3.14.
+        // Poll every 2 s via run_cat_ex over TCI — replaces the legacy aux CAT poll.
+        // Skip when fork advertises rx_filter_preset_ex: native push covers the same data.
+        if self.power_on
+            && !self.has_cap("rx_filter_preset_ex")
+            && self.last_filter_preset_poll.elapsed() >= std::time::Duration::from_secs(2)
+        {
+            self.last_filter_preset_poll = Instant::now();
+            self.run_cat("ZZFI").await;
+            self.run_cat("ZZFJ").await;
+        }
+
+        // TL2-1 ctun-auto-recenter: tick flag-clear timers. Cheap, runs every poll.
+        self.ctun_recenter.tick_flag_clear(Instant::now());
+
+        // TL2-1 ctun-auto-recenter: PTT-off transition forceert eval.
+        // Anders moet user knoppen voor recenter na lange TX-periode met VFO buiten zone.
+        if self.detect_ptt_off_transition() {
+            log::debug!("TCI: ctun PTT-off transition — forcing trigger-eval");
+            let zr1 = self.effective_zoom_rx1_cache;
+            let zr2 = self.effective_zoom_rx2_cache;
+            self.trigger_eval_and_act_rx1(zr1).await;
+            self.trigger_eval_and_act_rx2(zr2).await;
+        }
+    }
+
+    // ===== TL2-1 ctun-auto-recenter: trigger evaluation + actie =====
+
+    /// Force CTUN-AAN voor RX1 + RX2 indien fork de cap adverteert. Idempotent.
+    /// Aangeroepen bij init (Ready) en bij band-switch detection.
+    pub async fn force_ctun_aan_if_capable(&mut self) {
+        if !self.has_cap("auto_recenter_ex") {
+            return;
+        }
+        if !self.ctun_recenter.fork_active_logged {
+            info!("TCI: ThetisLink ctun-extension active — Thetis recenter logic disabled (cap auto_recenter_ex)");
+            self.ctun_recenter.fork_active_logged = true;
+        }
+        self.run_cat("ZZCN1").await;  // CTUN AAN voor RX1
+        self.run_cat("ZZCO1").await;  // CTUN AAN voor RX2 (ZZCO, NIET ZZCP — ZZCP is compander!)
+    }
+
+    /// Lazy-ensure: bij VFO-event op een specifieke RX, check of CTUN AAN staat.
+    /// Zo niet (owner heeft handmatig CTUN-uit gezet of Thetis-init had het uit):
+    /// stuur ZZCN1 (RX1) of ZZCO1 (RX2) en update cache. Per owner-keuze 2026-05-08.
+    /// Idempotent: bij CTUN al AAN → no-op. Cap-gated.
+    async fn ensure_ctun_aan_for_rx(&mut self, rx_index: u8) {
+        if !self.has_cap("auto_recenter_ex") {
+            return;
+        }
+        match rx_index {
+            0 if !self.ctun => {
+                debug!("TCI: ctun rx=0 was off — forcing ON before VFO-event eval");
+                self.run_cat("ZZCN1").await;
+                self.ctun = true; // optimistic; rx_ctun_ex push bevestigt later
+            }
+            1 if !self.ctun_rx2 => {
+                debug!("TCI: ctun rx=1 was off — forcing ON before VFO-event eval");
+                self.run_cat("ZZCO1").await;
+                self.ctun_rx2 = true;
+            }
+            _ => {}
+        }
+    }
+
+    /// Trigger-eval + recenter-actie voor RX1. Aangeroepen vanuit network.rs na elke
+    /// vfo-event of zoom-change. `effective_zoom` is None bij 0 spectrum-clients.
+    /// Combineer TL-server PTT met Thetis-originated TRX zodat externe PTT
+    /// (footswitch, VOX, manual TX-button) ook recenter blokkeert.
+    pub async fn trigger_eval_and_act_rx1(&mut self, effective_zoom: Option<f32>) {
+        let any_tx = self.tx_active || self.thetis_tx_active;
+        let result = crate::ctun_recenter::evaluate_trigger(
+            0,
+            self.has_cap("auto_recenter_ex"),
+            effective_zoom,
+            self.vfo_a_freq,
+            self.dds_freq[0],
+            self.ddc_sample_rate_rx1,
+            any_tx,
+            &self.ctun_recenter.rx1,
+        );
+        self.ctun_recenter.rx1.last_eval = Some(result);
+        if result.decision == crate::ctun_recenter::TriggerDecision::Trigger {
+            self.execute_recenter_rx1().await;
+        }
+    }
+
+    /// Trigger-eval + recenter-actie voor RX2.
+    pub async fn trigger_eval_and_act_rx2(&mut self, effective_zoom: Option<f32>) {
+        let any_tx = self.tx_active || self.thetis_tx_active;
+        let result = crate::ctun_recenter::evaluate_trigger(
+            1,
+            self.has_cap("auto_recenter_ex"),
+            effective_zoom,
+            self.vfo_b_freq,
+            self.dds_freq[1],
+            self.ddc_sample_rate_rx2,
+            any_tx,
+            &self.ctun_recenter.rx2,
+        );
+        self.ctun_recenter.rx2.last_eval = Some(result);
+        if result.decision == crate::ctun_recenter::TriggerDecision::Trigger {
+            self.execute_recenter_rx2().await;
+        }
+    }
+
+    /// Recenter-burst RX1: ZZCN0 → 50ms → ZZCN1. Sets per-RX flag voor 200ms.
+    /// Note: PTT-on tijdens deze burst voltooit binnen flag-window (geen
+    /// abort-pad). Inconsistente CTUN-state tussen ZZCN0 en ZZCN1 is risicovoller
+    /// dan een korte ZZCN1-tijdens-TX-glitch. `&mut self`-borrow + tokio::sleep
+    /// garandeert dat geen andere recenter-actie de burst kan onderbreken.
+    async fn execute_recenter_rx1(&mut self) {
+        self.ctun_recenter.rx1.recentering = true;
+        self.ctun_recenter.rx1.flag_clear_at =
+            Some(Instant::now() + std::time::Duration::from_millis(200));
+        debug!(
+            "TCI: ctun recenter rx=0 START vfo={} → ddc_center will follow",
+            self.vfo_a_freq
+        );
+        self.run_cat("ZZCN0").await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        self.run_cat("ZZCN1").await;
+        debug!("TCI: ctun recenter rx=0 END");
+    }
+
+    /// Recenter-burst RX2: ZZCO0 → 50ms → ZZCO1.
+    /// **Belangrijk:** RX2-CTUN gebruikt **ZZCO**, niet ZZCP. ZZCP = compander
+    /// (audio); ZZCO = CTUN RX2. Eerdere build 6 had ZZCP en toggelde per ongeluk
+    /// de compander tijdens elke recenter.
+    async fn execute_recenter_rx2(&mut self) {
+        self.ctun_recenter.rx2.recentering = true;
+        self.ctun_recenter.rx2.flag_clear_at =
+            Some(Instant::now() + std::time::Duration::from_millis(200));
+        debug!(
+            "TCI: ctun recenter rx=1 START vfo={} → ddc_center will follow",
+            self.vfo_b_freq
+        );
+        self.run_cat("ZZCO0").await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        self.run_cat("ZZCO1").await;
+        debug!("TCI: ctun recenter rx=1 END");
+    }
+
+    /// Band-switch heuristiek: VFO-jump > DDC-bandwidth → owner heeft band-switch
+    /// gedaan. Forceer CTUN-AAN opnieuw (Thetis kan CTUN-state per band onthouden).
+    /// Aangeroepen vanuit network.rs na vfo-event-update.
+    pub async fn detect_band_switch_and_reforce(&mut self) {
+        if !self.has_cap("auto_recenter_ex") {
+            self.prev_vfo_a_for_ctun = self.vfo_a_freq;
+            self.prev_vfo_b_for_ctun = self.vfo_b_freq;
+            return;
+        }
+        let bw_rx1 = self.ddc_sample_rate_rx1 as u64;
+        let bw_rx2 = self.ddc_sample_rate_rx2 as u64;
+        let jump_a = (self.vfo_a_freq as i128 - self.prev_vfo_a_for_ctun as i128).unsigned_abs() as u64;
+        let jump_b = (self.vfo_b_freq as i128 - self.prev_vfo_b_for_ctun as i128).unsigned_abs() as u64;
+        let band_switch = (bw_rx1 > 0 && jump_a > bw_rx1 && self.prev_vfo_a_for_ctun > 0)
+            || (bw_rx2 > 0 && jump_b > bw_rx2 && self.prev_vfo_b_for_ctun > 0);
+        if band_switch {
+            debug!(
+                "TCI: ctun band-switch detected (vfo_a jump={} > bw_rx1={} OR vfo_b jump={} > bw_rx2={}) — reforcing CTUN-AAN",
+                jump_a, bw_rx1, jump_b, bw_rx2
+            );
+            self.force_ctun_aan_if_capable().await;
+        }
+        self.prev_vfo_a_for_ctun = self.vfo_a_freq;
+        self.prev_vfo_b_for_ctun = self.vfo_b_freq;
+    }
+
+    /// PTT-off transition detectie: trigger forceert eval.
+    /// Detecteer combined `tx_active OR thetis_tx_active` om óók externe-PTT-off
+    /// (footswitch, VOX, Thetis manual TX) door te laten.
+    /// Returns true als PTT-off detectie zojuist plaatsvond.
+    pub fn detect_ptt_off_transition(&mut self) -> bool {
+        let any_tx_now = self.tx_active || self.thetis_tx_active;
+        let was_tx = self.prev_tx_active_for_ctun;
+        self.prev_tx_active_for_ctun = any_tx_now;
+        was_tx && !any_tx_now
     }
 
     /// Process a single TCI notification
@@ -391,6 +650,9 @@ impl TciConnection {
                 info!("TCI: READY received, sending init commands");
                 self.power_on = true;
                 self.send_init_commands().await;
+                // TL2-1 ctun-auto-recenter: forceer CTUN-AAN bij init wanneer cap aanwezig.
+                // Idempotent — niet schadelijk om ook te runnen wanneer cap absent.
+                self.force_ctun_aan_if_capable().await;
             }
             TciNotification::Vfo { receiver, channel, freq } => {
                 match (receiver, channel) {
@@ -398,12 +660,26 @@ impl TciConnection {
                         if freq != self.vfo_a_freq {
                             log::debug!("TCI VFO A: {} Hz", freq);
                             self.vfo_a_freq = freq;
+                            // TL2-1 ctun-auto-recenter: bij VFO-event eerst CTUN-aan
+                            // garanderen (per owner-keuze 2026-05-08); daarna band-switch
+                            // detect en trigger-eval. Dit lost het edge-geval op waar
+                            // owner CTUN-uit klikt en daarna gaat tunen — feature blijft
+                            // werken zonder dat owner naar de vink-uit-checkbox hoeft.
+                            self.ensure_ctun_aan_for_rx(0).await;
+                            self.detect_band_switch_and_reforce().await;
+                            let z = self.effective_zoom_rx1_cache;
+                            self.trigger_eval_and_act_rx1(z).await;
                         }
                     }
                     (0, 1) | (1, 0) => {
                         if freq != self.vfo_b_freq {
                             log::debug!("TCI VFO B: {} Hz", freq);
                             self.vfo_b_freq = freq;
+                            // Idem RX2: ensure CTUN aan, daarna band-switch + trigger-eval.
+                            self.ensure_ctun_aan_for_rx(1).await;
+                            self.detect_band_switch_and_reforce().await;
+                            let z = self.effective_zoom_rx2_cache;
+                            self.trigger_eval_and_act_rx2(z).await;
                         }
                     }
                     _ => {}
@@ -436,7 +712,13 @@ impl TciConnection {
             }
             TciNotification::Trx { receiver: _, active } => {
                 // Note: we don't update tx_active here — PTT controller manages that
-                // But we log it for debugging
+                // But we log it for debugging.
+                // TL2-1 ctun-auto-recenter: mirror TRX-state in separate
+                // `thetis_tx_active` so external-PTT (Thetis-self, footswitch,
+                // VOX, etc.) ook ctun-recenter defer veroorzaakt.
+                if active != self.thetis_tx_active {
+                    self.thetis_tx_active = active;
+                }
                 if active != self.tx_active {
                     info!("TCI TRX: {}", if active { "TX" } else { "RX" });
                 }
@@ -507,22 +789,10 @@ impl TciConnection {
                 } else if receiver == 1 {
                     self.rx2_af_gain = pct;
                 }
-                info!("TCI: RX{} volume = {:.1} dB ({}%)", receiver + 1, db, pct);
-            }
-            TciNotification::DdcSampleRateEx { receiver, rate } => {
-                let old = if receiver == 0 { self.ddc_sample_rate_rx1 } else { self.ddc_sample_rate_rx2 };
-                if receiver == 0 { self.ddc_sample_rate_rx1 = rate; }
-                else { self.ddc_sample_rate_rx2 = rate; }
-                if old != rate {
-                    info!("TCI: RX{} DDC sample rate = {}kHz", receiver + 1, rate / 1000);
-                }
-            }
-            TciNotification::DdcSampleRatesEx { rates } => {
-                self.ddc_sample_rates = rates;
-                info!("TCI: available DDC rates = {:?}", self.ddc_sample_rates);
+                debug!("TCI: RX{} volume = {:.1} dB ({}%)", receiver + 1, db, pct);
             }
             TciNotification::DiversityAutonullProgress { round, total, phase, gain_db, smeter } => {
-                info!("TCI: Auto-null progress {}/{}: phase={:.1}° gain={:.1}dB smeter={:.1}dBm", round, total, phase, gain_db, smeter);
+                debug!("TCI: Auto-null progress {}/{}: phase={:.1}° gain={:.1}dB smeter={:.1}dBm", round, total, phase, gain_db, smeter);
                 self.diversity_auto_progress = Some((round, total, phase, gain_db, smeter));
                 // Update phase from progress; gain is updated via diversity_gain_ex push
                 self.diversity_phase = (phase * 100.0) as i32;
@@ -545,18 +815,18 @@ impl TciConnection {
             TciNotification::AgcAutoEx { receiver, enabled } => {
                 if receiver == 0 { self.agc_auto_rx1 = enabled; }
                 else { self.agc_auto_rx2 = enabled; }
-                info!("TCI: RX{} AGC Auto = {}", receiver + 1, enabled);
+                debug!("TCI: RX{} AGC Auto = {}", receiver + 1, enabled);
             }
             TciNotification::RxAnfEnable { receiver, enabled } => {
                 if receiver == 0 { self.anf_on = enabled; }
                 else { self.rx2_anf_on = enabled; }
-                info!("TCI: RX{} ANF = {}", receiver + 1, enabled);
+                debug!("TCI: RX{} ANF = {}", receiver + 1, enabled);
             }
             TciNotification::RxNrEnable { receiver, enabled, level } => {
                 let nr = if enabled { level.max(1) } else { 0 };
                 if receiver == 0 { self.nr_level = nr; }
                 else { self.rx2_nr_level = nr; }
-                info!("TCI: RX{} NR = {} (level {})", receiver + 1, enabled, nr);
+                debug!("TCI: RX{} NR = {} (level {})", receiver + 1, enabled, nr);
             }
             TciNotification::TxChrono { .. } => {
                 // Handled directly in reader task for low latency
@@ -572,7 +842,7 @@ impl TciConnection {
             TciNotification::RxChannelEnable { .. } => {}
             TciNotification::MonEnable { enabled } => {
                 if enabled != self.mon_on {
-                    info!("TCI: MON {}", if enabled { "ON" } else { "OFF" });
+                    debug!("TCI: MON {}", if enabled { "ON" } else { "OFF" });
                     self.mon_on = enabled;
                 }
             }
@@ -611,65 +881,65 @@ impl TciConnection {
             TciNotification::NbEnable { .. } => {}
             TciNotification::CwKeyerSpeed { speed } => { self.cw_keyer_speed = speed; }
             TciNotification::VfoLock { enabled } => {
-                info!("TCI notify: vfo_lock A = {}", enabled);
+                debug!("TCI notify: vfo_lock A = {}", enabled);
                 self.vfo_lock = enabled;
             }
             TciNotification::VfoLockB { enabled } => {
-                info!("TCI notify: vfo_lock B = {}", enabled);
+                debug!("TCI notify: vfo_lock B = {}", enabled);
                 self.rx2_vfo_lock = enabled;
             }
             TciNotification::BinEnable { receiver: 0, enabled } => { self.binaural = enabled; }
             TciNotification::BinEnable { receiver: 1, enabled } => { self.rx2_binaural = enabled; }
             TciNotification::BinEnable { .. } => {}
             TciNotification::ApfEnable { receiver: 0, enabled } => {
-                info!("TCI notify: apf_enable rx1 = {}", enabled);
+                debug!("TCI notify: apf_enable rx1 = {}", enabled);
                 self.apf_enable = enabled;
             }
             TciNotification::ApfEnable { receiver: 1, enabled } => {
-                info!("TCI notify: apf_enable rx2 = {}", enabled);
+                debug!("TCI notify: apf_enable rx2 = {}", enabled);
                 self.rx2_apf_enable = enabled;
             }
             TciNotification::ApfEnable { .. } => {}
             TciNotification::Mute { enabled } => {
-                info!("TCI notify: mute = {}", enabled);
+                debug!("TCI notify: mute = {}", enabled);
                 self.mute = enabled;
             }
             TciNotification::RxMute { receiver: 0, enabled } => {
-                info!("TCI notify: rx_mute rx1 = {}", enabled);
+                debug!("TCI notify: rx_mute rx1 = {}", enabled);
                 self.rx_mute = enabled;
             }
             TciNotification::RxMute { .. } => {}
             TciNotification::NfEnable { receiver: 0, enabled } => {
-                info!("TCI notify: nf_enable rx1 = {}", enabled);
+                debug!("TCI notify: nf_enable rx1 = {}", enabled);
                 self.nf_enable = enabled;
             }
             TciNotification::NfEnable { receiver: 1, enabled } => {
-                info!("TCI notify: nf_enable rx2 = {}", enabled);
+                debug!("TCI notify: nf_enable rx2 = {}", enabled);
                 self.rx2_nf_enable = enabled;
             }
             TciNotification::NfEnable { .. } => {}
             TciNotification::RxBalance { receiver: 0, channel: 0, value } => {
-                info!("TCI notify: rx_balance = {}", value);
+                debug!("TCI notify: rx_balance = {}", value);
                 self.rx_balance = value.clamp(-40, 40) as i8;
             }
             TciNotification::RxBalance { .. } => {}
             TciNotification::Tune { receiver: 0, active } => {
                 if active != self.tune_active {
-                    info!("TCI: TUNE {}", if active { "ON" } else { "OFF" });
+                    debug!("TCI: TUNE {}", if active { "ON" } else { "OFF" });
                     self.tune_active = active;
                 }
             }
             TciNotification::Tune { .. } => {}
             TciNotification::TuneDrive { receiver: 0, power } => {
                 if power != self.tune_drive {
-                    info!("TCI: Tune drive = {}%", power);
+                    debug!("TCI: Tune drive = {}%", power);
                     self.tune_drive = power;
                 }
             }
             TciNotification::TuneDrive { .. } => {}
             TciNotification::MonVolume { db } => {
                 if db != self.mon_volume {
-                    info!("TCI: Mon volume = {} dB", db);
+                    debug!("TCI: Mon volume = {} dB", db);
                     self.mon_volume = db;
                 }
             }
@@ -679,7 +949,7 @@ impl TciConnection {
                     || (xvtr_gain - self.xvtr_gain_offset[idx]).abs() > 0.01
                     || (six_m_gain - self.six_m_gain_offset[idx]).abs() > 0.01;
                 if changed {
-                    info!("TCI: calibration_ex rx{} meter_cal={:.2} xvtr={:.1} 6m={:.1}",
+                    debug!("TCI: calibration_ex rx{} meter_cal={:.2} xvtr={:.1} 6m={:.1}",
                         receiver, meter_cal, xvtr_gain, six_m_gain);
                     self.meter_cal_offset[idx] = meter_cal;
                     self.xvtr_gain_offset[idx] = xvtr_gain;
@@ -695,7 +965,7 @@ impl TciConnection {
                         .position(|n| n == &self.tx_profile_name)
                         .unwrap_or(0) as u8;
                     self.tx_profile = idx;
-                    info!("TCI: TX profile index recalculated: \"{}\" = {}", self.tx_profile_name, idx);
+                    debug!("TCI: TX profile index recalculated: \"{}\" = {}", self.tx_profile_name, idx);
                 }
             }
             TciNotification::TxProfileEx { name } => {
@@ -710,7 +980,13 @@ impl TciConnection {
             }
             // ── ThetisLink extended controls (state tracking) ─────────────
             TciNotification::CtunEx { receiver, enabled } => {
-                if receiver == 0 { self.ctun = enabled; }
+                // Per-RX cache update — gebruikt door ctun-auto-recenter om bij VFO-event
+                // te checken of CTUN AAN is, zo niet eerst forceren.
+                match receiver {
+                    0 => self.ctun = enabled,
+                    1 => self.ctun_rx2 = enabled,
+                    _ => {}
+                }
                 info!("TCI: CTUN RX{} = {}", receiver + 1, enabled);
             }
             TciNotification::VfoSyncEx { enabled } => {
@@ -721,10 +997,87 @@ impl TciConnection {
                 self.fm_deviation = if hz >= 5000 { 1 } else { 0 };
                 log::debug!("TCI: FM deviation RX{} = {} Hz", receiver + 1, hz);
             }
-            TciNotification::StepAttenuatorEx { receiver, db } => {
+            // Stock v2.10.3.14+: iq_samplerate is the global IQ stream / DDC sample rate (Hz).
+            // Primary source for DDC rate state. Both RX1 and RX2 receive the same value
+            // because stock TCI exposes one global rate (DDC protocol 2 hardware does support
+            // per-RX rates — that comes back via TL2-x fork extensions in Phase 3).
+            TciNotification::IqSamplerate { rate } => {
+                // Defensief: stock .14/.15 stuurt nooit rate=0, maar future-Thetis
+                // builds of corrupte push zouden state op 0 zetten en client-UI
+                // (`if rate > 0`) zou de DDC-rate-knop verbergen. Skip 0.
+                if rate == 0 {
+                    log::debug!("TCI: iq_samplerate = 0 Hz, skipped (preserving last known rate)");
+                    return;
+                }
+                if self.ddc_sample_rate_rx1 != rate || self.ddc_sample_rate_rx2 != rate {
+                    info!("TCI: iq_samplerate = {} Hz", rate);
+                }
+                self.ddc_sample_rate_rx1 = rate;
+                self.ddc_sample_rate_rx2 = rate;
+            }
+            // Stock v2.10.3.14+: if_limits gives the IF range; sample rate ≈ high - low.
+            // Used as FALLBACK only — applied when iq_samplerate has not yet populated state.
+            TciNotification::IfLimits { low, high } => {
+                let derived = high.saturating_sub(low).max(0) as u32;
+                if self.ddc_sample_rate_rx1 == 0 && derived > 0 {
+                    info!("TCI: if_limits fallback → ddc_sample_rate = {} Hz (low={}, high={})",
+                        derived, low, high);
+                    self.ddc_sample_rate_rx1 = derived;
+                    self.ddc_sample_rate_rx2 = derived;
+                } else {
+                    log::debug!("TCI: if_limits = {} .. {} Hz (iq_samplerate already set)", low, high);
+                }
+            }
+            TciNotification::RxStepAttEx { receiver, db } => {
+                let db = db as i32;
                 if receiver == 0 { self.step_att_rx1 = db; }
                 else { self.step_att_rx2 = db; }
-                info!("TCI: Step ATT RX{} = {} dB", receiver + 1, db);
+                debug!("TCI: rx_step_att_ex RX{} = {} dB", receiver + 1, db);
+            }
+            TciNotification::RxStepAttEnabledEx { receiver, enabled } => {
+                if receiver == 0 { self.step_att_enabled_rx1 = enabled; }
+                else { self.step_att_enabled_rx2 = enabled; }
+                debug!("TCI: rx_step_att_enabled_ex RX{} = {}", receiver + 1, enabled);
+            }
+            TciNotification::RxPreampAttEx { receiver, db } => {
+                if receiver == 0 { self.preamp_att_rx1 = db; }
+                else { self.preamp_att_rx2 = db; }
+                debug!("TCI: rx_preamp_att_ex RX{} = {} dB (signed)", receiver + 1, db);
+            }
+            TciNotification::TxFilterBandEx { low, high } => {
+                self.tx_filter_low_hz = low;
+                self.tx_filter_high_hz = high;
+                log::debug!("TCI: tx_filter_band_ex = {} .. {} Hz", low, high);
+            }
+            TciNotification::TxFrequencyEx { freq, band, rx2_enabled, tx_vfob } => {
+                log::debug!("TCI: tx_frequency_ex = {} Hz (band={}, rx2={}, tx_vfob={})",
+                    freq, band, rx2_enabled, tx_vfob);
+            }
+            TciNotification::RunCatExResponse { cat_cmd, response } => {
+                let cmd_upper = cat_cmd.to_uppercase();
+                let resp_upper = response.to_uppercase();
+                // Filter preset index responses (ZZFI##/ZZFJ##) replace the aux CAT poll.
+                if cmd_upper.starts_with("ZZFI") {
+                    if let Some(idx_str) = resp_upper.strip_prefix("ZZFI") {
+                        if let Ok(idx) = idx_str.parse::<u8>() {
+                            if idx != self.filter_index {
+                                info!("TCI: filter preset RX1 = {} (was {})", idx, self.filter_index);
+                                self.filter_index = idx;
+                            }
+                        }
+                    }
+                } else if cmd_upper.starts_with("ZZFJ") {
+                    if let Some(idx_str) = resp_upper.strip_prefix("ZZFJ") {
+                        if let Ok(idx) = idx_str.parse::<u8>() {
+                            if idx != self.filter_rx2_index {
+                                info!("TCI: filter preset RX2 = {} (was {})", idx, self.filter_rx2_index);
+                                self.filter_rx2_index = idx;
+                            }
+                        }
+                    }
+                } else {
+                    log::debug!("TCI: run_cat_ex({}) -> {}", cat_cmd, response);
+                }
             }
             TciNotification::DiversityEnableEx { enabled } => {
                 self.diversity_enabled = enabled;
@@ -742,6 +1095,18 @@ impl TciConnection {
                 if receiver == 0 { self.diversity_gain_rx1 = gain; }
                 else { self.diversity_gain_rx2 = gain; }
                 info!("TCI: Diversity gain RX{} = {}", receiver + 1, gain);
+            }
+            TciNotification::DiversityGainMultiEx { multi } => {
+                self.diversity_gain_multi = multi;
+                info!("TCI: Diversity GainMulti = {} (= {:.2}x)", multi, (multi as f32) / 100.0);
+            }
+            TciNotification::DdcSampleRateEx { receiver, rate_hz } => {
+                // TL2-1 fork per-RX echo. Overrides whatever the global iq_samplerate
+                // (which sets both rx fields equal) just wrote, so we end up with the
+                // actual per-RX state.
+                if receiver == 0 { self.ddc_sample_rate_rx1 = rate_hz; }
+                else { self.ddc_sample_rate_rx2 = rate_hz; }
+                info!("TCI: ddc_sample_rate_ex RX{} = {} Hz", receiver + 1, rate_hz);
             }
             TciNotification::DiversityPhaseEx { phase } => {
                 self.diversity_phase = phase;
@@ -827,38 +1192,31 @@ impl TciConnection {
         tokio::time::sleep(delay).await;
 
         // Batch 5: Extension queries (capability-gated per command, or fork extensions)
-        if self.has_cap("tx_profiles_ex") || self.has_extensions() {
-            self.send("tx_profiles_ex;").await;
-        }
+        // Stock .14/.15 supports tx_profiles_ex without advertising the cap. Query is
+        // harmless in fork-mode (Thetis re-pushes the same names list).
+        self.send("tx_profiles_ex;").await;
         if self.has_cap("calibration_ex") || self.has_extensions() {
             self.send("calibration_ex:0;").await;
             self.send("calibration_ex:1;").await;
         }
-        if self.has_cap("ctun_ex") {
-            self.send("rx_ctun_ex:0;").await;
-            self.send("rx_ctun_ex:1;").await;
-        }
-        if self.has_cap("agc_auto_ex") {
-            self.send("agc_auto_ex;").await;
-        }
-        if self.has_cap("vfo_sync_ex") {
-            self.send("vfo_sync_ex;").await;
-        }
-        if self.has_cap("step_attenuator_ex") {
-            self.send("step_attenuator_ex:0;").await;
-            self.send("step_attenuator_ex:1;").await;
-        }
-        if self.has_cap("ddc_sample_rate_ex") {
-            self.send("ddc_sample_rates_ex;").await;
-            self.send("ddc_sample_rate_ex;").await;
-        }
-        if self.has_cap("diversity_ex") {
+        // Stock .14/.15 supports these _ex queries without advertising the caps.
+        // Pushes echo back via rx_ctun_ex / agc_auto_ex / vfo_sync_ex notifications.
+        self.send("rx_ctun_ex:0;").await;
+        self.send("rx_ctun_ex:1;").await;
+        self.send("agc_auto_ex;").await;
+        self.send("vfo_sync_ex;").await;
+        // Sentinel cap: enable_ex is canonical "diversity-suite present" indicator on the
+        // TL2-fork (advertises per-command caps; presence of enable implies the rest).
+        if self.has_cap("diversity_enable_ex") {
             self.send("diversity_enable_ex;").await;
             self.send("diversity_ref_ex;").await;
             self.send("diversity_source_ex;").await;
             self.send("diversity_gain_ex:0;").await;
             self.send("diversity_gain_ex:1;").await;
             self.send("diversity_phase_ex;").await;
+        }
+        if self.has_cap("diversity_gain_multi_ex") {
+            self.send("diversity_gain_multi_ex;").await;
         }
 
         info!("TCI: init commands sent (audio 48kHz float32, {} batches with {}ms delay)",
@@ -1037,6 +1395,14 @@ async fn tci_reader_task(
                 for line in text_str.split('\n') {
                     let line = line.trim();
                     if line.is_empty() {
+                        continue;
+                    }
+                    // run_cat_ex payload contains embedded `;` (wrapped CAT command + response).
+                    // Splitting on `;` would truncate it, so handle as single command first.
+                    if line.to_lowercase().starts_with("run_cat_ex:") {
+                        if let Some(notif) = parse_tci_text(line) {
+                            let _ = notify_tx.try_send(notif);
+                        }
                         continue;
                     }
                     // TCI commands end with ; but may have multiple per line

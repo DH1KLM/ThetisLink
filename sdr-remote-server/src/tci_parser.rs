@@ -80,8 +80,6 @@ pub enum TciNotification {
     DiversityAutonullDone { phase: f32, gain_db: f32, improvement_db: f32 },
     /// Auto-null error
     DiversityAutonullError { message: String },
-    DdcSampleRateEx { receiver: u32, rate: u32 },
-    DdcSampleRatesEx { rates: Vec<u32> },
     RxNrEnable { receiver: u32, enabled: bool, level: u8 },
     /// calibration_ex:rx,meter_cal,display_cal,xvtr_gain,6m_gain,tx_display
     CalibrationEx { receiver: u32, meter_cal: f32, xvtr_gain: f32, six_m_gain: f32 },
@@ -89,15 +87,32 @@ pub enum TciNotification {
     TxProfileEx { name: String },
     /// Server capability flags (Thetis extension)
     TciCapsEx { caps: Vec<String> },
+    /// run_cat_ex response (stock v2.10.3.14 native CAT-relay over TCI):
+    /// outgoing  `run_cat_ex:ZZxxx;` / incoming `run_cat_ex:ZZxxx;,response;`
+    RunCatExResponse { cat_cmd: String, response: String },
     // ThetisLink extended controls
     CtunEx { receiver: u32, enabled: bool },
     VfoSyncEx { enabled: bool },
     FmDeviationEx { receiver: u32, hz: u32 },
-    StepAttenuatorEx { receiver: u32, db: i32 },
+    // Stock Thetis v2.10.3.14 native sample rate / IF limits (global, not per-RX)
+    /// `iq_samplerate:<rate>;` — primary bron voor DDC sample rate (Hz)
+    IqSamplerate { rate: u32 },
+    /// `if_limits:<low>,<high>;` — IF range in Hz; sample rate = high - low
+    /// (fallback wanneer iq_samplerate niet binnenkomt)
+    IfLimits { low: i32, high: i32 },
+    // Stock Thetis v2.10.3.14 native attenuator/preamp commands
+    RxStepAttEx { receiver: u32, db: u32 },
+    RxStepAttEnabledEx { receiver: u32, enabled: bool },
+    RxPreampAttEx { receiver: u32, db: i32 },
+    // Stock Thetis v2.10.3.14 native TX commands
+    TxFilterBandEx { low: i32, high: i32 },
+    TxFrequencyEx { freq: u64, band: String, rx2_enabled: bool, tx_vfob: bool },
     DiversityEnableEx { enabled: bool },
     DiversityRefEx { rx1_ref: bool },
     DiversitySourceEx { source: u32 },
     DiversityGainEx { receiver: u32, gain: u16 },
+    DiversityGainMultiEx { multi: u16 },
+    DdcSampleRateEx { receiver: u32, rate_hz: u32 },
     DiversityPhaseEx { phase: i32 },
     // Binary stream notifications
     RxAudio { receiver: u32, samples: Vec<f32> },
@@ -114,6 +129,19 @@ pub fn parse_tci_text(cmd: &str) -> Option<TciNotification> {
     // Handle tx_profiles_ex / tx_profile_ex BEFORE lowercase (names are case-sensitive)
     // and before comma-split (names can contain commas and braces)
     let cmd_lower = cmd.to_lowercase();
+    // run_cat_ex carries embedded `;` inside its payload (CAT-cmd echo + response),
+    // so it must be parsed before the regular `:` split. Original case preserved.
+    if let Some(colon_pos) = cmd_lower.find("run_cat_ex:") {
+        let payload = &cmd[colon_pos + "run_cat_ex:".len()..];
+        if let Some(comma_pos) = payload.find(',') {
+            let cat_cmd = payload[..comma_pos].trim_end_matches(';').trim().to_string();
+            let response = payload[comma_pos + 1..].trim_end_matches(';').trim().to_string();
+            if !cat_cmd.is_empty() {
+                return Some(TciNotification::RunCatExResponse { cat_cmd, response });
+            }
+        }
+        return None;
+    }
     if let Some(colon_pos) = cmd_lower.find("tci_caps_ex:") {
         let payload = &cmd_lower[colon_pos + "tci_caps_ex:".len()..];
         let caps: Vec<String> = payload.split(',')
@@ -478,19 +506,6 @@ pub fn parse_tci_text(cmd: &str) -> Option<TciNotification> {
                 Some(TciNotification::MonVolume { db })
             } else { None }
         }
-        "ddc_sample_rate_ex" => {
-            if args.len() >= 2 {
-                let receiver: u32 = args[0].trim().parse().ok()?;
-                let rate: u32 = args[1].trim().parse().ok()?;
-                Some(TciNotification::DdcSampleRateEx { receiver, rate })
-            } else { None }
-        }
-        "ddc_sample_rates_ex" => {
-            let rates: Vec<u32> = args.iter()
-                .filter_map(|s| s.trim().parse().ok())
-                .collect();
-            if !rates.is_empty() { Some(TciNotification::DdcSampleRatesEx { rates }) } else { None }
-        }
         "diversity_autonull_status_ex" => {
             if args.len() >= 2 {
                 let status = args[0].trim();
@@ -596,8 +611,8 @@ pub fn parse_tci_text(cmd: &str) -> Option<TciNotification> {
                 Some(TciNotification::CalibrationEx { receiver, meter_cal, xvtr_gain, six_m_gain })
             } else { None }
         }
-        // ── ThetisLink extended controls ────────────────────────────────
-        "ctun_ex" | "rx_ctun_ex" => {
+        // ── Stock Thetis (v2.10.3.13+) and ThetisLink extended controls ──
+        "rx_ctun_ex" => {
             if args.len() >= 2 {
                 let receiver: u32 = args[0].trim().parse().ok()?;
                 let enabled = args[1].trim() == "true";
@@ -617,11 +632,62 @@ pub fn parse_tci_text(cmd: &str) -> Option<TciNotification> {
                 Some(TciNotification::FmDeviationEx { receiver, hz })
             } else { None }
         }
-        "step_attenuator_ex" => {
+        // Stock v2.10.3.14+: iq_samplerate is the global IQ stream / DDC sample rate (Hz).
+        // Primary source for tci.ddc_sample_rate_rx1/rx2 in TL2 v2.0.0-alpha-3+.
+        "iq_samplerate" => {
+            if !args.is_empty() {
+                let rate: u32 = args[0].trim().parse().ok()?;
+                Some(TciNotification::IqSamplerate { rate })
+            } else { None }
+        }
+        // Stock v2.10.3.14+: if_limits is the IF range (low, high in Hz, relative to DDS center).
+        // Fallback source for DDC sample rate when iq_samplerate is absent (rate ≈ high - low).
+        "if_limits" => {
+            if args.len() >= 2 {
+                let low: i32 = args[0].trim().parse().ok()?;
+                let high: i32 = args[1].trim().parse().ok()?;
+                Some(TciNotification::IfLimits { low, high })
+            } else { None }
+        }
+        // Stock v2.10.3.14: rx_step_att_ex sends |attenuation| (positive only)
+        "rx_step_att_ex" => {
+            if args.len() >= 2 {
+                let receiver: u32 = args[0].trim().parse().ok()?;
+                let db: u32 = args[1].trim().parse().ok()?;
+                Some(TciNotification::RxStepAttEx { receiver, db })
+            } else { None }
+        }
+        "rx_step_att_enabled_ex" => {
+            if args.len() >= 2 {
+                let receiver: u32 = args[0].trim().parse().ok()?;
+                let enabled = args[1].trim() == "true";
+                Some(TciNotification::RxStepAttEnabledEx { receiver, enabled })
+            } else { None }
+        }
+        // Stock v2.10.3.14: rx_preamp_att_ex carries signed value (negative = gain in preamp mode)
+        "rx_preamp_att_ex" => {
             if args.len() >= 2 {
                 let receiver: u32 = args[0].trim().parse().ok()?;
                 let db: i32 = args[1].trim().parse().ok()?;
-                Some(TciNotification::StepAttenuatorEx { receiver, db })
+                Some(TciNotification::RxPreampAttEx { receiver, db })
+            } else { None }
+        }
+        // Stock v2.10.3.14: tx_filter_band_ex carries low/high cut Hz for TX
+        "tx_filter_band_ex" => {
+            if args.len() >= 2 {
+                let low: i32 = args[0].trim().parse().ok()?;
+                let high: i32 = args[1].trim().parse().ok()?;
+                Some(TciNotification::TxFilterBandEx { low, high })
+            } else { None }
+        }
+        // Stock v2.10.3.14: tx_frequency_ex:freq,band,rx2_enabled,tx_vfob
+        "tx_frequency_ex" => {
+            if args.len() >= 4 {
+                let freq: u64 = args[0].trim().parse().ok()?;
+                let band = args[1].trim().to_string();
+                let rx2_enabled = args[2].trim() == "true";
+                let tx_vfob = args[3].trim() == "true";
+                Some(TciNotification::TxFrequencyEx { freq, band, rx2_enabled, tx_vfob })
             } else { None }
         }
         "diversity_enable_ex" => {
@@ -647,6 +713,26 @@ pub fn parse_tci_text(cmd: &str) -> Option<TciNotification> {
                 let receiver: u32 = args[0].trim().parse().ok()?;
                 let gain: u16 = args[1].trim().parse().ok()?;
                 Some(TciNotification::DiversityGainEx { receiver, gain })
+            } else { None }
+        }
+        "diversity_gain_multi_ex" => {
+            if !args.is_empty() {
+                let multi: u16 = args[0].trim().parse().ok()?;
+                Some(TciNotification::DiversityGainMultiEx { multi })
+            } else { None }
+        }
+        "ddc_sample_rate_ex" => {
+            // TL2-1 fork extension: per-RX rate (`rx,rate_hz`). Coexists with stock global
+            // `iq_samplerate:rate;` which is parsed by another arm — that one set both
+            // RX rates equal; this one updates only the named receiver.
+            if args.len() >= 2 {
+                let receiver: u32 = args[0].trim().parse().ok()?;
+                let rate_hz: u32 = args[1].trim().parse().ok()?;
+                if receiver > 1 { return None; }
+                if !matches!(rate_hz, 48000 | 96000 | 192000 | 384000 | 768000 | 1536000) {
+                    return None;
+                }
+                Some(TciNotification::DdcSampleRateEx { receiver, rate_hz })
             } else { None }
         }
         "diversity_phase_ex" => {
@@ -918,5 +1004,43 @@ pub fn mode_u8_to_str(mode: u8) -> &'static str {
         10 => "SAM",
         11 => "DRM",
         _ => "USB",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ddc_sample_rate_ex_valid() {
+        for &rate in &[48000u32, 96000, 192000, 384000, 768000, 1536000] {
+            for rx in 0..=1u32 {
+                let line = format!("ddc_sample_rate_ex:{},{}", rx, rate);
+                match parse_tci_text(&line) {
+                    Some(TciNotification::DdcSampleRateEx { receiver, rate_hz }) => {
+                        assert_eq!(receiver, rx);
+                        assert_eq!(rate_hz, rate);
+                    }
+                    Some(_) => panic!("expected DdcSampleRateEx variant for {:?}", line),
+                    None => panic!("expected Some(DdcSampleRateEx), got None for {:?}", line),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ddc_sample_rate_ex_rejects_out_of_range_receiver() {
+        for rx in [2u32, 3, 99, u32::MAX] {
+            let line = format!("ddc_sample_rate_ex:{},384000", rx);
+            assert!(parse_tci_text(&line).is_none(), "should reject rx={}", rx);
+        }
+    }
+
+    #[test]
+    fn ddc_sample_rate_ex_rejects_invalid_rate() {
+        for rate in [0u32, 1, 12345, 44100, 384001, u32::MAX] {
+            let line = format!("ddc_sample_rate_ex:0,{}", rate);
+            assert!(parse_tci_text(&line).is_none(), "should reject rate={}", rate);
+        }
     }
 }

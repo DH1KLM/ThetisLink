@@ -1,10 +1,10 @@
-﻿# ThetisLink v1.0.0 - Installatiehandleiding
+﻿# ThetisLink v2.0.0 - Installatiehandleiding
 
 ThetisLink is een remote bediening voor de ANAN 7000DLE SDR met Thetis. Audio, spectrum, PTT en volledige radiobediening over het netwerk via TCI WebSocket.
 
-**Compatibiliteit:** Werkt met alle HPSDR Protocol 2 apparaten (ANAN-7000DLE, ANAN-8000DLE, ANAN-G2, Hermes-Lite 2, etc.) in combinatie met **Thetis v2.10.3.13** (officiele release door ramdor). Optioneel: Yaesu FT-991A als tweede radio (via COM poort).
+**Compatibiliteit:** ThetisLink praat alleen met **Thetis** (via TCI WebSocket) en niet rechtstreeks met de SDR-hardware. Werkt daarom met elk SDR-apparaat dat door **Thetis v2.10.3.15** (officiële release door ramdor) ondersteund wordt — zowel HPSDR Protocol 1 (Hermes, Angelia, Orion) als HPSDR Protocol 2 (ANAN-7000DLE, ANAN-8000DLE, ANAN-G2, Hermes-Lite 2, etc.). Optioneel: Yaesu FT-991A als tweede radio (via COM-poort).
 
-**PA3GHM Thetis fork (aanbevolen):** Er is een Thetis fork beschikbaar die alle besturing via TCI afhandelt, waardoor de minder efficiente TCP/IP CAT verbinding volledig wordt geelimineerd. Daarnaast biedt de fork uitgebreide IQ bandbreedte (tot 1536 kHz), push-notificaties en diversity auto-null. Alle uitbreidingen zitten achter een checkbox in Thetis en zijn standaard uit. Zie de Gebruikershandleiding (`User-Manual.md`) voor details.
+**PA3GHM Thetis fork (optioneel, aanbevolen voor TL2-extensies):** ThetisLink v2.0.0 werkt prima met stock Thetis v2.10.3.15 via TCI alleen — er is geen aparte CAT TCP verbinding nodig. De PA3GHM fork is een **optionele** vervanger die ThetisLink-specifieke TL2 `_ex` extensies toevoegt bovenop stock Thetis: uitgebreide IQ-bandbreedte tot 1536 kHz (vs de 384 kHz stock cap), `tci_caps_ex` capability-broadcast, server-side CTUN auto-recenter (`auto_recenter_ex`), filter-preset en per-RX DDC-rate push-notificaties, plus diversity auto-null met live cirkel-broadcast. Alle uitbreidingen zitten achter de **"ThetisLink extensions"** checkbox in Thetis en zijn standaard uit; met de vink uit blijft het TCI-extensiegedrag van stock v2.10.3.15 behouden (let op: de fork bevat wel een eigen build-tag, release-notes en About-metadata). Zie de Gebruikershandleiding (`User-Manual.md`) voor details.
 
 **Disclaimer:** Deze software bestuurt radiozenders. Gebruik op eigen risico. De auteur is niet verantwoordelijk voor schade aan apparatuur, storing of overtredingen van regelgeving als gevolg van het gebruik van deze software. Controleer alle veiligheidsfuncties (PTT timeout, vermogensgrenzen) voor het zenden.
 
@@ -14,11 +14,11 @@ ThetisLink is een remote bediening voor de ANAN 7000DLE SDR met Thetis. Audio, s
 
 | Bestand | Beschrijving |
 |---------|-------------|
-| ThetisLink-Server.exe | Server - draait op de PC naast Thetis |
-| ThetisLink-Client.exe | Desktop client - Windows |
-| ThetisLink-1.0.0.apk | Android client - telefoon/tablet |
-| thetislink-server.conf | Voorbeeldconfiguratie server |
-| thetislink-client.conf | Voorbeeldconfiguratie client |
+| ThetisLink-Server.exe | ThetisLink Server - draait op de PC naast Thetis |
+| ThetisLink-Client.exe | ThetisLink Desktop Client - Windows |
+| ThetisLink-2.0.0.apk | ThetisLink Android Client - telefoon/tablet |
+| thetislink-server.conf | Voorbeeldconfiguratie ThetisLink Server |
+| thetislink-client.conf | Voorbeeldconfiguratie ThetisLink Client |
 | Installatie.pdf | Deze handleiding (Nederlands) |
 | User-Manual.pdf | Gebruikershandleiding (Nederlands) |
 | Technische-Referentie.pdf | Technische referentie (Nederlands) |
@@ -35,16 +35,15 @@ ThetisLink is een remote bediening voor de ANAN 7000DLE SDR met Thetis. Audio, s
 ```mermaid
 flowchart LR
     Thetis[Thetis SDR] <-->|"TCI WebSocket :40001"| Server[ThetisLink Server]
-    Thetis <-.->|"CAT TCP :13013<br>(optioneel)"| Server
-    Server <-->|"UDP :4580"| Desktop[Desktop Client<br>Windows]
-    Server <-->|"UDP :4580"| Android[Android Client<br>telefoon]
+    Server <-->|"UDP :4580"| Desktop[ThetisLink Desktop Client<br>Windows]
+    Server <-->|"UDP :4580"| Android[ThetisLink Android Client<br>telefoon]
 ```
 
-**Thetis -> Server** (TCI WebSocket, eventueel aangevuld met CAT):
+**Thetis -> ThetisLink Server** (één TCI WebSocket verbinding):
 - Audio (RX en TX streams), spectrum/waterfall (IQ data), besturing (frequentie, mode, controls)
 
-**Server -> Clients** (UDP poort 4580):
-- Alles: audio, spectrum, besturing, apparaatstatus - in een UDP verbinding per client
+**ThetisLink Server -> ThetisLink Clients** (UDP poort 4580):
+- Alles: audio, spectrum, besturing, apparaatstatus - in één UDP-verbinding per ThetisLink Client
 
 ---
 
@@ -52,14 +51,14 @@ flowchart LR
 
 | Component | Vereiste |
 |-----------|---------|
-| **Server OS** | Windows 10 of 11 |
-| **Thetis** | v2.10.3.13 (ramdor) of PA3GHM fork |
-| **SDR hardware** | ANAN 7000DLE of ander HPSDR Protocol 2 apparaat |
-| **Desktop client** | Windows 10 of 11 |
-| **Android client** | Android 8.0 (Oreo) of hoger, arm64 |
+| **ThetisLink Server OS** | Windows 10 of 11 |
+| **Thetis** | v2.10.3.15 (ramdor) of PA3GHM fork |
+| **SDR hardware** | Elk HPSDR-apparaat dat door Thetis ondersteund wordt (Protocol 1 of 2) |
+| **ThetisLink Desktop Client** | Windows 10 of 11 |
+| **ThetisLink Android Client** | Android 8.0 (Oreo) of hoger, arm64 |
 | **Netwerk** | WiFi of LAN, UDP poort 4580 beschikbaar |
 
-Geen administrator-rechten nodig voor server of client. ADB is optioneel (alleen nodig voor APK installatie via command line).
+Geen administrator-rechten nodig voor de ThetisLink Server of ThetisLink Clients. ADB is optioneel (alleen nodig voor APK installatie via command line).
 
 ---
 
@@ -69,56 +68,62 @@ Geen administrator-rechten nodig voor server of client. ADB is optioneel (alleen
 
 De PA3GHM fork is een aangepaste versie van Thetis met ThetisLink-specifieke uitbreidingen. Installatie:
 
-1. Installeer eerst de officiele **Thetis v2.10.3.13** via de standaard installer (als je dat nog niet hebt)
-2. Download `Thetis.exe` van de PA3GHM fork (branch `thetislink-tci-extended`)
+1. Installeer eerst de officiele **Thetis v2.10.3.15** via de standaard installer (als je dat nog niet hebt)
+2. Download `Thetis.exe` van de PA3GHM fork (branch `thetislink-tl2`)
 3. Maak een **backup** van de originele `Thetis.exe` in de Thetis installatiemap (bijv. hernoem naar `Thetis-original.exe`)
 4. Kopieer de PA3GHM `Thetis.exe` naar de Thetis installatiemap (overschrijf de originele)
 5. Kopieer `ReleaseNotes.txt` naar dezelfde map (overschrijf de bestaande)
-6. Start Thetis - in de titelbalk verschijnt "PA3GHM TL-26" achter het versienummer
+6. Start Thetis - in de titelbalk verschijnt "PA3GHM TL2-1" achter het versienummer
 
 > De fork wijzigt alleen `Thetis.exe`. Alle andere bestanden (DLL's, database, instellingen) blijven ongewijzigd. Je kunt altijd terug naar de originele versie door de backup terug te zetten.
 
-### 1.1 TCI Server inschakelen
+### 1.1 TCI Server in Thetis inschakelen
 
-Setup -> Serial/Network/Midi CAT -> Network:
-1. Vink **TCI Server Running** aan
-2. Poort: **40001** (standaard)
+Setup -> Serial/Network/Midi CAT -> Network -> groep **TCI Server**:
+
+1. Zet het **Bind IP:Port** veld op **`0.0.0.0:40001`**
+   - `0.0.0.0` = luister op alle netwerk-interfaces (loopback + LAN)
+   - `40001` = de poort die de ThetisLink Server standaard verwacht
+   - **Let op:** Thetis ships standaard met `127.0.0.1:50001`. Beide waarden moeten dus actief gewijzigd worden.
+2. Vink **TCI Server Running** aan
+
+> **Waarom `0.0.0.0` en niet `127.0.0.1`?** Met `0.0.0.0` is de Thetis TCI-server bereikbaar voor:
+> - de **ThetisLink Server** op dezelfde PC (die gebruikt `ws://127.0.0.1:40001`)
+> - **netwerk-apparaten** die rechtstreeks met Thetis praten (bijv. een **RF2K-S PA** op een ander IP in het LAN)
+> - **remote toegang via router/internet** (port-forwarding op poort 40001)
+>
+> Met alleen `127.0.0.1` werkt enkel het lokale ThetisLink Server-pad — netwerk-apparaten en remote toegang vallen weg.
+>
+> Wil je niet wijd-open binden, klik dan op **IPv4** (knop naast het Bind-veld); Thetis vult dan je lokale LAN-IP in. Dat beperkt bereikbaarheid tot het LAN.
 
 Bij de PA3GHM Thetis fork, op dezelfde tab:
 1. Vink **ThetisLink extensions** aan
 
-### 1.2 CAT Server inschakelen (alleen bij standaard Thetis)
-
-Setup -> Serial/Network/Midi CAT -> Network:
-1. Vink **TCP/IP CAT Server Running** aan
-2. Poort: **13013**
-
-> Alleen nodig bij standaard Thetis. Met de PA3GHM fork en ThetisLink extensions aan gaat alle besturing via TCI en is CAT niet nodig.
+> ThetisLink v2.0.0 gebruikt uitsluitend TCI voor radio-besturing. De TCP/IP CAT-server in Thetis hoeft niet aan te staan voor ThetisLink — die is alleen nodig als je een apart loggings-programma of derde-partij CAT-client direct aan Thetis wilt koppelen.
 
 ---
 
-## Stap 2: Server instellen
+## Stap 2: ThetisLink Server (TL2) instellen
 
-### 2.1 Server starten
+### 2.1 ThetisLink Server starten
 
 Kopieer `ThetisLink-Server.exe` naar een map op de Thetis-PC. Dubbelklik om te starten - geen installatie of administrator-rechten nodig.
 
-Bij eerste start wordt automatisch een `thetislink-server.conf` aangemaakt met standaardwaarden. De server opent een GUI-venster waarin je alles configureert.
+Bij eerste start wordt automatisch een `thetislink-server.conf` aangemaakt met standaardwaarden. De ThetisLink Server opent een GUI-venster waarin je alles configureert.
 
 ### 2.2 Verbinding met Thetis configureren
 
-Vul in de server GUI in:
+Vul in de ThetisLink Server GUI in:
 
 | Instelling | Waarde | Toelichting |
 |-----------|--------|-------------|
-| **TCI** | `ws://127.0.0.1:40001` | TCI WebSocket adres |
-| **CAT** | `127.0.0.1:13013` | CAT TCP adres (niet nodig bij PA3GHM fork) |
+| **TCI** | `ws://127.0.0.1:40001` | TCI WebSocket adres van Thetis |
 
-Als Thetis op dezelfde PC draait (aanbevolen), zijn de standaardwaarden al correct.
+Als Thetis op dezelfde PC draait (aanbevolen), zijn de standaardwaarden al correct, mits je in stap 1.1 de Thetis TCI Server op `0.0.0.0:40001` (of `127.0.0.1:40001`) hebt ingesteld.
 
 ### 2.3 Externe apparaten (optioneel)
 
-In de server GUI kun je externe apparaten aansluiten. Elk apparaat heeft een enable/disable vinkje - uitgeschakelde apparaten behouden hun configuratie maar worden niet opgestart.
+In de ThetisLink Server GUI kun je externe apparaten aansluiten. Elk apparaat heeft een enable/disable vinkje - uitgeschakelde apparaten behouden hun configuratie maar worden niet opgestart.
 
 | Apparaat | Verbinding | Instelling |
 |----------|-----------|-----------|
@@ -140,13 +145,13 @@ https://www.silabs.com/developer-tools/usb-to-uart-bridge-vcp-drivers
 
 Na installatie van de driver en het aansluiten van de Yaesu via USB verschijnen er **twee COM-poorten** in Apparaatbeheer (bijv. COM5 en COM6). Selecteer de **laagste** van de twee - dit is de CAT/serieel poort. De andere poort is voor USB audio.
 
-Voor Yaesu audio: selecteer in de ThetisLink Server GUI bij het Yaesu apparaat **USB Audio CODEC** als audioapparaat. De server stuurt dit audiokanaal door naar de clients.
+Voor Yaesu audio: selecteer in de ThetisLink Server GUI bij het Yaesu apparaat **USB Audio CODEC** als audioapparaat. De ThetisLink Server stuurt dit audiokanaal door naar alle verbonden ThetisLink Clients.
 
 ### 2.4 Firewall
 
 Bij eerste start vraagt Windows Firewall om toestemming. Sta **privaatnetwerk** toe.
 
-De server luistert op **UDP poort 4580**. Als de firewall-melding niet verschijnt:
+De ThetisLink Server luistert op **UDP poort 4580**. Als de firewall-melding niet verschijnt:
 
 1. Windows Defender Firewall -> Geavanceerde instellingen
 2. Binnenkomende regel -> Nieuwe regel -> Programma
@@ -163,13 +168,13 @@ Windows Defender scant `ThetisLink-Server.exe` continu omdat het een onbekend pr
 
 ### 2.6 Wachtwoord en 2FA
 
-Een wachtwoord is **verplicht**. De server start niet zonder een geldig wachtwoord (minimaal 8 tekens, letters en cijfers). Stel het wachtwoord in via de server GUI onder **Security**. Clients moeten hetzelfde wachtwoord invoeren om te verbinden.
+Een wachtwoord is **verplicht**. De ThetisLink Server start niet zonder een geldig wachtwoord (minimaal 8 tekens, letters en cijfers). Stel het wachtwoord in via de ThetisLink Server GUI onder **Security**. ThetisLink Clients moeten hetzelfde wachtwoord invoeren om te verbinden.
 
-De authenticatie gebruikt HMAC-SHA256 challenge-response: het wachtwoord wordt nooit over het netwerk verstuurd. Brute-force bescherming is ingebouwd per client.
+De authenticatie gebruikt HMAC-SHA256 challenge-response: het wachtwoord wordt nooit over het netwerk verstuurd. Brute-force bescherming is ingebouwd per ThetisLink Client.
 
 **2FA (optioneel, aanbevolen):** Onder het wachtwoord staat een **2FA (TOTP)** checkbox. Bij het inschakelen verschijnt een QR code. Scan deze met een authenticator app (Google Authenticator, Authy, Microsoft Authenticator, etc.). Na het scannen genereert de app elke 30 seconden een 6-cijferige code.
 
-Bij het verbinden voert de client eerst het wachtwoord in, waarna een tweede invoerveld verschijnt voor de 6-cijferige 2FA code. Zonder de code is verbinden niet mogelijk.
+Bij het verbinden voert de ThetisLink Client eerst het wachtwoord in, waarna een tweede invoerveld verschijnt voor de 6-cijferige 2FA code. Zonder de code is verbinden niet mogelijk.
 
 ### 2.7 Configuratiebestand
 
@@ -177,26 +182,26 @@ Alle instellingen worden automatisch opgeslagen in `thetislink-server.conf` naas
 
 ---
 
-## Stap 3: Desktop client installeren (Windows)
+## Stap 3: ThetisLink Desktop Client installeren (Windows)
 
-> De desktop client is momenteel alleen beschikbaar voor Windows. Een macOS build (Intel) is experimenteel getest maar niet opgenomen in de distributie.
+> De ThetisLink Desktop Client is momenteel alleen beschikbaar voor Windows. Een macOS build (Intel) is experimenteel getest maar niet opgenomen in de distributie.
 
 ### 3.1 Installatie
 
-Kopieer `ThetisLink-Client.exe` naar een map op de client-PC. Geen installatie nodig.
+Kopieer `ThetisLink-Client.exe` naar een map op de Desktop Client-PC. Geen installatie nodig.
 
 ### 3.2 Eerste keer starten
 
 1. Start `ThetisLink-Client.exe`
 2. Selecteer je **microfoon** (Input) en **speaker/headset** (Output) bovenaan
-3. Vul het **serveradres** in: `<server-IP>:4580` (bijv. `192.168.1.79:4580`)
+3. Vul het **ThetisLink Server-adres** in: `<server-IP>:4580` (bijv. `192.168.1.79:4580`)
 4. Voer het **wachtwoord** in (zie stap 2.6)
 5. Klik **Connect**
-6. Voer de **2FA code** in als TOTP is ingeschakeld op de server (6 cijfers uit je authenticator app)
+6. Voer de **2FA code** in als TOTP is ingeschakeld op de ThetisLink Server (6 cijfers uit je authenticator app)
 
-Als server en client op dezelfde PC draaien: gebruik `127.0.0.1:4580`.
+Als ThetisLink Server en ThetisLink Desktop Client op dezelfde PC draaien: gebruik `127.0.0.1:4580`.
 
-> Bij de eerste verbinding kan het aan beide zijden even duren voordat alles is opgestart - de server moet de TCI verbinding met Thetis opbouwen en alle apparaten initialiseren. Dit is eenmalig; bij volgende verbindingen gaat het direct.
+> Bij de eerste verbinding kan het aan beide zijden even duren voordat alles is opgestart - de ThetisLink Server moet de TCI-verbinding met Thetis opbouwen en alle externe apparaten initialiseren. Dit is eenmalig; bij volgende verbindingen gaat het direct.
 
 ### 3.3 Configuratie
 
@@ -209,25 +214,25 @@ Instellingen worden automatisch opgeslagen in `thetislink-client.conf` naast de 
 
 ---
 
-## Stap 4: Android client installeren
+## Stap 4: ThetisLink Android Client installeren
 
 ### 4.1 APK installeren
 
 **Via bestandsbeheer:**
-1. Kopieer `ThetisLink-1.0.0.apk` naar je telefoon (USB, e-mail, of cloud)
+1. Kopieer `ThetisLink-2.0.0.apk` naar je telefoon (USB, e-mail, of cloud)
 2. Open het APK-bestand op de telefoon
 3. Sta "Installeren van onbekende bronnen" toe als gevraagd
 4. Installeer
 
 **Via ADB** (met USB-debugging ingeschakeld):
 ```
-adb install ThetisLink-1.0.0.apk
+adb install ThetisLink-2.0.0.apk
 ```
 
 ### 4.2 Verbinden
 
 1. Open ThetisLink
-2. Vul het serveradres in: `<server-IP>:4580`
+2. Vul het **ThetisLink Server-adres** in: `<server-IP>:4580`
 3. Stel het **wachtwoord** in via Settings (tandwiel icoon)
 4. Tik **Connect**
 5. Voer de **2FA code** in als TOTP is ingeschakeld (6 cijfers uit je authenticator app)
@@ -235,7 +240,7 @@ adb install ThetisLink-1.0.0.apk
 
 ### 4.3 Bluetooth headset
 
-De Android client detecteert automatisch aangesloten Bluetooth headsets. Na het koppelen van een BT headset wordt deze automatisch gebruikt voor audio in/uit.
+De ThetisLink Android Client detecteert automatisch aangesloten Bluetooth headsets. Na het koppelen van een BT headset wordt deze automatisch gebruikt voor audio in/uit.
 
 ### 4.4 Bluetooth PTT knop
 
@@ -277,7 +282,7 @@ Hoe lager de netwerklatency, hoe beter de ervaring - met name voor PTT en audio.
 
 ### Gebruik via internet (port forwarding)
 
-Om ThetisLink van buitenshuis te gebruiken moet je router het verkeer doorsturen naar de server-PC:
+Om ThetisLink van buitenshuis te gebruiken moet je router het verkeer doorsturen naar de ThetisLink Server PC:
 
 1. Log in op je router (meestal `192.168.1.1` of `192.168.178.1` in de browser)
 2. Zoek de **port forwarding** instelling (soms "NAT", "virtuele server" of "poort doorsturen" genoemd)
@@ -285,12 +290,12 @@ Om ThetisLink van buitenshuis te gebruiken moet je router het verkeer doorsturen
    - **Protocol:** UDP
    - **Externe poort:** 4580
    - **Interne poort:** 4580
-   - **Intern IP-adres:** het IP van de server-PC (bijv. `192.168.1.79`)
+   - **Intern IP-adres:** het IP van de ThetisLink Server PC (bijv. `192.168.1.79`)
 4. Sla op en herstart de router indien nodig
 
-In de client gebruik je dan je **publieke IP-adres** als serveradres. Je publieke IP vind je op bijv. whatismyip.com. Bij een wisselend IP-adres kun je een DynDNS dienst gebruiken (bijv. No-IP, DuckDNS) zodat je altijd via dezelfde naam verbindt.
+In de ThetisLink Client gebruik je dan je **publieke IP-adres** als ThetisLink Server-adres. Je publieke IP vind je op bijv. whatismyip.com. Bij een wisselend IP-adres kun je een DynDNS dienst gebruiken (bijv. No-IP, DuckDNS) zodat je altijd via dezelfde naam verbindt.
 
-> **Beveiliging:** Het wachtwoord is altijd verplicht (zie stap 2.6). Bij gebruik via internet wordt 2FA (TOTP) sterk aanbevolen als extra beveiligingslaag. Overweeg als alternatief een VPN-oplossing (bijv. WireGuard) waarmee de server-PC niet direct aan internet wordt blootgesteld.
+> **Beveiliging:** Het wachtwoord is altijd verplicht (zie stap 2.6). Bij gebruik via internet wordt 2FA (TOTP) sterk aanbevolen als extra beveiligingslaag. Overweeg als alternatief een VPN-oplossing (bijv. WireGuard) waarmee de ThetisLink Server PC niet direct aan internet wordt blootgesteld.
 
 ---
 
@@ -298,23 +303,23 @@ In de client gebruik je dan je **publieke IP-adres** als serveradres. Je publiek
 
 | Probleem | Oplossing |
 |----------|-----------|
-| Geen audio na connect | Controleer of TCI server actief is in Thetis (Setup -> Serial/Network/Midi CAT -> Network) |
-| Frequentie verandert niet | Controleer of CAT server actief is (Setup -> Serial/Network/Midi CAT -> Network, poort 13013) |
-| Client kan niet verbinden | Firewall blokkeert UDP 4580 - controleer firewall-regels |
-| Disconnect na paar seconden | Instabiel WiFi of firewall blokkade. Check loss% onderaan de client |
-| Spectrum toont niets | TCI server moet actief zijn. Controleer ook de TCI poort in de server GUI |
-| Externe apparaten reageren niet | Check COM poort instelling in server GUI en of het apparaat aan staat |
-| Rotor offline | Check IP:poort in server GUI. Visual Rotor software mag niet tegelijk draaien |
-| Yaesu reageert niet | Check COM poort in server GUI. Zorg dat geen ander programma de COM poort gebruikt |
+| Geen audio na connect | Controleer of de Thetis TCI Server actief is (Setup -> Serial/Network/Midi CAT -> Network) en het Bind IP:Port veld op `0.0.0.0:40001` of `127.0.0.1:40001` staat |
+| Frequentie verandert niet | Controleer of de Thetis TCI Server aan staat (Setup -> Serial/Network/Midi CAT -> Network, poort 40001) en dat het adres in de ThetisLink Server GUI overeenkomt (default `ws://127.0.0.1:40001`) |
+| ThetisLink Client kan niet verbinden | Firewall blokkeert UDP 4580 - controleer firewall-regels op de ThetisLink Server PC |
+| Disconnect na paar seconden | Instabiel WiFi of firewall blokkade. Check loss% onderaan de ThetisLink Client |
+| Spectrum toont niets | Thetis TCI Server moet actief zijn. Controleer ook de TCI-poort in de ThetisLink Server GUI |
+| Externe apparaten reageren niet | Check COM-poort instelling in de ThetisLink Server GUI en of het apparaat aan staat |
+| Rotor offline | Check IP:poort in de ThetisLink Server GUI. Visual Rotor software mag niet tegelijk draaien |
+| Yaesu reageert niet | Check COM-poort in de ThetisLink Server GUI. Zorg dat geen ander programma de COM-poort gebruikt |
 | APK installeert niet | Sta "onbekende bronnen" toe in Android-instellingen |
 
 Voor problemen tijdens het gebruik, zie de Gebruikershandleiding (`User-Manual.md`).
 
 ---
 
-## Remote beheer (headless server setup)
+## Remote beheer (headless ThetisLink Server PC setup)
 
-Voor een onbemande Thetis PC die op afstand beheerd wordt via ThetisLink.
+Voor een onbemande Thetis + ThetisLink Server PC die op afstand beheerd wordt via ThetisLink.
 
 > **Let op:** Automatisch inloggen zonder wachtwoord is alleen verantwoord als de PC fysiek beveiligd is (bijv. in een afgesloten shack) en bij voorkeur op een apart netwerksegment staat. Doe dit niet op een PC die publiek toegankelijk is of op een gedeeld netwerk zonder vertrouwen.
 
@@ -342,17 +347,17 @@ Win+R -> shell:startup -> plak snelkoppeling
 
 ### Remote reboot via ThetisLink
 
-De client kan de server PC herstarten via de reboot knop. Dit vereist een Windows Scheduled Task:
+De ThetisLink Client kan de ThetisLink Server PC herstarten via de reboot-knop. Dit vereist een Windows Scheduled Task:
 
 ```powershell
 schtasks /create /tn "ThetisLinkReboot" /tr "shutdown /r /t 5 /f" /sc once /st 00:00 /ru SYSTEM /rl HIGHEST /f
 ```
 
-Deze task wordt eenmalig aangemaakt. De server voert `schtasks /run /tn ThetisLinkReboot` uit bij een remote reboot verzoek.
+Deze task wordt eenmalig aangemaakt. De ThetisLink Server voert `schtasks /run /tn ThetisLinkReboot` uit bij een remote reboot verzoek.
 
 ### SSH toegang (voor bestandsbeheer via WinSCP)
 
-Installeer OpenSSH Server op de Thetis PC:
+Installeer OpenSSH Server op de ThetisLink Server PC:
 
 1. **Settings -> Apps -> Optional features -> Add a feature** -> zoek "OpenSSH Server" -> Install
 2. Start de service (PowerShell als Administrator):

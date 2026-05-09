@@ -1,4 +1,4 @@
-# ThetisLink v1.0.0 - User Manual
+# ThetisLink v2.0.0 - User Manual
 
 ## Table of Contents
 
@@ -28,13 +28,16 @@ The server communicates with Thetis via TCI WebSocket for both control and audio
 
 ### Thetis version
 
-ThetisLink has been tested with and requires **Thetis v2.10.3.13** (official release by ramdor). This is the base version: all core functionality (audio, spectrum, PTT, TCI control) works fully with unmodified Thetis.
+ThetisLink has been tested with and requires **Thetis v2.10.3.15** (official release by ramdor). This is the base version: all core functionality (audio, spectrum, PTT, TCI control) works fully with unmodified Thetis.
 
-Optionally there is the **PA3GHM Thetis fork** with ThetisLink-specific extensions. These extensions are behind the "ThetisLink extensions" checkbox in Thetis (Setup > Network > IQ Stream). With the checkbox unchecked, Thetis behaves identically to the original release. ThetisLink automatically detects whether extensions are available and switches over. Advantages of the fork:
+Optionally there is the **PA3GHM Thetis fork** with ThetisLink-specific extensions. These extensions are behind the "ThetisLink extensions" checkbox in Thetis (Setup > Network > IQ Stream). With the checkbox unchecked, the stock TCI extension behaviour is preserved (the fork still carries its own build tag, release notes and About metadata). ThetisLink automatically detects whether extensions are available and switches over. Advantages of the fork:
 
-- Full TCI control without an auxiliary CAT connection
-- Additional TCI commands for NB2, DDC sample rate and extended IQ
-- Push notifications from Thetis to ThetisLink clients
+- Extended IQ bandwidth up to **1536 kHz** (stock cap is 384 kHz), selectable per RX
+- Server-side **CTUN auto-recenter** — DDC follows the VFO automatically on rapid tuning
+- **Diversity auto-null suite**: Auto/Smart/Ultra with live circle broadcast for remote tuning visualisation
+- **`tci_caps_ex` capability broadcast** — clients auto-detect which extensions the build offers
+- Filter-preset push (`rx_filter_preset_ex`), per-RX DDC-rate push (`ddc_sample_rate_ex`)
+- Additional TCI `_ex` commands for NB2, AGC-auto, VFO-swap, FM-deviation, step/preamp att
 
 ### Distribution
 
@@ -44,23 +47,27 @@ ThetisLink is distributed as a zip file with the following contents:
 |---------|-------------|
 | `ThetisLink-Server.exe` | Server executable (Windows) |
 | `ThetisLink-Client.exe` | Desktop client executable |
-| `ThetisLink-1.0.0.apk` | Android client app |
-| `thetislink-server.conf` | Server configuration (example) |
-| `thetislink-client.conf` | Client configuration (example) |
-| `Installation.pdf` | Installation guide |
-| `Technical-Reference.pdf` | Technical reference |
-| `User-Manual.pdf` | User manual (this document) |
-| `LICENSE` | License |
+| `ThetisLink-2.0.0.apk` | Android client app |
+| `Installation.pdf` | Installation guide (English) |
+| `User-Manual-EN.pdf` | User manual (English, this document) |
+| `Technical-Reference.pdf` | Technical reference (English) |
+| `Installatie.pdf` | Installatiehandleiding (Nederlands) |
+| `User-Manual.pdf` | Gebruikershandleiding (Nederlands) |
+| `Technische-Referentie.pdf` | Technische referentie (Nederlands) |
+| `LICENSE` | License (GPL-2.0-or-later) |
+| `SHA256SUMS.txt` | SHA-256 checksums for binary verification |
+
+> **Configuration files:** `thetislink-server.conf` and `thetislink-client.conf` are not bundled. They are created automatically with default values on the first start of the server and client (in the same folder as the exe).
 
 ### System requirements
 
-- **Server:** Windows 10/11, Thetis v2.10.3.13 or PA3GHM fork, ANAN 7000DLE (or compatible)
+- **Server:** Windows 10/11, Thetis v2.10.3.15 or PA3GHM fork, ANAN 7000DLE (or compatible)
 - **Client:** Windows/macOS/Linux or Android 8+
 - **Network:** WiFi or LAN, UDP port 4580
 
 ---
 
-This manual assumes that ThetisLink has been installed and configured according to the **Installation Guide** (`Installation.md`). There you will find: installation of the server, desktop client and Android app, Thetis TCI/CAT configuration, firewall settings and network/port forwarding.
+This manual assumes that ThetisLink has been installed and configured according to the **Installation Guide** (`Installation.md`). There you will find: installation of the server, desktop client and Android app, Thetis TCI configuration, firewall settings and network/port forwarding.
 
 ---
 
@@ -72,7 +79,6 @@ flowchart TB
         Thetis[Thetis SDR Software]
         Server[ThetisLink Server]
         Thetis <-->|"TCI WebSocket :40001<br>audio + IQ + control"| Server
-        Thetis <-.->|"CAT TCP :13013<br>optional"| Server
     end
     Server <-->|"UDP :4580"| Desktop[Desktop Client<br>egui]
     Server <-->|"UDP :4580"| Android[Android Client<br>Compose]
@@ -85,7 +91,7 @@ flowchart TB
     Server <--> Yaesu[Yaesu FT-991A<br>COM + USB Audio]
 ```
 
-All audio (RX/TX), IQ spectrum data and control go through the TCI WebSocket connection. The CAT connection is only needed with standard Thetis (without the PA3GHM fork). No VB-Cable or other drivers required.
+All audio (RX/TX), IQ spectrum data and control go through a single TCI WebSocket connection. ThetisLink v2.0.0 does not use a separate CAT TCP connection — TCI covers all required commands, with both stock Thetis v2.10.3.15 and the PA3GHM fork. No VB-Cable or other drivers required.
 
 ---
 
@@ -121,7 +127,7 @@ amplitec_label6=UltraBeam
 
 ## Starting the server
 
-1. Start Thetis and enable TCI (Setup > CAT > TCI)
+1. Start Thetis and enable TCI (Setup > Serial/Network/Midi CAT > Network → TCI Server)
 2. Start `ThetisLink-Server.exe`
 3. Check the connection settings
 4. Check the desired devices
@@ -131,7 +137,7 @@ amplitec_label6=UltraBeam
 ### Server UI
 
 The server displays:
-- Connection status (TCI/CAT)
+- Connection status (TCI WebSocket)
 - Active device windows (Tuner, Amplitec, SPE, RF2K, UltraBeam, Rotor, Yaesu)
 - Macro buttons (2 rows of 12)
 - Uptime and client info
@@ -175,7 +181,17 @@ When changing bands these are automatically restored. In addition there are 5 fr
 
 ### Mode
 
-Selectable: LSB, USB, CW, AM, FM, DIG
+Selectable: LSB, USB, CW, AM, FM, DATA-FM, DIG
+
+### CW keyer (v2.0.0)
+
+In CW mode a remote keyer is available over TCI:
+
+- **CW key down/up:** an assigned button or MIDI pad triggers `keyer:0,true,duration_ms;` for a dit/dah, or a PTT-style press-and-release. The server log shows every key event.
+- **CW macros:** pre-programmed text strings (CQ call, RST report, own call/QTH) are sent to Thetis via `cw_macros:0,text;`. Thetis sends them at the current keyer speed (`cw_keyer_speed:wpm;`).
+- **Stop:** `cw_macros_stop;` cancels a running macro mid-character.
+
+Speed and macro content are adjustable in the client.
 
 ### Filter
 
@@ -184,9 +200,11 @@ The filter width is adjustable with +/- buttons. Presets are available per mode:
 - **SSB:** 1800, 2400, 2700, 3100, 3600 Hz
 - **AM/FM:** 6000, 8000, 10000, 12000 Hz
 
+**Filter preset tracking (v2.0.0, with fork):** with the PA3GHM fork the current Thetis filter preset (F1, F2, F3, VAR1, VAR2 or NONE) is synchronised live to the client. The client shows which preset Thetis currently has active and the owner can switch via the same button set — no manual double-setting between client and Thetis UI needed.
+
 ### Volume
 
-- **RX Volume:** receive level (ZZLA command)
+- **RX Volume:** receive level (TCI `volume` / `rx_volume`)
 - **TX Gain:** microphone preamplification
 - **Drive:** transmit power 0-100%
 - **Mic AGC:** automatic microphone gain (on/off)
@@ -204,6 +222,16 @@ ThetisLink offers three PTT modes:
 - **Toggle:** click the PTT button to switch between transmit and receive
 - **MIDI PTT:** separate MIDI PTT mode via an assigned MIDI controller button, independent of the desktop PTT mode
 
+**Android — external BT remote (ZL-01 or similar):** a Bluetooth button that behaves as an external touch device can be used as a PTT button. ThetisLink intercepts the touch events and maps them to PTT down/up. Only works while the screen is active (touch events are only delivered to a wakeful screen on Android).
+
+### TX meter (v2.0.0)
+
+During TX the S-meter switches to a TX meter showing:
+- **Power** in watts (e.g. `TX  100W`)
+- **SWR** colour-coded — below 1:2 green, 1:2-1:3 orange, above 1:3 red (e.g. `SWR 1.50`)
+
+The SWR value is broadcast by Thetis over TCI during every TX burst and is visible in real time on every connected client.
+
 ### Spectrum and waterfall
 
 - **Zoom:** adjustable, provides more accurate frequency display
@@ -211,6 +239,9 @@ ThetisLink offers three PTT modes:
 - **Reference level:** shift the dB range up/down
 - **Auto Ref:** automatic reference level adjustment based on noise floor
 - **Contrast:** waterfall brightness per band (remembered)
+- **DDC sample rate (v2.0.0):** dropdown for the DDC IQ bandwidth. Stock Thetis offers 384 kHz; with the PA3GHM fork the per-RX selection is 48, 96, 192, 384, 768 or 1536 kHz. Higher rates show more spectrum but load network and CPU more heavily.
+
+**Server-side CTUN auto-recenter (v2.0.0, with fork):** when the fork extension `auto_recenter_ex` is active, the server itself recenters the DDC when the VFO moves rapidly outside the current DDC zone. No manual action needed — the spectrum window follows the VFO automatically.
 
 #### TX spectrum override
 
@@ -318,7 +349,8 @@ Serial USB connection (19200 baud). Functions:
   - Minimum step: 25 kHz (prevents motor overload)
   - VFO selection is automatically determined via the Amplitec (see [Naming conventions](#naming-conventions))
 - **Band presets:** quick-select buttons per band
-- **Motor progress:** progress bar during element movement
+- **Motor indicators M1 / M2 (v2.0.0):** two badges next to the progress bar showing per-motor activity. Orange = motor running, grey = motor idle. During a large band change (e.g. 80m → 10m) you typically see both orange briefly, and when one motor reaches its target first you see that badge turn grey while the other keeps running.
+- **Motor progress:** shared progress bar during element movement. The RCU-06 only exposes a single combined progress value for both motors — exact per-motor progress is not available from the controller.
 - **Retract:** retract all elements (with confirmation)
 - **Element display:** current element lengths in mm
 
@@ -339,11 +371,26 @@ ThetisLink can control a Yaesu FT-991A transceiver as a second radio alongside t
 ### Functions
 
 - **Frequency:** read and set the current frequency
-- **Mode:** read and set (LSB, USB, CW, AM, FM, DIG)
+- **Mode:** read and set (LSB, USB, CW, AM, FM, DATA-FM, DIG)
 - **VFO A/B:** switch between VFO A and VFO B
 - **Memory channels:** automatically loaded when the Yaesu is enabled in the server. Channels with a name are displayed in the UI
 - **Menu editor:** read and modify Yaesu menu settings via the server UI
 - **Audio:** the Yaesu USB audio is captured by the server and sent via the AudioRx2 channel to the client, where it is mixed with the ANAN RX signal
+- **Auto-DFM during TX (v2.0.0):** see subsection below
+
+### Auto-DFM PTT toggle (FM ↔ DATA-FM)
+
+On the FT-991A, USB-mic TX in plain FM mode does not work — only DATA-FM accepts USB-mic audio. To work FM remotely you would therefore need to leave the radio permanently in DATA-FM, which also forces RX audio to DATA-FM (no squelch, different filtering).
+
+From v2.0.0 ThetisLink toggles this automatically:
+
+- **PTT press** while in FM ('4'): the server sends `MD0A;` (DATA-FM) → short settle → `TX1;`. Yaesu now transmits via the USB-mic audio path.
+- **PTT release** after an auto-DFM cycle: the server sends `TX0;` → settle → `MD04;` (back to FM). RX audio is plain FM again.
+- **Memory mode:** if the radio is in Memory mode on an FM channel, the server captures the channel number on PTT-on and restores it via `MC<nnn>;` after PTT-off, so Memory mode and the original channel are preserved across the cycle.
+
+Auto-DFM is inactive in DATA-FM ('A'), USB ('2'), FM-N ('B') and other modes — they keep their normal TX path.
+
+Known limits: a mode change during active TX can confuse the auto-restore; avoid pressing mode buttons while PTT is active. After a server crash during TX you must manually return to FM (the server cannot automatically recover its in-flight state).
 
 ### Configuration
 
@@ -379,6 +426,8 @@ In addition to manual diversity adjustment, ThetisLink offers two automatic null
 Both algorithms are available in the dropdown next to the **Auto Null** button. After completion the result is shown in dB improvement: green means a good null, orange means little difference from the starting situation.
 
 On Android there is a **Smart Null** button that shows the result in dB after completion.
+
+**Live circle broadcast (v2.0.0, with fork):** during a Smart or Ultra sweep the PA3GHM fork streams the current phase/gain position in real time. The client shows the live measurement as a moving dot on the circle plot, so you can see the algorithm walking the search space. This also works when another client started the sweep — all connected clients see the same live trace.
 
 ---
 
@@ -438,6 +487,8 @@ ThetisLink connects directly to a DX cluster server (telnet). Spots are:
 - Other: white
 
 Spots are also forwarded to Thetis via TCI `SPOT:` command, so they also appear on the Thetis panorama.
+
+**Click-to-tune (v2.0.0):** click a spot label on the spectrum (15-pixel snap zone) to tune the VFO directly to the spot frequency. The snap zone accounts for label overlap: clicks closer to another label go to that label. Clicks outside any snap zone fall back to normal click-to-tune (rounded to 1 kHz).
 
 ---
 
@@ -531,13 +582,15 @@ High loss% (visible at the bottom of the client) indicates a network problem. Tr
 
 Re-pair the headset via Android Bluetooth settings and restart the ThetisLink app.
 
+**EQ profile auto-switch (v2.0.0):** ThetisLink Android keeps two separate TX-EQ profiles — one for the internal mic (`mic_profile_android_mic`) and one for the BT headset (`mic_profile_android_bt`). On PTT-on the app detects whether an active BT headset is present and automatically selects the corresponding profile. Configure both profiles via Setup → TX EQ; if in doubt which profile is active, check the PTT status display of the app.
+
 ### UltraBeam timeout when stepping quickly
 
 The UltraBeam RCU-06 has a limited serial command speed. When pressing step buttons in rapid succession, intermediate commands are skipped and only the last one is sent. This is normal behavior and prevents motor overload.
 
 ### Spectrum and waterfall out of sync
 
-If the spectrum (line) and the waterfall are not in sync when panning, check the client version. This is fixed in v0.4.2+.
+If the spectrum (line) and the waterfall are not in sync when panning, restart the client and verify that both server and client run the current version.
 
 ---
 
@@ -545,6 +598,8 @@ If the spectrum (line) and the waterfall are not in sync when panning, check the
 
 | Version | Highlights |
 |---|---|
+| **2.0.0** | **TL2 release:** Yaesu auto-DFM PTT toggle (FM ↔ DATA-FM with memory restore), server-side CTUN auto-recenter, live diversity null-circle broadcast (Smart/Ultra), filter preset push (F1..VAR2/NONE), per-RX DDC sample rate (48..1536 kHz), `tci_caps_ex` capability broadcast, DX cluster click-to-tune, SWR display in TX meter, CW keyer + macros over TCI, single-TCI-only architecture (no separate CAT anymore), wire protocol VERSION = 2 |
+| 1.0.0 | First public release on `cjenschede/ThetisLink` |
 | 0.5.0 | Yaesu FT-991A support, Bluetooth headset (Android), diversity reception fix, TCI controls, RF2K-S reset, PTT modes, DX Cluster |
 | 0.4.9 | Wideband Opus TX, device switch fix |
 | 0.4.2 | Configurable FFT format, dynamic spectrum bins, Android power button fix |

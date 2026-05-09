@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#![allow(dead_code)]
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -528,6 +527,7 @@ impl MidiManager {
     }
 
     /// Name of the connected port.
+    #[allow(dead_code)] // future UI helper for MIDI status display
     pub fn connected_port_name(&self) -> &str {
         &self.connected_port_name
     }
@@ -540,6 +540,7 @@ impl MidiManager {
     }
 
     /// Check if learn mode is active.
+    #[allow(dead_code)] // future UI helper for MIDI learn-state display
     pub fn is_learn_mode(&self) -> bool {
         self.learn_mode.lock().map_or(false, |lm| *lm)
     }

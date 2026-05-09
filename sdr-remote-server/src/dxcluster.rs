@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#![allow(dead_code)]
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -77,6 +76,7 @@ impl DxCluster {
     }
 
     /// Get all non-expired spots (unfiltered).
+    #[allow(dead_code)] // public API counterpart to spots_for_bands(); kept for future UI
     pub fn all_spots(&self) -> Vec<DxSpot> {
         let now = Instant::now();
         let guard = self.spots.lock().unwrap();
@@ -324,16 +324,6 @@ pub fn mode_color_argb(mode: &str) -> u32 {
         "SSB" => 0xFF00FF00,      // green
         "FT8" | "FT4" | "DIGI" => 0xFF00FFFF, // cyan
         _ => 0xFFFFFFFF,          // white
-    }
-}
-
-/// egui Color32 for a mode string (for client spectrum overlay).
-pub fn mode_color_rgba(mode: &str, alpha: u8) -> [u8; 4] {
-    match mode {
-        "CW" => [255, 255, 0, alpha],       // yellow
-        "SSB" => [0, 255, 0, alpha],        // green
-        "FT8" | "FT4" | "DIGI" => [0, 255, 255, alpha], // cyan
-        _ => [255, 255, 255, alpha],        // white
     }
 }
 

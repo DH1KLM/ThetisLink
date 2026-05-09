@@ -753,7 +753,12 @@ impl SdrRemoteApp {
                 let gm_slider = egui::Slider::new(&mut self.diversity_gain_multi, 1.0..=10.0)
                     .custom_formatter(|v, _| format!("{:.0}", v))
                     .step_by(1.0);
-                ui.add_sized([160.0, 16.0], gm_slider);
+                let gm_resp = ui.add_sized([160.0, 16.0], gm_slider);
+                if gm_resp.changed() {
+                    let val = (self.diversity_gain_multi * 100.0).clamp(100.0, 1000.0) as u16;
+                    let _ = self.cmd_tx.send(Command::SetControl(
+                        ControlId::DiversityGainMulti, val));
+                }
 
                 let rx1_is_ref = self.diversity_ref == 1;
 

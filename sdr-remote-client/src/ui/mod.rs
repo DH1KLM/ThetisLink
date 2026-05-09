@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #![allow(dead_code)]
+
 mod helpers;
 mod meters;
 mod spectrum;
@@ -131,6 +132,9 @@ pub struct SdrRemoteApp {
     rec_yaesu: bool,
     last_recorded_path: Option<String>,
     midi_ptt_toggle_mode: bool,  // independent MIDI PTT mode
+    /// TL2-1 ctun-auto-recenter setup-vink "Allow zoom below 2x (with smear during tune)".
+    /// Default false → zoom-min 2x. True → zoom-min 1x toegestaan.
+    allow_zoom_below_2x: bool,
     reboot_confirm: bool,
     diversity_enabled: bool,
     diversity_state_read: bool,
@@ -679,6 +683,7 @@ impl SdrRemoteApp {
             rec_yaesu: false,
             last_recorded_path: None,
             midi_ptt_toggle_mode: config.midi_ptt_toggle,
+            allow_zoom_below_2x: config.allow_zoom_below_2x,
             reboot_confirm: false,
             diversity_enabled: false,
             diversity_state_read: false,
@@ -1379,6 +1384,12 @@ impl SdrRemoteApp {
         if !state.connected {
             self.yaesu_enable_sent = false;
         }
+        // TL2-1 ctun-auto-recenter: snapshot vorige connected-state vóór mutation,
+        // anders detecteren we false→true reconnects niet (een oudere
+        // `state.connected && !self.connected` check werkte nooit omdat
+        // self.connected hier al gemuteerd zou zijn). Bug was latent — de
+        // zoom-reset-block op reconnect werd waarschijnlijk al langer overgeslagen.
+        let was_connected = self.connected;
         self.connected = state.connected;
         self.ptt_denied = state.ptt_denied;
         self.rtt_ms = state.rtt_ms;
@@ -1435,7 +1446,8 @@ impl SdrRemoteApp {
         }
         // Reset zoom on reconnect (connected false→true) or power ON
         // Span is reset to 0 so the first spectrum packet triggers zoom calculation.
-        let reconnected = state.connected && !self.connected;
+        // Use `was_connected` snapshot — see comment above on connected-state mutation.
+        let reconnected = state.connected && !was_connected;
         if reconnected || (state.power_on && !self.power_on) {
             self.full_spectrum_span_hz = 0;
             self.spectrum_pan = 0.0;
@@ -1458,6 +1470,13 @@ impl SdrRemoteApp {
             self.rx2_anf_on = false;
             self.ddc_sample_rate_rx1 = 0;
             self.ddc_sample_rate_rx2 = 0;
+            // TL2-1 ctun-auto-recenter: push allow_zoom_below_2x bij elke
+            // (re)connect zodat server-strictest-vink-policy correct kan worden
+            // berekend ZONDER te wachten op handmatige toggle.
+            let _ = self.cmd_tx.send(Command::SetControl(
+                sdr_remote_core::protocol::ControlId::AllowZoomBelow2x,
+                if self.allow_zoom_below_2x { 1 } else { 0 },
+            ));
         }
         self.power_on = state.power_on;
         self.tx_profile = state.tx_profile;
@@ -1884,6 +1903,9 @@ impl SdrRemoteApp {
         if state.diversity_gain_rx2 != 0 {
             self.diversity_gain_rx2 = state.diversity_gain_rx2 as f32 / 1000.0;
         }
+        if state.diversity_gain_multi != 0 {
+            self.diversity_gain_multi = state.diversity_gain_multi as f32 / 100.0;
+        }
         self.mon_on = state.mon_on;
         // New TCI controls: client-authoritative (no server broadcast).
         // State is only updated when Thetis pushes TCI notifications via
@@ -2054,13 +2076,32 @@ impl SdrRemoteApp {
         ui.horizontal(|ui| {
             ui.spacing_mut().slider_width = 80.0;
             ui.label("Zoom:");
-            let zoom_changed = ui.add(egui::Slider::new(&mut self.spectrum_zoom, 1.0..=1024.0)
+            // TL2-1 ctun-auto-recenter: zoom-min = 2.0 default (anti-smear feature werkbaar);
+            // 1.0 toegestaan via setup-vink "Allow zoom <2x" (smear-trade-off).
+            let zoom_min: f32 = if self.allow_zoom_below_2x { 1.0 } else { 2.0 };
+            // Clamp huidige zoom naar nieuwe minimum (bij vink-toggle naar uit)
+            if self.spectrum_zoom < zoom_min {
+                self.spectrum_zoom = zoom_min;
+            }
+            let zoom_changed = ui.add(egui::Slider::new(&mut self.spectrum_zoom, zoom_min..=1024.0)
                 .logarithmic(true)
                 .custom_formatter(|v, _| format!("{:.0}x", v))
             ).changed();
             if zoom_changed {
                 let max_pan = (0.5 - 0.5 / self.spectrum_zoom) * 0.05;
                 self.spectrum_pan = self.spectrum_pan.clamp(-max_pan, max_pan);
+            }
+            // TL2-1 ctun-auto-recenter setup-vink. Persist + push naar server bij toggle.
+            // Server enforced strictest: zolang één client vink-uit, server klemt op 2x.
+            if ui.checkbox(&mut self.allow_zoom_below_2x, "Allow zoom <2x")
+                .on_hover_text("Toestaan om uit te zoomen onder 2× (waterval-smear bij tunen tussen 1× en 1.2×). Default uit voor smear-vrije ervaring.")
+                .changed()
+            {
+                crate::ui::config::save_allow_zoom_below_2x(self.allow_zoom_below_2x);
+                let _ = self.cmd_tx.send(Command::SetControl(
+                    sdr_remote_core::protocol::ControlId::AllowZoomBelow2x,
+                    if self.allow_zoom_below_2x { 1 } else { 0 },
+                ));
             }
             ui.label("Pan:");
             let max_pan = if self.spectrum_zoom > 1.01 { (0.5 - 0.5 / self.spectrum_zoom) * 0.05 } else { 0.0 };
@@ -2924,7 +2965,13 @@ impl SdrRemoteApp {
             ui.horizontal(|ui| {
                 ui.spacing_mut().slider_width = 80.0;
                 ui.label("Zoom:");
-                let zoom_changed = ui.add(egui::Slider::new(&mut self.rx2_spectrum_zoom, 1.0..=1024.0)
+                // TL2-1 ctun-auto-recenter: same zoom-min logic als RX1 (per-RX onafhankelijk
+                // zoom maar zelfde vink-clamp policy).
+                let zoom_min_rx2: f32 = if self.allow_zoom_below_2x { 1.0 } else { 2.0 };
+                if self.rx2_spectrum_zoom < zoom_min_rx2 {
+                    self.rx2_spectrum_zoom = zoom_min_rx2;
+                }
+                let zoom_changed = ui.add(egui::Slider::new(&mut self.rx2_spectrum_zoom, zoom_min_rx2..=1024.0)
                     .logarithmic(true)
                     .custom_formatter(|v, _| format!("{:.0}x", v))
                 ).changed();
@@ -3151,34 +3198,25 @@ impl eframe::App for SdrRemoteApp {
             }
         }
 
-        let rx1_tuning_active = Self::tuning_latch_active(
-            self.rx1_force_full_tuning,
-            self.pending_freq,
-            self.pending_freq_at,
-        );
-
-        // Push new waterfall data (always, before rendering)
+        // Push new waterfall data (always, before rendering).
+        // Tuning-latch op view-data verwijderd (experiment 2026-05-06): de
+        // per-row absolute mapping in render_waterfall (spectrum.rs:646)
+        // gebruikt elke row's eigen center_hz + span_hz. Late detail-FFT-rows
+        // worden dus automatisch op hun werkelijke freq-positie gerenderd —
+        // 1-2 rows kort op verschoven plek tijdens snel tunen, daarna self-
+        // correcting. Voorheen werd view-data weggegooid tijdens tuning-
+        // latch zodat alleen full-DDC (grover) in de row kwam.
         self.waterfall.push(
             &self.full_spectrum_bins, self.full_spectrum_center_hz,
             self.full_spectrum_span_hz, self.full_spectrum_sequence,
-            if !rx1_tuning_active { &self.spectrum_bins } else { &[] },
-            if !rx1_tuning_active { self.spectrum_center_hz } else { 0 },
-            if !rx1_tuning_active { self.spectrum_span_hz } else { 0 },
+            &self.spectrum_bins, self.spectrum_center_hz, self.spectrum_span_hz,
         );
 
-        let rx2_tuning_active = Self::tuning_latch_active(
-            self.rx2_force_full_tuning,
-            self.rx2_pending_freq,
-            self.rx2_pending_freq_at,
-        );
-
-        // Push RX2 waterfall data
+        // Push RX2 waterfall data — zelfde principe als RX1.
         self.rx2_waterfall.push(
             &self.rx2_full_spectrum_bins, self.rx2_full_spectrum_center_hz,
             self.rx2_full_spectrum_span_hz, self.rx2_full_spectrum_sequence,
-            if !rx2_tuning_active { &self.rx2_spectrum_bins } else { &[] },
-            if !rx2_tuning_active { self.rx2_spectrum_center_hz } else { 0 },
-            if !rx2_tuning_active { self.rx2_spectrum_span_hz } else { 0 },
+            &self.rx2_spectrum_bins, self.rx2_spectrum_center_hz, self.rx2_spectrum_span_hz,
         );
 
         // Sticky top panel: PTT button + local volume (always visible)

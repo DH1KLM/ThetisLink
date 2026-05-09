@@ -97,6 +97,11 @@ pub(crate) struct ClientConfig {
     pub(crate) catsync_enabled: bool,
     pub(crate) catsync_url: String,
     pub(crate) catsync_favorites: Vec<(String, String)>,
+    /// TL2-1 ctun-auto-recenter: setup-vink "Allow zoom below 2x (waterfall smear during tune)".
+    /// Default false → zoom-min 2x, anti-smear feature volledig actief.
+    /// True → zoom-min 1x toegestaan, smear bij tunen <1.2× zoom.
+    /// Server enforced strictest over alle clients (zolang één client false → server klemt op 2x).
+    pub(crate) allow_zoom_below_2x: bool,
 }
 
 impl Default for ClientConfig {
@@ -151,6 +156,7 @@ impl Default for ClientConfig {
             catsync_enabled: false,
             catsync_url: String::new(),
             catsync_favorites: Vec::new(),
+            allow_zoom_below_2x: false,
         }
     }
 }
@@ -435,6 +441,9 @@ pub(crate) fn load_config() -> ClientConfig {
             config.yaesu_ptt_toggle = val.trim() == "true";
         } else if let Some(val) = line.strip_prefix("midi_ptt_toggle=") {
             config.midi_ptt_toggle = val.trim() == "true";
+        } else if let Some(val) = line.strip_prefix("allow_zoom_below_2x=") {
+            config.allow_zoom_below_2x = val.trim() == "true";
+            has_keys = true;
         } else if let Some(val) = line.strip_prefix("catsync_enabled=") {
             config.catsync_enabled = val.trim() == "true";
             has_keys = true;
@@ -610,10 +619,11 @@ pub(crate) fn save_config(
         for (i, mapping) in midi_mappings.iter().enumerate() {
             content.push_str(&format!("midi_map_{}={}\n", i, mapping.to_config()));
         }
-        // Preserve ptt_toggle + midi_ptt_toggle from existing config
+        // Preserve ptt_toggle + midi_ptt_toggle + allow_zoom_below_2x from existing config
         if let Ok(existing) = std::fs::read_to_string(&path) {
             for line in existing.lines() {
-                if line.starts_with("ptt_toggle=") || line.starts_with("yaesu_ptt_toggle=") || line.starts_with("midi_ptt_toggle=") {
+                if line.starts_with("ptt_toggle=") || line.starts_with("yaesu_ptt_toggle=") || line.starts_with("midi_ptt_toggle=")
+                    || line.starts_with("allow_zoom_below_2x=") {
                     content.push_str(line);
                     content.push('\n');
                 }
@@ -621,4 +631,32 @@ pub(crate) fn save_config(
         }
         let _ = std::fs::write(path, content);
     }
+}
+
+/// TL2-1 ctun-auto-recenter: persist setup-vink "Allow zoom below 2x" to config file.
+/// Read-modify-write op `allow_zoom_below_2x=` regel zonder andere keys aan te raken.
+pub(crate) fn save_allow_zoom_below_2x(allow: bool) {
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let path = exe.with_file_name(CONFIG_FILE);
+    let new_line = format!("allow_zoom_below_2x={}", allow);
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut found = false;
+    let mut updated_lines: Vec<String> = existing
+        .lines()
+        .map(|l| {
+            if l.starts_with("allow_zoom_below_2x=") {
+                found = true;
+                new_line.clone()
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+    if !found {
+        updated_lines.push(new_line);
+    }
+    let _ = std::fs::write(path, updated_lines.join("\n") + "\n");
 }

@@ -6,8 +6,14 @@ use num_enum::TryFromPrimitive;
 /// Magic byte identifying our protocol
 pub const MAGIC: u8 = 0xAA;
 
-/// Protocol version
-pub const VERSION: u8 = 1;
+/// Protocol version.
+///
+/// **Breaking change v0.3.x → v2.0.0 (TL2):** new packet types (AudioRx2,
+/// AudioYaesu, AudioBinR, AudioMultiCh, Diversity*, Yaesu*, etc.), expanded
+/// ControlId range, new auth path. v1-clients cannot interoperate with v2-
+/// servers and vice versa; mismatch surfaces as `unsupported version` at
+/// header-deserialize time (early, explicit failure).
+pub const VERSION: u8 = 2;
 
 /// Packet type identifiers
 #[derive(Debug, Clone, Copy, PartialEq, Eq, TryFromPrimitive)]
@@ -229,9 +235,14 @@ pub enum ControlId {
     AgcAutoRx1 = 0x48,
     /// AGC Auto mode RX2 (value: 0=off, 1=on)
     AgcAutoRx2 = 0x49,
-    /// DDC sample rate RX1 (value: rate in kHz, e.g. 192=192000 Hz)
+
+    /// DDC sample rate RX1 (value: rate in kHz, e.g. 384 = 384000 Hz).
+    /// Bron: stock TCI `iq_samplerate` (primary) of `if_limits` (fallback) — zie
+    /// `PATCH-tl2-server-if-limits` (alpha-3). Beide RX1 en RX2 krijgen dezelfde
+    /// waarde in stock-mode (TCI exposes één globale rate). Per-RX divergence
+    /// komt terug via TL2-x fork extensions in Phase 3.
     DdcSampleRateRx1 = 0x3D,
-    /// DDC sample rate RX2 (same encoding)
+    /// DDC sample rate RX2 (zelfde encoding als DdcSampleRateRx1).
     DdcSampleRateRx2 = 0x3E,
 
     /// Diversity enable (value: 0=off, 1=on)
@@ -248,6 +259,9 @@ pub enum ControlId {
     DiversityPhase = 0x45,
     /// Read diversity state from Thetis (value: ignored)
     DiversityRead = 0x46,
+    /// Diversity GainMulti — gates per-RX gain max (value: multi × 100, range 100..1000 = 1.00..10.00).
+    /// TL2-1 fork-only `diversity_gain_multi_ex` command.
+    DiversityGainMulti = 0x47,
 
     /// Global mute (value: 0/1; TCI: mute)
     Mute = 0x5A,
@@ -269,6 +283,12 @@ pub enum ControlId {
     ThetisSwr = 0x61,
     /// Audio routing mode (0=Mono RX1→L+R, 1=Binaural RX1L+RX1R, 2=Split RX1→L RX2→R)
     AudioMode = 0x62,
+
+    /// Per-client setup-vink "Allow zoom below 2× (waterfall smear during tune)".
+    /// Value: 0=vink-uit (default, smear-vrij gegarandeerd), 1=vink-aan (zoom 1× toegestaan, smear-trade-off).
+    /// TL2-1 server enforces strictest setting over all connected clients (zoom-min 2×
+    /// zolang één client vink-uit heeft). Used by `auto_recenter_ex` feature.
+    AllowZoomBelow2x = 0x63,
 }
 
 impl ControlId {

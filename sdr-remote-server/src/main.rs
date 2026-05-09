@@ -2,8 +2,8 @@
 
 mod amplitec;
 mod audio_loops;
-mod cat;
 mod config;
+mod ctun_recenter;
 mod dxcluster;
 mod macros;
 mod network;
@@ -206,7 +206,6 @@ fn print_usage() {
     eprintln!("Usage: sdr-remote-server [OPTIONS]");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  --cat <ADDR>           Thetis CAT address (default: 127.0.0.1:13013)");
     eprintln!("  --tci <ADDR>           Thetis TCI address (e.g. 127.0.0.1:40001)");
     eprintln!("  --thetis-path <PATH>   Path to Thetis.exe for auto-launch on POWER ON");
     eprintln!("  --amplitec-port <COM>  COM port for Amplitec 6/2 antenna switch");
@@ -217,10 +216,59 @@ fn print_usage() {
     eprintln!("Without arguments, a settings GUI is shown.");
 }
 
+/// Install a panic hook that writes panic info to thetislink-server.log next to
+/// the executable, then delegates to the default handler so CLI-mode stderr is
+/// unchanged.
+///
+/// In GUI-mode autostart, stderr goes nowhere — without this hook a panic in a
+/// spawned tokio task (e.g. peripheral init racing an unstable USB device on
+/// cold-boot) is invisible. Direct file-write avoids depending on `log::` macros,
+/// which may be unsafe during panic-unwinding.
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let log_path = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("thetislink-server.log");
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let thread = std::thread::current();
+        let thread_name = thread.name().unwrap_or("<unnamed>");
+        let location = info.location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let payload = info.payload();
+        let message = payload.downcast_ref::<&str>().copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("<non-string panic payload>");
+        let backtrace = std::backtrace::Backtrace::force_capture();
+
+        let entry = format!(
+            "\n[PANIC] ts={} thread={} location={} message={}\nbacktrace:\n{}\n",
+            timestamp, thread_name, location, message, backtrace
+        );
+
+        // Best-effort append. If file-open fails the default handler still runs.
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true).append(true).open(&log_path)
+        {
+            let _ = f.write_all(entry.as_bytes());
+        }
+
+        default_hook(info);
+    }));
+}
+
 fn main() -> Result<()> {
+    install_panic_hook();
+
     // Parse command-line arguments
     let args: Vec<String> = env::args().collect();
-    let mut cat_addr: Option<String> = None;
     let mut tci_addr: Option<String> = None;
     let mut thetis_path: Option<String> = None;
     let mut amplitec_port: Option<String> = None;
@@ -230,10 +278,6 @@ fn main() -> Result<()> {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--cat" => {
-                i += 1;
-                cat_addr = Some(args.get(i).cloned().unwrap_or_default());
-            }
             "--tci" => {
                 i += 1;
                 tci_addr = Some(args.get(i).cloned().unwrap_or_default());
@@ -265,13 +309,13 @@ fn main() -> Result<()> {
             other => {
                 eprintln!("Unknown argument: {}", other);
                 print_usage();
-                return Ok(());
+                std::process::exit(2);
             }
         }
         i += 1;
     }
 
-    let has_cli_args = cat_addr.is_some() || tci_addr.is_some()
+    let has_cli_args = tci_addr.is_some()
         || thetis_path.is_some() || amplitec_port.is_some()
         || tuner_port.is_some() || spe_port.is_some() || rf2k_addr.is_some();
 
@@ -287,7 +331,6 @@ fn main() -> Result<()> {
         let ub_en = defaults.ultrabeam_port.is_some();
         let rot_en = defaults.rotor_addr.is_some();
         let config = ServerConfig {
-            cat_addr: cat_addr.unwrap_or(defaults.cat_addr),
             tci_addr: tci_addr.or(defaults.tci_addr),
             spectrum_enabled: true,
             thetis_path: thetis_path.or(defaults.thetis_path),
@@ -339,7 +382,7 @@ fn main() -> Result<()> {
             totp_secret: defaults.totp_secret,
             totp_enabled: defaults.totp_enabled,
         };
-        info!("Starting with cat='{}', tci={:?}", config.cat_addr, config.tci_addr);
+        info!("Starting with tci={:?}", config.tci_addr);
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(async {
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -477,21 +520,17 @@ pub async fn run_server_async(
     yaesu_prebuilt: Option<Arc<yaesu::YaesuRadio>>,
 ) -> Result<()> {
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", DEFAULT_PORT).parse()?;
-    info!("ThetisLink Server v{} listening on {}", sdr_remote_core::version_string(), bind_addr);
+    info!("ThetisLink Server v{} starting up...", sdr_remote_core::version_string());
     info!("PA3GHM — Remote control for Thetis SDR + Yaesu FT-991A");
     info!("Licensed under GPL-2.0-or-later — source: https://github.com/cjenschede/ThetisLink");
 
     // Session manager
     let session = Arc::new(Mutex::new(SessionManager::new(config.password.clone(), config.totp_secret.clone())));
 
-    // PTT controller: TCI or CAT backend
-    let ptt = if let Some(ref tci_addr) = config.tci_addr {
-        info!("TCI mode: connecting to ws://{}", tci_addr);
-        // Also create auxiliary TCP CAT connection for commands TCI doesn't support (ZZLA/ZZLE/ZZBY)
-        Arc::new(Mutex::new(PttController::new_tci(Some(tci_addr), Some(&config.cat_addr), config.thetis_path.clone())))
-    } else {
-        Arc::new(Mutex::new(PttController::new(Some(&config.cat_addr), config.thetis_path.clone())))
-    };
+    // PTT controller (TL2 v2: TCI-only). Default to localhost if no addr configured.
+    let tci_addr_str = config.tci_addr.clone().unwrap_or_else(|| "127.0.0.1:40001".to_string());
+    info!("TCI mode: connecting to ws://{}", tci_addr_str);
+    let ptt = Arc::new(Mutex::new(PttController::new_tci(Some(&tci_addr_str), config.thetis_path.clone())));
 
     // Spectrum processor
     let spectrum = Arc::new(Mutex::new(SpectrumProcessor::new()));

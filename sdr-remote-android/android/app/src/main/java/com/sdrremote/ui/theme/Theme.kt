@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 package com.sdrremote.ui.theme
 
 import androidx.compose.foundation.isSystemInDarkTheme

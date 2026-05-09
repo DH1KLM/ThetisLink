@@ -173,10 +173,22 @@ pub(super) fn render_ultrabeam_panel(
 
     ui.add_space(6.0);
 
-    // Motor progress bar (only when moving)
+    // Per-motor moving + progress bar (alleen tonen bij beweging).
+    // motors_moving is een bitfield: bit 0 = motor 1, bit 1 = motor 2.
     if status.motors_moving != 0 {
+        let m1_active = (status.motors_moving & 0x01) != 0;
+        let m2_active = (status.motors_moving & 0x02) != 0;
+        let active_color = egui::Color32::from_rgb(255, 170, 40);
+        let idle_color = egui::Color32::from_rgb(100, 100, 100);
         ui.horizontal(|ui| {
-            ui.label("Moving:");
+            ui.colored_label(
+                if m1_active { active_color } else { idle_color },
+                RichText::new("M1").strong(),
+            );
+            ui.colored_label(
+                if m2_active { active_color } else { idle_color },
+                RichText::new("M2").strong(),
+            );
             let progress = if status.motor_completion > 0 {
                 (status.motor_completion as f32) / 60.0
             } else {

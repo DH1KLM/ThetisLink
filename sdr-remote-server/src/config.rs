@@ -5,7 +5,6 @@ use std::path::PathBuf;
 
 #[derive(Clone)]
 pub struct ServerConfig {
-    pub cat_addr: String,
     /// TCI WebSocket address (e.g. "127.0.0.1:40001")
     pub tci_addr: Option<String>,
     pub spectrum_enabled: bool,
@@ -91,7 +90,6 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            cat_addr: "127.0.0.1:13013".to_string(),
             tci_addr: None,
             spectrum_enabled: true,
             thetis_path: detect_thetis_path(),
@@ -178,7 +176,6 @@ pub fn load() -> ServerConfig {
             let line = line.trim();
             if let Some((key, value)) = line.split_once('=') {
                 match key.trim() {
-                    "cat" => config.cat_addr = value.trim().to_string(),
                     "tci" => {
                         let v = value.trim().to_string();
                         config.tci_addr = if v.is_empty() { None } else { Some(v) };
@@ -489,8 +486,7 @@ pub fn load() -> ServerConfig {
 pub fn save(config: &ServerConfig) {
     let path = config_path();
     let mut contents = format!(
-        "cat={}\ntci={}\nthetis_path={}\nyaesu_port={}\nyaesu_enabled={}\nyaesu_baud={}\nyaesu_audio={}\namplitec_port={}\namplitec_enabled={}\namplitec_window={}\ntuner_port={}\ntuner_enabled={}\ntuner_assume_tuned={}\ntuner_window={}\nspe_port={}\nspe_enabled={}\nspe_window={}\nrf2k_addr={}\nrf2k_enabled={}\nrf2k_window={}\nultrabeam_port={}\nultrabeam_enabled={}\nultrabeam_window={}\nrotor_addr={}\nrotor_enabled={}\nrotor_window={}\n",
-        config.cat_addr,
+        "tci={}\nthetis_path={}\nyaesu_port={}\nyaesu_enabled={}\nyaesu_baud={}\nyaesu_audio={}\namplitec_port={}\namplitec_enabled={}\namplitec_window={}\ntuner_port={}\ntuner_enabled={}\ntuner_assume_tuned={}\ntuner_window={}\nspe_port={}\nspe_enabled={}\nspe_window={}\nrf2k_addr={}\nrf2k_enabled={}\nrf2k_window={}\nultrabeam_port={}\nultrabeam_enabled={}\nultrabeam_window={}\nrotor_addr={}\nrotor_enabled={}\nrotor_window={}\n",
         config.tci_addr.as_deref().unwrap_or(""),
         config.thetis_path.as_deref().unwrap_or(""),
         config.yaesu_port.as_deref().unwrap_or(""),

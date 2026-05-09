@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#![allow(dead_code)]
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -224,6 +223,10 @@ impl ClientEngine {
         let mut rx2_volume: f32 = 0.2;     // Thetis ZZLB sync + RX2 audio gain
         let mut vfo_b_volume: f32 = 1.0;   // Additional client-only RX2 gain (VFO B Vol slider)
         let mut audio_mode: u16 = 0;       // 0=Mono, 1=BIN, 2=Split
+        // Track last Binaural ControlPacket value sent on PTT-side-effect path.
+        // Avoids spamming the server with redundant rx_bin_enable cmds when the
+        // PTT-state hasn't actually flipped (alpha-5 testlog: 38k events/session).
+        let mut last_sent_bin: Option<u16> = None;
         let stereo_output = audio.supports_stereo(); // false on Android
 
         // Audio recording state
@@ -355,13 +358,16 @@ impl ClientEngine {
                         if audio_mode == 1 {
                             if let Some(ref addr) = server_addr {
                                 let bin_val = if v { 0u16 } else { 1u16 }; // TX: off, RX: on
-                                let ctrl = ControlPacket {
-                                    control_id: ControlId::Binaural,
-                                    value: bin_val,
-                                };
-                                let mut buf = [0u8; ControlPacket::SIZE];
-                                ctrl.serialize(&mut buf);
-                                let _ = socket.send_to(&buf, addr.as_str()).await;
+                                if last_sent_bin != Some(bin_val) {
+                                    let ctrl = ControlPacket {
+                                        control_id: ControlId::Binaural,
+                                        value: bin_val,
+                                    };
+                                    let mut buf = [0u8; ControlPacket::SIZE];
+                                    ctrl.serialize(&mut buf);
+                                    let _ = socket.send_to(&buf, addr.as_str()).await;
+                                    last_sent_bin = Some(bin_val);
+                                }
                             }
                         }
                     }
@@ -1612,12 +1618,14 @@ impl ClientEngine {
                                 ControlId::DiversitySource => state.diversity_source = ctrl.value as u8,
                                 ControlId::DiversityGainRx1 => state.diversity_gain_rx1 = ctrl.value,
                                 ControlId::DiversityGainRx2 => state.diversity_gain_rx2 = ctrl.value,
+                                ControlId::DiversityGainMulti => state.diversity_gain_multi = ctrl.value,
                                 ControlId::DiversityPhase => state.diversity_phase = ctrl.value,
                                 ControlId::AgcAutoRx1 => state.agc_auto_rx1 = ctrl.value != 0,
                                 ControlId::AgcAutoRx2 => state.agc_auto_rx2 = ctrl.value != 0,
                                 ControlId::DdcSampleRateRx1 => state.ddc_sample_rate_rx1 = ctrl.value,
                                 ControlId::DdcSampleRateRx2 => state.ddc_sample_rate_rx2 = ctrl.value,
                                 ControlId::AudioMode => {} // handled client-side
+                                ControlId::AllowZoomBelow2x => {} // handled client-side (setup-vink)
                             }
                         }
                         Ok(Packet::EquipmentStatus(eq)) => {

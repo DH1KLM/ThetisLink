@@ -26,14 +26,20 @@ radio control over the network via TCI WebSocket.
 Included with each release:
 
 - `Installatie.md` / `Installation.md` — installation guide (Dutch / English)
-- `User-Manual.md` / `user-manual-en.md` — user manual (Dutch / English)
+- `User-Manual.md` / `User-Manual-EN.md` — user manual (Dutch / English)
 - `Technische-Referentie.md` / `Technical-Reference.md` — technical reference
 
 ## Thetis compatibility
 
-ThetisLink talks to the radio through Thetis. It requires **Thetis v2.10.3.13**
-(the official release by ramdor). Optionally use the [PA3GHM Thetis fork](https://github.com/cjenschede/Thetis/tree/thetislink-tci-extended)
-for extended TCI control, eliminating the need for a separate CAT connection.
+ThetisLink talks to the radio through Thetis. It targets **Thetis v2.10.3.15**
+(the latest official release by ramdor) and works with stock Thetis out of the
+box. Optionally use the [PA3GHM Thetis fork](https://github.com/cjenschede/Thetis/tree/thetislink-tl2)
+(branch `thetislink-tl2`) for the additional `_ex` TCI extensions used by
+ThetisLink v2.0.0 (capability broadcast, per-RX filter preset, diversity
+control suite, server-side DDC recenter, relaxed IQ-stream rate cap). All
+extensions are gated behind the **ThetisLink extensions** checkbox in Setup
+> Network > IQ Stream; with the checkbox unchecked the fork behaves like
+stock Thetis.
 
 The Thetis fork is maintained separately from this repository. Its per-file
 source headers grant the GNU General Public License "version 2 or (at your

@@ -17,7 +17,6 @@ use sdr_remote_core::{FRAME_SAMPLES_WIDEBAND, FULL_SPECTRUM_BINS, MAX_PACKET_SIZ
 
 use crate::amplitec::AmplitecSwitch;
 use crate::config::ServerConfig;
-use crate::ptt::RadioBackend;
 use crate::ptt::PttController;
 use crate::rf2k::Rf2k;
 use crate::session::SessionManager;
@@ -27,6 +26,24 @@ use crate::tuner::Jc4sTuner;
 use crate::dxcluster::DxCluster;
 use crate::rotor::Rotor;
 use crate::ultrabeam::UltraBeam;
+
+/// Bind-fail / bind-timeout diagnostic write helper. Direct file-write to
+/// thetislink-server.log next to the executable, bypassing `log::` macros for
+/// consistency with panic-hook and to ensure visibility even if logger state
+/// is partially initialised.
+fn write_bind_diag(entry: &str) {
+    let log_path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("thetislink-server.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true).append(true).open(&log_path)
+    {
+        use std::io::Write;
+        let _ = f.write_all(entry.as_bytes());
+    }
+}
 
 /// Server network service
 pub struct NetworkService {
@@ -76,9 +93,37 @@ impl NetworkService {
         vfo_b_freq_shared: Option<Arc<AtomicU64>>,
         yaesu: Option<Arc<crate::yaesu::YaesuRadio>>,
     ) -> Result<Self> {
-        let socket = UdpSocket::bind(bind_addr)
-            .await
-            .context("bind UDP socket")?;
+        // Wrap bind in 30s timeout to catch cold-boot kernel-hangs (memory
+        // project_tl2_coldboot_bind_fail.md). On Err: emit [BIND-FAIL] with
+        // concrete OS error. On timeout: emit [BIND-TIMEOUT] with elapsed.
+        // Direct file-write keeps diagnostic visible if logger state is fragile.
+        const BIND_TIMEOUT_SECS: u64 = 30;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let socket = match tokio::time::timeout(
+            Duration::from_secs(BIND_TIMEOUT_SECS),
+            UdpSocket::bind(bind_addr),
+        ).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                let entry = format!("[BIND-FAIL] ts={} addr={} error={}\n", ts, bind_addr, e);
+                write_bind_diag(&entry);
+                return Err(anyhow::Error::new(e)).context("bind UDP socket");
+            }
+            Err(_elapsed) => {
+                let entry = format!(
+                    "[BIND-TIMEOUT] ts={} addr={} elapsed={}s\n",
+                    ts, bind_addr, BIND_TIMEOUT_SECS
+                );
+                write_bind_diag(&entry);
+                return Err(anyhow::anyhow!(
+                    "bind UDP socket timed out after {}s on {}",
+                    BIND_TIMEOUT_SECS, bind_addr
+                ));
+            }
+        };
         // Enlarge UDP buffers: default Windows buffer (8KB) overflows with
         // spectrum packets (4-8KB each × clients), dropping audio packets.
         {
@@ -139,7 +184,7 @@ impl NetworkService {
         // Extract TCI audio receivers from PttController
         let (tci_rx1_audio, tci_rx2_audio, tci_bin_r_audio) = {
             let mut ptt = self.ptt.lock().await;
-            if let RadioBackend::Tci(ref mut tci) = ptt.radio {
+            if let Some(tci) = Some(&mut ptt.tci) {
                 (tci.rx1_audio_rx.take(), tci.rx2_audio_rx.take(), tci.bin_r_audio_rx.take())
             } else {
                 (None, None, None)
@@ -578,20 +623,19 @@ impl NetworkService {
                                 // Unknown tune command, pass through
                                 &cmd
                             };
-                            info!("Tuner TCI: {} → {}", cmd.trim_end_matches(';'), tci_cmd.trim_end_matches(';'));
+                            debug!("Tuner TCI: {} → {}", cmd.trim_end_matches(';'), tci_cmd.trim_end_matches(';'));
                             ptt.lock().await.send_cat(tci_cmd).await;
                         }
                         _ = cat_tick.tick() => {
                             // Two-phase connect: check needs (brief lock), connect (no lock), store (brief lock)
                             let ptt_clone = ptt.clone();
                             tokio::spawn(async move {
-                                // Phase 1: check what connections are needed (brief, no I/O)
-                                let (tci_url, cat_addr, aux_addr) = {
+                                // Phase 1: check if TCI connection is needed (brief, no I/O)
+                                let tci_url = {
                                     let mut guard = ptt_clone.lock().await;
-                                    let r = guard.needed_connections();
-                                    r // guard dropped here
+                                    guard.needed_connections()
                                 };
-                                // Phase 2: attempt connections WITHOUT holding the ptt lock
+                                // Phase 2: attempt TCI WebSocket connect WITHOUT holding the ptt lock
                                 let mut tci_stream = None;
                                 if let Some(url) = tci_url {
                                     debug!("TCI: connecting to {}...", url);
@@ -604,33 +648,9 @@ impl NetworkService {
                                         Err(_) => { log::debug!("TCI connect timed out"); }
                                     }
                                 }
-                                let mut cat_stream = None;
-                                if let Some(ref addr) = cat_addr {
-                                    match tokio::time::timeout(
-                                        Duration::from_millis(100),
-                                        tokio::net::TcpStream::connect(addr),
-                                    ).await {
-                                        Ok(Ok(stream)) => { cat_stream = Some(stream); }
-                                        Ok(Err(_)) => {}
-                                        Err(_) => {}
-                                    }
-                                }
-                                let mut aux_stream = None;
-                                if let Some(ref addr) = aux_addr {
-                                    match tokio::time::timeout(
-                                        Duration::from_millis(100),
-                                        tokio::net::TcpStream::connect(addr),
-                                    ).await {
-                                        Ok(Ok(stream)) => { aux_stream = Some(stream); }
-                                        Ok(Err(_)) => {}
-                                        Err(_) => {}
-                                    }
-                                }
-                                // Phase 3: store established connections (brief lock, no I/O)
-                                if tci_stream.is_some() || cat_stream.is_some() || aux_stream.is_some() {
-                                    ptt_clone.lock().await.accept_connections(
-                                        tci_stream, cat_stream, aux_stream,
-                                    );
+                                // Phase 3: store established connection (brief lock, no I/O)
+                                if tci_stream.is_some() {
+                                    ptt_clone.lock().await.accept_connections(tci_stream);
                                 }
                             });
                             session.lock().await.check_timeout();
@@ -692,6 +712,7 @@ impl NetworkService {
                             let div_phase = ptt_guard.diversity_phase();
                             let div_gain_rx1 = ptt_guard.diversity_gain(0);
                             let div_gain_rx2 = ptt_guard.diversity_gain(1);
+                            let div_gain_multi = ptt_guard.diversity_gain_multi();
                             let diversity_autonull_done = ptt_guard.diversity_autonull_done();
                             let vfo_sync_on = ptt_guard.vfo_sync_on();
                             let cw_keyer_speed = ptt_guard.cw_keyer_speed();
@@ -717,7 +738,12 @@ impl NetworkService {
                             let static_cal_rx2 = ptt_guard.static_cal_offset(1);
                             let step_att_rx1 = ptt_guard.step_att(0);
                             let step_att_rx2 = ptt_guard.step_att(1);
-                            let has_att_ex = ptt_guard.has_tci_cap("step_attenuator_ex");
+                            // Stock v2.10.3.14: rx_step_att_enabled_ex per receiver.
+                            // Replaces TL-26 fork's `step_attenuator_ex` capability gate.
+                            // Sign convention: stock .14 sends |attenuation| (positive), so we
+                            // ADD step_att to the calibration offset (no negation).
+                            let step_att_enabled_rx1 = ptt_guard.step_att_enabled(0);
+                            let step_att_enabled_rx2 = ptt_guard.step_att_enabled(1);
                             let ddc_rate_rx1 = ptt_guard.ddc_sample_rate(0);
                             let ddc_rate_rx2 = ptt_guard.ddc_sample_rate(1);
                             drop(ptt_guard);
@@ -746,9 +772,9 @@ impl NetworkService {
                                 if dds_rx1 != 0 { sp.set_ddc_center(dds_rx1); }
 
                                 if !is_tx {
-                                    if has_att_ex {
-                                        // Direct: static_cal + ATT (ATT is negative, negate for positive offset)
-                                        sp.set_cal_offset_db(static_cal_rx1 + (-step_att_rx1 as f32));
+                                    if step_att_enabled_rx1 {
+                                        // Direct: static_cal + ATT (stock .14 sends positive dB)
+                                        sp.set_cal_offset_db(static_cal_rx1 + (step_att_rx1 as f32));
                                     } else if let Some(tci_dbm) = tci_smeter_dbm_rx1 {
                                         // Fallback: auto-calibrate from S-meter vs raw spectrum
                                         let raw_dbm = sp.compute_raw_passband_power_dbm(filter_low, filter_high);
@@ -772,8 +798,9 @@ impl NetworkService {
                             // RX2 spectrum calibration
                             if !is_tx {
                                 let mut rx2_sp = rx2_spectrum.lock().await;
-                                if has_att_ex {
-                                    rx2_sp.set_cal_offset_db(static_cal_rx2 + (-step_att_rx2 as f32));
+                                if step_att_enabled_rx2 {
+                                    // Direct: static_cal + ATT (stock .14 sends positive dB)
+                                    rx2_sp.set_cal_offset_db(static_cal_rx2 + (step_att_rx2 as f32));
                                 } else if let Some(tci_dbm) = tci_smeter_dbm_rx2 {
                                     let raw_dbm = rx2_sp.compute_raw_passband_power_dbm(rx2_filter_low, rx2_filter_high);
                                     if raw_dbm > -130.0 && tci_dbm > -130.0 {
@@ -893,6 +920,7 @@ impl NetworkService {
                                 (ControlId::DiversityPhase, (div_phase + 18000).max(0) as u16),
                                 (ControlId::DiversityGainRx1, div_gain_rx1),
                                 (ControlId::DiversityGainRx2, div_gain_rx2),
+                                (ControlId::DiversityGainMulti, div_gain_multi),
                                 (ControlId::DiversityAutoNull, diversity_autonull_done),
                                 (ControlId::VfoSync, vfo_sync_on as u16),
                                 (ControlId::MonitorVolume, mon_volume as i8 as i16 as u16),
@@ -1539,17 +1567,29 @@ impl NetworkService {
                         Packet::Disconnect => {
                             info!("Client {} disconnected", addr);
                             self.session.lock().await.remove(addr);
+                            // TL2-1 ctun-auto-recenter: herbereken effective_zoom +
+                            // strictest-vink na disconnect — laatste vink-uit client kan
+                            // zojuist weg zijn waardoor zoom-min van 2.0 → 1.0 mag.
+                            let new_eff_rx1 = self.session.lock().await.effective_zoom_rx1();
+                            let new_eff_rx2 = self.session.lock().await.effective_zoom_rx2();
+                            let mut p = self.ptt.lock().await;
+                            p.tci.effective_zoom_rx1_cache = new_eff_rx1;
+                            p.tci.effective_zoom_rx2_cache = new_eff_rx2;
+                            // Geen trigger_eval bij disconnect — eerstvolgende vfo-event of
+                            // remaining-client-zoom-change zal eval triggeren.
                         }
                         Packet::Control(ctrl) => {
                             let mut ptt = self.ptt.lock().await;
                             match ctrl.control_id {
                                 ControlId::Rx1AfGain => {
                                     let val = ctrl.value.min(100);
-                                    // rx_volume via TCI (v2.10.3.13+)
-                                    let db = (val as i32) - 100; // 0-100 → -100..0 dB
+                                    // rx_volume via TCI (stock v2.10.3.13+).
+                                    // Schaal: 0..100 % → −60..0 dB (matches parser in tci.rs RxVolume handler).
+                                    let db = ((val as i32 - 100) * 60) / 100;
                                     let cmd = format!("rx_volume:0,0,{};", db);
                                     ptt.send_cat(&cmd).await;
-                                    ptt.set_rx_af_gain(val as u8);
+                                    // No optimistic state update — Thetis echoes rx_volume back
+                                    // and the parser updates rx_af_gain via the notification path.
                                 }
                                 ControlId::PowerOnOff => {
                                     if ctrl.value == 2 {
@@ -1589,8 +1629,17 @@ impl NetworkService {
                                 }
                                 ControlId::SpectrumZoom => {
                                     let zoom = ctrl.value as f32 / 10.0;
+                                    let prev_eff = self.session.lock().await.effective_zoom_rx1();
                                     self.session.lock().await.set_spectrum_zoom(addr, zoom);
-                                    info!("Client {} spectrum zoom: {:.1}x", addr, zoom);
+                                    let new_eff = self.session.lock().await.effective_zoom_rx1();
+                                    info!("TCI: client {} rx1 zoom={:.1}x; effective_rx1={:?} (was {:?})",
+                                          addr, zoom, new_eff, prev_eff);
+                                    // TL2-1 ctun-auto-recenter: update cached effective_zoom + trigger eval.
+                                    // Gebruik bestaande outer `ptt`-guard (regel ~1572
+                                    // `let mut ptt = self.ptt.lock().await;`) — Tokio mutex is niet
+                                    // reentrant, nested self.ptt.lock() = deadlock.
+                                    ptt.tci.effective_zoom_rx1_cache = new_eff;
+                                    ptt.tci.trigger_eval_and_act_rx1(new_eff).await;
                                 }
                                 ControlId::SpectrumPan => {
                                     let pan = ctrl.value as f32 / 10000.0 - 0.5;
@@ -1646,7 +1695,31 @@ impl NetworkService {
                                 }
                                 ControlId::Rx2SpectrumZoom => {
                                     let zoom = ctrl.value as f32 / 10.0;
+                                    let prev_eff = self.session.lock().await.effective_zoom_rx2();
                                     self.session.lock().await.set_rx2_spectrum_zoom(addr, zoom);
+                                    let new_eff = self.session.lock().await.effective_zoom_rx2();
+                                    info!("TCI: client {} rx2 zoom={:.1}x; effective_rx2={:?} (was {:?})",
+                                          addr, zoom, new_eff, prev_eff);
+                                    // Gebruik outer ptt-guard (geen nested lock).
+                                    ptt.tci.effective_zoom_rx2_cache = new_eff;
+                                    ptt.tci.trigger_eval_and_act_rx2(new_eff).await;
+                                }
+                                ControlId::AllowZoomBelow2x => {
+                                    let allow = ctrl.value != 0;
+                                    let prev_min = self.session.lock().await.server_enforced_zoom_min();
+                                    self.session.lock().await.set_allow_zoom_below_2x(addr, allow);
+                                    let new_min = self.session.lock().await.server_enforced_zoom_min();
+                                    info!("TCI: client {} allow_zoom_below_2x={}; server-strictest zoom-min: {:.1}x → {:.1}x",
+                                          addr, allow, prev_min, new_min);
+                                    // Vink-toggle wijzigt server_enforced_zoom_min → effective_zoom
+                                    // kan veranderen → herbereken cache + trigger eval voor beide RX.
+                                    // Geen nested lock (outer ptt-guard reeds beschikbaar).
+                                    let new_eff_rx1 = self.session.lock().await.effective_zoom_rx1();
+                                    let new_eff_rx2 = self.session.lock().await.effective_zoom_rx2();
+                                    ptt.tci.effective_zoom_rx1_cache = new_eff_rx1;
+                                    ptt.tci.effective_zoom_rx2_cache = new_eff_rx2;
+                                    ptt.tci.trigger_eval_and_act_rx1(new_eff_rx1).await;
+                                    ptt.tci.trigger_eval_and_act_rx2(new_eff_rx2).await;
                                 }
                                 ControlId::Rx2SpectrumPan => {
                                     let pan = ctrl.value as f32 / 10000.0 - 0.5;
@@ -1733,16 +1806,6 @@ impl NetworkService {
                                 ControlId::AgcAutoRx2 => {
                                     ptt.set_agc_auto(1, ctrl.value != 0).await;
                                 }
-                                ControlId::DdcSampleRateRx1 => {
-                                    let rate = ctrl.value as u32 * 1000;
-                                    info!("Client {} DDC RX1 rate: {}kHz", addr, ctrl.value);
-                                    ptt.set_ddc_sample_rate(0, rate).await;
-                                }
-                                ControlId::DdcSampleRateRx2 => {
-                                    let rate = ctrl.value as u32 * 1000;
-                                    info!("Client {} DDC RX2 rate: {}kHz", addr, ctrl.value);
-                                    ptt.set_ddc_sample_rate(1, rate).await;
-                                }
                                 ControlId::AudioMode => {
                                     info!("Client {} audio mode: {}", addr, ctrl.value);
                                     self.session.lock().await.set_audio_mode(addr, ctrl.value as u8);
@@ -1760,11 +1823,13 @@ impl NetworkService {
                                     let ptt = self.ptt.clone();
                                     let socket = self.socket.clone();
                                     tokio::spawn(async move {
-                                        let mut ptt_guard = ptt.lock().await;
-                                        let use_tci = ptt_guard.has_tci_cap("diversity_ex");
-
-                                        if use_tci {
-                                            // Read from TCI state (already populated by init queries)
+                                        let ptt_guard = ptt.lock().await;
+                                        // Diversity state is only available when TL2-x fork extensions
+                                        // are enabled (Phase 3); stock Thetis has no diversity_*_ex push.
+                                        // No CAT-fallback exists in TL2 v2 (aux CAT is removed).
+                                        // Sentinel cap: enable_ex is canonical indicator that the per-command
+                                        // diversity suite is advertised by the fork.
+                                        if ptt_guard.has_tci_cap("diversity_enable_ex") {
                                             let tci = ptt_guard.tci_ref().unwrap();
                                             let values = [
                                                 (ControlId::DiversityEnable, tci.diversity_enabled as u16),
@@ -1773,6 +1838,7 @@ impl NetworkService {
                                                 (ControlId::DiversityGainRx1, tci.diversity_gain_rx1),
                                                 (ControlId::DiversityGainRx2, tci.diversity_gain_rx2),
                                                 (ControlId::DiversityPhase, (tci.diversity_phase + 18000).max(0) as u16),
+                                                (ControlId::DiversityGainMulti, tci.diversity_gain_multi),
                                             ];
                                             for (ctrl_id, value) in &values {
                                                 let ctrl = ControlPacket { control_id: *ctrl_id, value: *value };
@@ -1782,32 +1848,7 @@ impl NetworkService {
                                             }
                                             info!("Diversity read via TCI state");
                                         } else {
-                                            // Fallback: query via auxiliary CAT
-                                            let queries = [
-                                                ("ZZDE;", ControlId::DiversityEnable),
-                                                ("ZZDB;", ControlId::DiversityRef),
-                                                ("ZZDH;", ControlId::DiversitySource),
-                                                ("ZZDG;", ControlId::DiversityGainRx1),
-                                                ("ZZDC;", ControlId::DiversityGainRx2),
-                                                ("ZZDD;", ControlId::DiversityPhase),
-                                            ];
-                                            for (cmd, ctrl_id) in &queries {
-                                                if let Some(val_str) = ptt_guard.query_cat(cmd).await {
-                                                    let value: u16 = match ctrl_id {
-                                                        ControlId::DiversityPhase => {
-                                                            if let Ok(v) = val_str.parse::<i32>() {
-                                                                (v + 18000).max(0) as u16
-                                                            } else { 18000 }
-                                                        }
-                                                        _ => val_str.trim().parse().unwrap_or(0),
-                                                    };
-                                                    let ctrl = ControlPacket { control_id: *ctrl_id, value };
-                                                    let mut buf = [0u8; ControlPacket::SIZE];
-                                                    ctrl.serialize(&mut buf);
-                                                    let _ = socket.try_send_to(&buf, addr);
-                                                }
-                                            }
-                                            info!("Diversity read via CAT");
+                                            info!("Diversity read skipped: stock Thetis has no diversity_ex");
                                         }
                                     });
                                 }
@@ -1868,8 +1909,16 @@ impl NetworkService {
                                     ptt.set_vfo_lock(ctrl.value != 0).await;
                                 }
                                 ControlId::Binaural => {
-                                    info!("Client {} BIN: {}", addr, if ctrl.value != 0 { "ON" } else { "OFF" });
-                                    ptt.set_binaural(ctrl.value != 0).await;
+                                    // Log only on state-change to suppress spam from clients that
+                                    // re-emit BIN ControlPackets ~50 Hz (alpha-5/8 testlogs). Server
+                                    // set_binaural() already idempotent; this filters the info-log
+                                    // along the same axis.
+                                    let new_on = ctrl.value != 0;
+                                    let cur_on = ptt.binaural();
+                                    if new_on != cur_on {
+                                        info!("Client {} BIN: {}", addr, if new_on { "ON" } else { "OFF" });
+                                    }
+                                    ptt.set_binaural(new_on).await;
                                 }
                                 ControlId::ApfEnable => {
                                     info!("Client {} APF: {}", addr, if ctrl.value != 0 { "ON" } else { "OFF" });
@@ -1935,7 +1984,8 @@ impl NetworkService {
                                 // (ZZDE causes Thetis to reconfigure IQ streams which blocks TCP CAT)
                                 ControlId::DiversityEnable | ControlId::DiversityRef
                                 | ControlId::DiversitySource | ControlId::DiversityGainRx1
-                                | ControlId::DiversityGainRx2 | ControlId::DiversityPhase => {
+                                | ControlId::DiversityGainRx2 | ControlId::DiversityPhase
+                                | ControlId::DiversityGainMulti => {
                                     let ptt = self.ptt.clone();
                                     let cid = ctrl.control_id;
                                     let val = ctrl.value;
@@ -1948,6 +1998,7 @@ impl NetworkService {
                                             ControlId::DiversityGainRx1 => guard.set_diversity_gain(0, val).await,
                                             ControlId::DiversityGainRx2 => guard.set_diversity_gain(1, val).await,
                                             ControlId::DiversityPhase => guard.set_diversity_phase((val as i32) - 18000).await,
+                                            ControlId::DiversityGainMulti => guard.set_diversity_gain_multi(val).await,
                                             _ => {}
                                         }
                                     });
@@ -1961,25 +2012,15 @@ impl NetworkService {
                                 ControlId::YaesuPtt => {
                                     if let Some(ref yaesu) = yaesu {
                                         let on = ctrl.value != 0;
-                                        let status = yaesu.status();
-                                        let in_memory = status.vfo_select == 1; // 1=Memory mode
-                                        // FM → DATA-FM transparent switch for USB mic TX
-                                        // Skip mode switch in memory mode (would force radio to VFO mode)
-                                        let needs_data_fm = !in_memory && status.mode_char == '4';
-                                        if on && needs_data_fm {
-                                            yaesu.send_command(crate::yaesu::YaesuCmd::RawCat("MD0A;".to_string()));
-                                            info!("Yaesu: FM → DATA-FM for TX");
-                                        }
+                                        // Auto-DFM (FM ↔ DATA-FM) wordt nu volledig
+                                        // afgehandeld in YaesuCmd::SetPtt zelf (build 12) —
+                                        // single source of truth voor mode-toggle, geen race
+                                        // tussen network.rs en yaesu_poll_loop. Memory-mode-skip
+                                        // zit ook in SetPtt.
                                         yaesu.send_command(crate::yaesu::YaesuCmd::SetPtt(on));
                                         yaesu_ptt_active = on;
                                         self.yaesu_ptt_flag.store(on, Ordering::Relaxed);
-                                        if !on && needs_data_fm {
-                                            yaesu.send_command(crate::yaesu::YaesuCmd::RawCat("MD04;".to_string()));
-                                            info!("Yaesu: DATA-FM → FM after TX");
-                                        }
-                                        info!("Client {} Yaesu PTT: {}{}", addr,
-                                            if on { "TX" } else { "RX" },
-                                            if in_memory { " (memory mode)" } else { "" });
+                                        info!("Client {} Yaesu PTT: {}", addr, if on { "TX" } else { "RX" });
                                     }
                                 }
                                 ControlId::YaesuFreq => {} // handled via FrequencyYaesu packet
@@ -2117,6 +2158,18 @@ impl NetworkService {
                                 ControlId::SpectrumBinDepth => {
                                     // Reserved for future use, ignored
                                 }
+                                ControlId::DdcSampleRateRx1 | ControlId::DdcSampleRateRx2 => {
+                                    // TL2-1 fork extension: when ddc_sample_rate_ex cap is
+                                    // advertised, dispatch via PTT chooser. Stock-mode (no
+                                    // cap) silently ignores (chooser self-gates).
+                                    let rx: u32 = if matches!(ctrl.control_id, ControlId::DdcSampleRateRx1) { 0 } else { 1 };
+                                    let rate_hz: u32 = (ctrl.value as u32).saturating_mul(1000); // client sends kHz
+                                    let ptt = self.ptt.clone();
+                                    tokio::spawn(async move {
+                                        let mut guard = ptt.lock().await;
+                                        guard.set_ddc_sample_rate(rx, rate_hz).await;
+                                    });
+                                }
                                 _ => {
                                     // Unknown or unhandled control, ignore
                                     debug!("Unhandled control: {:?} = {}", ctrl.control_id, ctrl.value);
@@ -2205,4 +2258,3 @@ impl NetworkService {
 
 // Re-export for use within this file (Yaesu TX decode task uses resample_to_device)
 use crate::audio_loops::resample_to_device;
-

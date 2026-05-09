@@ -17,15 +17,16 @@ use super::coverage;
 use super::{ControlContext, UiDensity, UiEvent};
 
 /// Volledige mode-set (popouts). (mode_val, label) — mode_val komt uit het
-/// TCI-protocol: 0=LSB, 1=USB, 3=CW-L, 4=CW-U, 5=FM, 6=AM, 7=DIGU, 9=DIGL.
+/// TCI-protocol: 0=LSB, 1=USB, 3=CW-L, 4=CW-U, 5=FM, 6=AM, 7=DIGU, 9=DIGL,
+/// 10=SAM (synchronous AM, AM-variant).
 pub(crate) const MODES_EXTENDED: &[(u8, &str)] = &[
     (0, "LSB"), (1, "USB"), (3, "CW-L"), (4, "CW-U"),
-    (6, "AM"), (5, "FM"), (7, "DIGU"), (9, "DIGL"),
+    (6, "AM"), (10, "SAM"), (5, "FM"), (7, "DIGU"), (9, "DIGL"),
 ];
 
 /// Basisscherm mode-set (Tab::Radio): alleen de meestgebruikte voice-modes.
 pub(crate) const MODES_BASIC: &[(u8, &str)] = &[
-    (0, "LSB"), (1, "USB"), (6, "AM"), (5, "FM"),
+    (0, "LSB"), (1, "USB"), (6, "AM"), (10, "SAM"), (5, "FM"),
 ];
 
 pub(crate) struct ModeClick {

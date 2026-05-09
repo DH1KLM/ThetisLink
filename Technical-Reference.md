@@ -4,16 +4,16 @@
 
 ThetisLink is a system for remote operation of an ANAN 7000DLE + Thetis SDR receiver and a Yaesu FT-991A transceiver over a network connection. It provides bidirectional real-time audio streaming, PTT control, DDC spectrum/waterfall display, full RX2/VFO-B support, diversity, Yaesu memory channel management and radio settings editor over UDP with Opus codec.
 
-**Version:** v1.0.0 (shared version number in `sdr-remote-core::VERSION`)
+**Version:** v2.0.0 (shared version number in `sdr-remote-core::VERSION`)
 **Development language:** Rust + Kotlin (Android UI)
 **Target platform:** Windows 10/11, macOS (Intel/Apple Silicon), Android 8+ (arm64)
 **Design priority:** latency > bandwidth > features
 
 ### Thetis compatibility
 
-ThetisLink requires **Thetis v2.10.3.13** or newer (the latest official release by Richard Samphire, MW0LGE / [ramdor/Thetis](https://github.com/ramdor/Thetis)). Older Thetis versions do not fully support the TCI WebSocket protocol — in particular IQ streaming and audio routing do not work correctly.
+ThetisLink requires **Thetis v2.10.3.15** or newer (the latest official release by Richard Samphire, MW0LGE / [ramdor/Thetis](https://github.com/ramdor/Thetis)). Older Thetis versions do not fully support the TCI WebSocket protocol — in particular IQ streaming and audio routing do not work correctly.
 
-There is also a **PA3GHM ThetisLink fork** ([cjenschede/Thetis](https://github.com/cjenschede/Thetis/tree/thetislink-tci-extended), branch `thetislink-tci-extended`) with extensions specifically for ThetisLink. This fork adds:
+There is also a **PA3GHM ThetisLink fork** ([cjenschede/Thetis](https://github.com/cjenschede/Thetis/tree/thetislink-tl2), branch `thetislink-tl2`) with extensions specifically for ThetisLink. This fork adds:
 
 - **Extended IQ spectrum**: up to **1536 kHz** IQ bandwidth via TCI (standard Thetis is limited to 384 kHz)
 - **TCI `_ex` commands**: CTUN, VFO sync, step attenuator, FM deviation, diversity, DDC sample rate, AGC auto, VFO swap — all via TCI instead of CAT
@@ -21,20 +21,37 @@ There is also a **PA3GHM ThetisLink fork** ([cjenschede/Thetis](https://github.c
 - **Diversity auto-null**: Smart and Ultra algorithms running server-side in Thetis (DSP speed)
 - **BroadcastDiversityPhase/Gain**: real-time circle plot updates during auto-null sweep
 
-All extensions are behind the **"ThetisLink extensions"** checkbox in Setup → Network → IQ Stream. With this option unchecked, Thetis behaves identically to the original v2.10.3.13 release. The current ThetisLink fork build tag is **TL-26**.
+All extensions are behind the **"ThetisLink extensions"** checkbox in Setup → Network → IQ Stream. With this option unchecked, the stock TCI extension behaviour of v2.10.3.15 is preserved (the fork still carries its own build tag, release notes and About metadata). The current ThetisLink fork build tag is **TL2-1**.
 
 The default IQ sample rate is 384 kHz. With ThetisLink extensions the user can choose from: 48, 96, 192, 384, 768 or **1536 kHz** — selectable per receiver via the DDC sample rate dropdown in the client.
 
 **Repos:**
-- ThetisLink: [cjenschede/sdr-remote](https://github.com/cjenschede/sdr-remote) (branch `ThetisLink-TCI`)
-- Thetis fork: [cjenschede/Thetis](https://github.com/cjenschede/Thetis) (branch `thetislink-tci-extended`)
+- ThetisLink: [cjenschede/ThetisLink](https://github.com/cjenschede/ThetisLink) (public release repo, tag `v2.0.0`)
+- Thetis fork: [cjenschede/Thetis](https://github.com/cjenschede/Thetis) (branch `thetislink-tl2`)
 - Original Thetis: [ramdor/Thetis](https://github.com/ramdor/Thetis)
+
+### v2.0.0 highlights
+
+The v2.0.0 release is a major step compared to the v0.x line. Key changes:
+
+- **Wire protocol VERSION = 2** — breaking change. v0.x clients/servers do not interoperate with v2.0.0. See §5.
+- **TCI as single transport** — the CAT (TCP) path has been fully removed. All radio commands and audio go via TCI WebSocket :40001. See §9.
+- **Server-side CTUN auto-recenter** (fork) — when CTUN is on and the VFO drifts to the edge of the visible spectrum, the TL-server toggles CTUN (`ZZCN`/`ZZCO` via the TCI `run_cat_ex` relay) to force a recenter. The `auto_recenter_ex` capability is advertise-only. See §13.
+- **Yaesu FT-991A auto-DFM with memory-restore** — on PTT the server temporarily switches FM → DATA-FM and on PTT-off restores via `MC<nnn>;` so memory mode and the active channel remain. See §26.
+- **DDC sample rate dropdown per RX** — 48/96/192/384/768/1536 kHz, selectable per receiver (RX1/RX2). 768 and 1536 kHz only with the fork. See §16.
+- **Filter preset tracking** (fork) — F1..VAR2/NONE labels are read back from Thetis and visible in the client.
+- **Diversity live circle broadcast** (fork) — real-time phase/gain updates during Smart/Ultra auto-null sweep. See §22.
+- **Android EQ auto-switch** — mic profile and BT-headset profile switch automatically based on the selected output device.
+- **ZL-01 BT remote PTT** — supported as PTT input on Android.
+- **TX meter SWR colour-coded** — green &lt;1:2, orange 1:2..1:3, red &gt;1:3.
+- **DX cluster click-to-tune** — 15 px snap on the spectrum.
+- **CW keyer + macros + stop** — keyer with macro buttons and an immediate-stop button.
 
 ---
 
 ## 2. Architecture
 
-ThetisLink uses a TCI WebSocket connection to Thetis for audio, IQ and commands. A parallel TCP CAT connection handles commands that TCI does not (yet) support.
+ThetisLink v2.0.0 uses a single TCI WebSocket connection to Thetis for audio, IQ and all radio commands. With the PA3GHM fork the additional `_ex` commands extend the surface (CTUN auto-recenter, diversity, per-RX DDC sample rate). No parallel CAT connection is required against either stock v2.10.3.15 or the fork.
 
 ```mermaid
 flowchart LR
@@ -45,7 +62,6 @@ flowchart LR
     end
     subgraph Server["Server (PC next to Thetis)"]
         TCI["TCI WebSocket :40001"]
-        CAT["CAT TCP :13013<br>(optional)"]
     end
     OpusEnc -->|"UDP :4580<br>Audio + PTT"| TCI
     TCI -->|"UDP :4580<br>Audio"| OpusDec
@@ -53,7 +69,7 @@ flowchart LR
     Thetis -->|RX_AUDIO_STREAM| TCI
 ```
 
-Audio goes directly via the TCI WebSocket (RX_AUDIO_STREAM / TX_AUDIO_STREAM). The CAT connection is optional (only without PA3GHM fork) for commands that TCI does not support.
+Audio, IQ and all commands flow over the single TCI WebSocket (RX_AUDIO_STREAM / TX_AUDIO_STREAM plus text TCI commands). ThetisLink no longer maintains a separate CAT connection.
 
 ### Client Architecture
 
@@ -89,7 +105,6 @@ flowchart TB
     PTT["PttController<br>PTT safety (timeouts, tail delay)"]
     PTT --> TCI["RadioBackend::Tci<br>TciConnection"]
     TCI --> WS["WebSocket to Thetis :40001<br>Push-based state updates<br>Audio streams RX/TX<br>IQ streams - spectrum"]
-    TCI -.-> CAT["aux_cat: CatConnection<br>(optional)<br>Commands TCI does not know"]
 ```
 
 ---
@@ -118,15 +133,25 @@ sdr-remote/
 │   └── src/
 │       ├── main.rs             # Startup, argument parsing, shutdown
 │       ├── network.rs          # UDP send/receive, resampling, playout timer
-│       ├── cat.rs              # CatConnection: Thetis CAT TCP + radio state
 │       ├── tci.rs              # TciConnection: TCI WebSocket client + state + streams
+│       ├── tci_commands.rs     # TCI command sender (audio/IQ/_ex commands)
+│       ├── tci_parser.rs       # TCI text/binary parser
+│       ├── ctun_recenter.rs    # CTUN auto-recenter (auto_recenter_ex cap)
+│       ├── audio_loops.rs      # Audio bundling + IQ consumer loops
 │       ├── ptt.rs              # PttController: PTT safety (contains TciConnection)
 │       ├── session.rs          # Client session management (multi-client)
 │       ├── spectrum.rs         # SpectrumProcessor: DDC FFT pipeline + test generator
 │       ├── dxcluster.rs        # DX Cluster telnet client
+│       ├── macros.rs           # CW keyer macros
+│       ├── yaesu.rs            # Yaesu FT-991A CAT serial controller (auto-DFM)
+│       ├── amplitec.rs         # Amplitec antenna switch
+│       ├── rf2k.rs             # RF2K-S PA HTTP controller
+│       ├── spe_expert.rs       # SPE Expert 1.3K-FA serial controller
+│       ├── ultrabeam.rs        # UltraBeam RCU-06 serial controller
+│       ├── rotor.rs            # EA7HG Visual Rotor UDP controller
 │       ├── tuner.rs            # JC-4s tuner controller (serial RTS/CTS)
 │       ├── config.rs           # Server configuration (persistent)
-│       └── ui.rs               # Server GUI
+│       └── ui/                 # Server GUI (egui)
 ├── sdr-remote-client/          # Desktop client (egui)
 │   └── src/
 │       ├── main.rs             # Startup, engine + UI threading
@@ -190,7 +215,7 @@ Every packet starts with the same header:
 | Offset | Size | Field | Value |
 |--------|------|-------|-------|
 | 0 | 1 | Magic | `0xAA` |
-| 1 | 1 | Version | `1` |
+| 1 | 1 | Version | `2` (was `1` in v0.x; v1 clients are not wire-compatible with v2 servers and vice versa) |
 | 2 | 1 | PacketType | See below |
 | 3 | 1 | Flags | Bit 0 = PTT active |
 
@@ -269,17 +294,17 @@ Sends control commands (bidirectional).
 
 **ControlId values — Thetis RX1:**
 
-| ID | Name | Values | CAT/TCI |
-|----|------|--------|---------|
-| 0x01 | Rx1AfGain | 0-100 | `ZZLA` |
-| 0x02 | PowerOnOff | 0/1 | `ZZPS` |
-| 0x03 | TxProfile | 0-99 | `ZZTP` / TCI `tx_profile_ex` |
-| 0x04 | NoiseReduction | 0-4 (0=off, 1=NR1..4=NR4) | TCI `rx_nb_enable` |
-| 0x05 | AutoNotchFilter | 0/1 | TCI `rx_anf_enable` |
-| 0x06 | DriveLevel | 0-100 | TCI `DRIVE` |
-| 0x0D | ThetisStarting | 0/1 | TCI `start`/`stop` |
-| 0x1E | MonitorOn | 0/1 | TCI `MON_ENABLE` |
-| 0x1F | ThetisTune | 0/1 | TCI `TUNE` |
+| ID | Name | Values | TCI command |
+|----|------|--------|-------------|
+| 0x01 | Rx1AfGain | 0-100 | `volume` / `rx_volume:0,0,dB` |
+| 0x02 | PowerOnOff | 0/1 | `start;` / `stop;` |
+| 0x03 | TxProfile | 0-99 | `tx_profile_ex` push + set |
+| 0x04 | NoiseReduction | 0-4 (0=off, 1=NR1..4=NR4) | `rx_nr_enable_ex:0,enabled,level` |
+| 0x05 | AutoNotchFilter | 0/1 | `rx_anf_enable:0,bool` |
+| 0x06 | DriveLevel | 0-100 | `drive:0,level` |
+| 0x0D | ThetisStarting | 0/1 | `start;` / `stop;` |
+| 0x1E | MonitorOn | 0/1 | `mon_enable:bool` |
+| 0x1F | ThetisTune | 0/1 | `tune:0,bool` |
 
 **ControlId values — Spectrum:**
 
@@ -300,7 +325,7 @@ Sends control commands (bidirectional).
 | ID | Name | Values | Description |
 |----|------|--------|-------------|
 | 0x0E | Rx2Enable | 0/1 | RX2 on/off |
-| 0x0F | Rx2AfGain | 0-100 | RX2 AF volume (`ZZLB`) |
+| 0x0F | Rx2AfGain | 0-100 | RX2 AF volume — TCI `rx_volume:1,0,dB` |
 | 0x10 | Rx2SpectrumZoom | 10-10240 | Zoom |
 | 0x11 | Rx2SpectrumPan | 0-10000 | Pan |
 | 0x12 | Rx2FilterLow | signed Hz | RX2 filter low |
@@ -310,8 +335,11 @@ Sends control commands (bidirectional).
 | 0x16 | Rx2SpectrumFps | 5-30 | RX2 spectrum FPS |
 | 0x17 | Rx2NoiseReduction | 0-4 | RX2 NR level |
 | 0x18 | Rx2AutoNotchFilter | 0/1 | RX2 ANF |
-| 0x19 | VfoSwap | trigger | VFO A<->B swap (`ZZVS2`) |
+| 0x19 | VfoSwap | trigger | VFO A<->B swap — TCI `vfo_swap_ex` |
 | 0x1B | Rx2SpectrumMaxBins | 64-32768 | RX2 max bins |
+| 0x3D | DdcSampleRateRx1 | kHz (e.g. 384) | Per-RX DDC rate (stock `iq_samplerate`, fork `ddc_sample_rate_ex`) |
+| 0x3E | DdcSampleRateRx2 | kHz | Per-RX DDC rate RX2 |
+| 0x3F | Rx2SpectrumFftSize | 32/64/128/256 | FFT size in K (RX2) |
 
 **ControlId values — TCI Controls (v0.5.3):**
 
@@ -342,6 +370,7 @@ Sends control commands (bidirectional).
 | 0x44 | DiversityGainRx2 | gain x1000 | E.g. 2500 = 2.500 |
 | 0x45 | DiversityPhase | phase x100 + 18000 | 18000=0deg, 0=-180deg, 36000=+180deg |
 | 0x46 | DiversityRead | trigger | Read diversity state from Thetis |
+| 0x47 | DiversityGainMulti | 100-1000 (×100, = 1.00..10.00) | Diversity gain multiplier (`diversity_gain_multi_ex`, fork-only) |
 | 0x48 | AgcAutoRx1 | 0/1 | AGC auto mode RX1 |
 | 0x49 | AgcAutoRx2 | 0/1 | AGC auto mode RX2 |
 | 0x4A | DiversityAutoNull | 1=start | Start Smart auto-null (Thetis-side) |
@@ -374,6 +403,7 @@ Sends control commands (bidirectional).
 | 0x60 | Rx2ManualNotchFilter | 0/1 | Manual notch filter RX2 |
 | 0x61 | ThetisSwr | SWR x100 | SWR broadcast during TX (e.g. 150 = 1.50:1) |
 | 0x62 | AudioMode | 0-2 | Audio routing (0=Mono, 1=Binaural, 2=Split) |
+| 0x63 | AllowZoomBelow2x | 0/1 | Per-client setup-vink for sub-2× zoom (smear trade-off; used by `auto_recenter_ex`) |
 
 **ControlId values — Yaesu:**
 
@@ -665,6 +695,30 @@ The server performs a safety check every **100ms** (PTT timeouts + state polling
 
 TCI (Transceiver Control Interface) is a WebSocket-based protocol built into Thetis. Default on `ws://127.0.0.1:40001`.
 
+### Stock vs fork TCI sub-protocol
+
+ThetisLink v2.0.0 talks TCI to both **stock Thetis v2.10.3.15** and the **PA3GHM fork (TL2-1)**. The base protocol is identical — but the fork adds an `_ex` extension layer that ThetisLink uses when available.
+
+**Capability negotiation:** at connect time the client requests `tci_caps_ex;`. With the fork (and the "ThetisLink extensions" Setup checkbox enabled) Thetis responds with a list of supported `_ex` capabilities (`auto_recenter_ex`, `rx_filter_preset_ex`, `ddc_sample_rate_ex`, `diversity_ex`, ...). Stock Thetis does not implement `tci_caps_ex` and the request times out → ThetisLink falls back to stock-mode behaviour.
+
+| Feature | Stock TCI | Fork TCI (`_ex`) |
+|---------|-----------|------------------|
+| Capability discovery | n/a | `tci_caps_ex;` returns supported extensions |
+| CTUN auto-recenter | not available (no recenter) | server-driven via `ZZCN`/`ZZCO` toggle, `auto_recenter_ex` advertise-only (no command, no push) |
+| RX filter preset (F1..VAR2/NONE) | not exposed | `rx_filter_preset_ex` push + set |
+| DDC sample rate | global, `IQ_SAMPLERATE` | per-RX, `ddc_sample_rate_ex:<rx>,<rate>;` |
+| Max IQ rate | 384 kHz | 1536 kHz |
+| Diversity auto-null | client-side sweep | server-side Smart/Ultra in DSP |
+| Diversity live circle | n/a | `diversity_phase_ex` / `diversity_gain_ex` push during sweep |
+| TX profile name push | n/a | `tx_profiles_ex` / `tx_profile_ex` push |
+| Server-initiated shutdown | n/a | `run_cat_ex:ZZBY;` |
+| AllowZoomBelow2x gate | always permitted | gated on SetupForm ControlId `0x63` |
+
+**Behavioural impact for the user:**
+- With the fork → no separate CAT process needed for ThetisLink-internal control; everything flows over the single TCI WebSocket.
+- Without the fork → ThetisLink still works but loses the fork-only features above (DDC > 384 kHz, server-side recenter, filter preset readback, live diversity circle).
+- **External CAT clients** (logging software, N1MM, etc.) connect directly to the Thetis CAT TCP server — independent of which TCI mode ThetisLink uses. See §10.
+
 ### Connection
 
 1. WebSocket connect to Thetis TCI server
@@ -747,56 +801,28 @@ TCI binary header: 16 x u32 = 64 bytes. Stream type at offset 24, sample format 
 
 ---
 
-## 10. CAT Interface (supplementary)
+## 10. Legacy CAT Reference (historical)
 
-Communication with Thetis SDR via TCP (TS-2000 compatible protocol). Runs as a parallel connection alongside TCI for commands that TCI does not support.
+Earlier ThetisLink versions (≤ v1.x) used a parallel TCP CAT connection alongside TCI for commands TCI did not support. **ThetisLink v2.0.0 removed the CAT path entirely** — all radio control flows over the single TCI WebSocket from §9. The ZZ-command listing below is retained as a Thetis CAT reference for users who connect external CAT clients (logging software, N1MM, etc.) directly to the Thetis CAT server (Thetis Setup → Serial/Network/Midi CAT → Network → TCP/IP CAT Server).
 
-| Setting | Value |
-|---------|-------|
-| Protocol | TCP/IP |
-| Default address | `127.0.0.1:13013` |
-| Command format | ZZ-prefix (Thetis extension of TS-2000) |
-| Connection timeout | 200ms on connect attempt |
+| ZZ command | TCI counterpart used by ThetisLink v2.0.0 |
+|------------|-------------------------------------------|
+| `ZZLA` / `ZZLB` (RX1/RX2 AF volume) | `volume` / `rx_volume:1,...` |
+| `ZZBY` (shutdown) | `run_cat_ex:ZZBY;` (server-initiated only) |
+| `ZZCT` (CTUN) | `rx_ctun_ex` push + `rx_ctun_ex:rx,enabled;` set |
+| `ZZPS` (power) | `start;` / `stop;` |
+| `ZZTP` (TX profile) | `tx_profile_ex` push + `tx_profile_ex:name;` |
+| `ZZTX` (PTT) | `trx:0,true;` / `trx:0,false;` |
+| `ZZFA` / `ZZFB` (VFO A/B freq) | `vfo:0,0,Hz;` / `vfo:0,1,Hz;` |
+| `ZZMD` / `ZZME` (RX1/RX2 mode) | `modulation:0,mode;` / `modulation:1,mode;` |
+| `ZZRM1`/`ZZRM2`/`ZZRM5` (S-meter / TX power) | TCI binary `MeterPacket` push |
+| `ZZPC` (drive) | `drive:0,level;` |
+| `ZZNE`/`ZZNV` (NR level RX1/RX2) | `rx_nr_enable_ex:0/1,enabled,level;` |
+| `ZZNT`/`ZZNU` (ANF RX1/RX2) | `rx_anf_enable:0/1,bool;` |
+| `ZZFL`/`ZZFH` / `ZZFS`/`ZZFR` (filter low/high) | `rx_filter_band:0/1,low,high;` |
+| `ZZVS2` (VFO swap) | `vfo_swap_ex;` (stock-supported, no cap advertised) |
 
-### Commands via parallel CAT (not in TCI)
-
-| Command | Description | Direction |
-|---------|-------------|-----------|
-| `ZZLA` / `ZZLA{:03};` | RX1 AF volume (000-100) | Bidirectional |
-| `ZZLB` / `ZZLB{:03};` | RX2 AF volume (000-100) | Bidirectional |
-| `ZZBY` | Shutdown | Server -> Thetis |
-| `ZZCT` | CTUN status (0=off, 1=on) | Server -> Thetis (poll) |
-| `ZZPS` / `ZZPS0;`/`ZZPS1;` | Power on/off | Bidirectional |
-| `ZZTP` / `ZZTP{:02};` | TX profile index | Bidirectional |
-
-### Other CAT commands
-
-| Command | Description | Direction |
-|---------|-------------|-----------|
-| `ZZTX1;`/`ZZTX0;` | PTT on/off (fallback) | Server -> Thetis |
-| `ZZAG100;` | Master AF volume at 100% | Server -> Thetis (on connect) |
-| `ZZFA;` / `ZZFA{:011};` | VFO-A frequency | Bidirectional |
-| `ZZMD;` / `ZZMD{:02};` | Operating mode | Bidirectional |
-| `ZZRM1;` | RX1 S-meter (average) | Server -> Thetis (poll, RX) |
-| `ZZRM2;` | RX2 S-meter | Server -> Thetis (poll) |
-| `ZZRM5;` | Forward power (watts) | Server -> Thetis (poll, TX) |
-| `ZZPC;` / `ZZPC{:03};` | Drive level (000-100) | Bidirectional |
-| `ZZNE;` / `ZZNE{0-4};` | NR level RX1 | Bidirectional |
-| `ZZNT;` / `ZZNT0;`/`ZZNT1;` | ANF RX1 | Bidirectional |
-| `ZZFL;` / `ZZFH;` | RX1 filter low/high | Bidirectional |
-| `ZZFB;` / `ZZFB{:011};` | VFO-B frequency | Bidirectional |
-| `ZZME;` / `ZZME{:02};` | RX2 mode | Bidirectional |
-| `ZZFS;` / `ZZFR;` | RX2 filter low/high | Bidirectional |
-| `ZZNV;` / `ZZNV{0-4};` | RX2 NR level | Bidirectional |
-| `ZZNU;` / `ZZNU0;`/`ZZNU1;` | RX2 ANF | Bidirectional |
-| `ZZVS2;` | VFO A<->B swap | Server -> Thetis |
-
-### Polling intervals
-
-| Poll | Interval | Commands |
-|------|----------|----------|
-| Meter | 100ms | `ZZRM1;` (RX1) / `ZZRM2;` (RX2) / `ZZRM5;` (TX) |
-| Full poll | 500ms | `ZZFA;ZZMD;ZZTX;ZZPS;ZZTP;ZZNE;ZZNT;ZZPC;ZZLA;ZZFL;ZZFH;ZZCT;ZZFB;ZZME;ZZLB;ZZFS;ZZFR;ZZNV;ZZNU;` |
+The only CAT-shaped escape hatch in v2.0.0 is `run_cat_ex:<ZZ-cmd>;` over TCI: this is a TCI-only relay that asks Thetis to execute a ZZ command on its own internal CAT parser (response returns over TCI). Used by the server for niche operations such as `ZZCN0/ZZCN1` (CTUN auto-recenter) and `ZZBY` (Thetis shutdown).
 
 ---
 
@@ -1003,10 +1029,10 @@ The desktop client provides an integrated WebView window (via `wry`, Win32 + Web
 ### Startup
 
 ```bash
-ThetisLink-Server.exe --tci ws://127.0.0.1:40001 --cat "127.0.0.1:13013"
+ThetisLink-Server.exe --tci ws://127.0.0.1:40001
 ```
 
-The server connects via TCI WebSocket to Thetis for audio, IQ and commands. A parallel CAT connection is automatically established for supplementary commands.
+The server connects via the single TCI WebSocket to Thetis for audio, IQ and all commands. There is no separate CAT connection (removed in v2.0.0).
 
 ### Session Management
 
@@ -1049,6 +1075,19 @@ Server adjusts spectrum FPS per client based on reported loss:
 - **0-5% loss:** Normal FPS
 - **5-15% loss:** Half FPS (skip every other frame)
 - **>15% loss:** Spectrum paused — audio has priority
+
+### Server-side CTUN auto-recenter (fork)
+
+With the PA3GHM fork enabled and `auto_recenter_ex` advertised in `tci_caps_ex`, the **TL-server owns CTUN recentering**. The capability flag is advertise-only — there is no `auto_recenter_ex:` command handler in Thetis and no `pan_ex` push contract. The server polls VFO/DDC state and toggles CTUN to force Thetis to recenter the bandscope on the current VFO.
+
+- **Trigger evaluation** (`ctun_recenter::evaluate_trigger`): the server checks per-RX whether the VFO is leaving the safety band of the visible spectrum, gated on `effective_zoom`, `vfo_freq`, `dds_freq`, `ddc_sample_rate` and `tx_active`. PTT (local or external `thetis_tx_active`) blocks recenter.
+- **Recenter action**: a brief CTUN OFF/ON burst toggled via the TCI `run_cat_ex` relay:
+  - **RX1**: `ZZCN0` → 50 ms → `ZZCN1`
+  - **RX2**: `ZZCO0` → 50 ms → `ZZCO1` (note: **not** `ZZCP`, which is compander)
+  - During the burst a 200 ms `recentering` flag is set per RX so a second trigger cannot interrupt the toggle.
+- **Gating**: only active when the fork advertises `auto_recenter_ex`. The **AllowZoomBelow2x** SetupForm checkbox (ControlId `0x63`) is the per-client setup-vink that controls whether sub-2× zoom is permitted while recenter is on (smear trade-off).
+- **Band-switch detection**: VFO jumps larger than the DDC bandwidth force CTUN re-enable (Thetis can drop CTUN per band internally).
+- **Stock fallback**: without `auto_recenter_ex` the server skips recenter entirely. The client may still scroll/pan the visible window manually; there is no automatic recenter against stock v2.10.3.15.
 
 ---
 
@@ -1133,14 +1172,14 @@ Peak-based envelope follower with noise gate:
 
 When switching audio device (microphone or speaker), all jitter buffers are reset to prevent frame buildup. Without reset the buffer can accumulate up to 38+ frames (~760ms delay).
 
-### RX Volume (ZZLA) Synchronization
+### RX Volume Synchronization
 
-The RX Volume (RX1 AF Gain) is bidirectionally synchronized between Thetis and all clients:
+The RX Volume (RX1 AF Gain) is bidirectionally synchronized between Thetis and all clients via TCI:
 
-1. **Server -> Client:** Server polls `ZZLA;` via CAT -> broadcast as ControlPacket -> client update
-2. **Client -> Server:** Slider change -> ControlPacket(Rx1AfGain) -> server sends `ZZLA{:03};`
+1. **Server -> Client:** Thetis pushes `volume:dB;` (or `rx_volume:0,0,dB;` for stock .14+) → server forwards as ControlPacket → client update
+2. **Client -> Server:** Slider change → ControlPacket(Rx1AfGain) → server sends `rx_volume:0,0,dB;` over TCI
 
-**Sync protocol:** Client only sends ZZLA to server after the first value from the server has been received (`rx_volume_synced` flag). This prevents the client from pushing its local value to Thetis on connect.
+**Sync protocol:** Client only sends volume to server after the first value from the server has been received (`rx_volume_synced` flag). This prevents the client from pushing its local value to Thetis on connect.
 
 ---
 
@@ -1170,7 +1209,7 @@ ThetisLink supports 7 external devices via the server. Status is read and forwar
 
 ### JC-4s Antenna Tuner
 
-Automatic antenna tuner. Uses serial USB RTS/CTS signal lines (no data). CAT commands (ZZTU1/ZZTU0) are forwarded via a tokio channel to Thetis.
+Automatic antenna tuner. Uses serial USB RTS/CTS signal lines (no data). Tune-on/off relays to Thetis via TCI `tune:0,true;` / `tune:0,false;` (forwarded over a tokio channel).
 
 **Tuner states:**
 
@@ -1222,20 +1261,42 @@ RF2K-S (RFKIT) solid-state linear amplifier.
 
 ### UltraBeam RCU-06 Antenna Controller
 
-Controller for UltraBeam steerable Yagi antenna. Controls element lengths via stepper motors.
+Controller for UltraBeam steerable Yagi antenna. Controls element lengths via stepper motors over a long (typically 50 m) cable to the mast. The RCU-06 itself tracks motor positions via encoders on that cable; ThetisLink only relays user commands and reads back status.
 
-**Hardware protocol:** Proprietary binary protocol via RS-232: `0x55` (sync) + command + data + checksum.
+**Hardware protocol:** Proprietary framed binary protocol over RS-232 (USB-serial, 19200 baud). Frame format: `STX` (0xF5) + DLE-quoted (`SEQ`, `COM`, `DAT…`, `CHK`) + `ETX` (0xFA). DLE byte is `0xF6`. Checksum init `0x55`, per-byte `chk = (chk ^ b) + 1` over `SEQ + COM + DAT…`; verifying receive is "compute over `SEQ + COM + DAT… + CHK` should yield 1".
 
-| Command | Description |
-|---------|-------------|
-| Status query | Band, direction, motors, elements |
-| Set frequency | kHz + direction (forward/reverse) |
-| Retract | Retract all elements (transport position) |
-| Read elements | Element positions in mm |
+| Command | ID | Description |
+|---------|----|----|
+| Status query | 1 | Band, direction, per-motor moving bitfield, controller state, frequency |
+| Retract | 2 | Retract all elements (transport position) |
+| Set frequency | 3 | kHz + direction (normal / 180° / bidirectional) |
+| Read elements | 9 | Element positions in mm (6 × u16) |
+| Motor progress | 10 | Distance travelled (mm) + completion (0..60), single combined value for both motors |
+| Modify element | 12 | Manually set one element length |
 
-Frequency steps: 25 kHz and 100 kHz.
+**Status response (14 bytes DAT) — per-motor bitfield (v2.0.0):**
 
-**UI:** Frequency/band display, direction indicator (forward/reverse), motor status (moving/complete %), element lengths per element, retract button.
+| Byte | Field | Notes |
+|------|-------|-------|
+| 0 | fw_major | Firmware major (e.g. 0x42 = 66) |
+| 1 | fw_minor | Firmware minor (e.g. 0x04 = 4) |
+| 2 | operation | 0=normal, 2=user_adj, 3=setup |
+| 3-4 | frequency_khz | LE u16, kHz |
+| 5 | band | 0=6m … 10=160m |
+| 6 | direction | 0=normal, 1=180°, 2=bidir |
+| 7 | flags | bit 0 = "any motor moving" / busy flag |
+| 8 | controller_state | Internal state byte (typically 0x22 / 0x23); not motion |
+| **9** | **motors_moving** | **Per-motor bitfield: bit 0 = motor 1, bit 1 = motor 2.** 0x00 = idle, 0x01 = only M1 moving, 0x02 = only M2, 0x03 = both. |
+| 10 | freq_max_mhz | Maximum frequency (MHz) |
+| 11-13 | trailing / reserved | Ignored by ThetisLink |
+
+Pre-v2.0.0 the parser read byte 8 as `motors_moving` — that byte is actually a controller-state value that is non-zero even when idle, so the motor-progress poll triggered continuously and the per-motor display was meaningless. From v2.0.0 the parser reads byte 9 (validated by tracking byte transitions during a 40m → 20m band-switch and a retract operation: the bit that stays set longer corresponds to the motor with the larger element-position delta).
+
+**Motor progress (CMD 10) is a single combined value** for both motors. The RCU-06 firmware does not expose per-motor progress. ThetisLink shows two M1 / M2 status indicators (driven by the byte 9 bitfield) plus one shared progress bar.
+
+**Unsolicited broadcasts:** Approximately every 84-148 seconds the RCU-06 sends a 3-burst sequence of unsolicited frames containing the same DAT as a CMD_STATUS response but with `COM = 0x00` and a checksum that uses a different init/algorithm — `read_packet` reports these as "Checksum mismatch (got 129)". The poll loop recovers automatically within ~30 seconds. Logged at debug level. No functional impact (motor positions are tracked by the RCU-06 itself, independent of our PC link).
+
+**UI:** Frequency/band display, direction indicator (forward/reverse), per-motor M1 + M2 indicators, shared motor-progress bar, element lengths per element, retract button.
 
 ### EA7HG Visual Rotor
 
@@ -1285,12 +1346,30 @@ TCI IQ_STREAM (receiver 0 or 1) -> Complex float32 I/Q pairs -> Accumulation
 
 ### TCI IQ Stream
 
-Spectrum data comes via the TCI WebSocket IQ stream (384 kHz sample rate).
+Spectrum data comes via the TCI WebSocket IQ stream.
 
 - **Source:** TCI `IQ_STREAM` command, receiver 0 (RX1) and receiver 1 (RX2)
 - **Sample format:** Float32 I/Q pairs
-- **Sample rate:** 384 kHz (configurable via `IQ_SAMPLERATE` TCI command)
+- **Sample rate:** see "DDC sample rate per RX" below
 - **Consumer:** Dedicated tokio task drains IQ channels to the spectrum processor
+
+### DDC sample rate per RX
+
+The IQ sample rate is configurable per receiver via the **DDC sample rate dropdown** in the client (Spectrum panel).
+
+| Sample rate | Stock v2.10.3.15 | PA3GHM fork (TL2-1) | Notes |
+|-------------|------------------|---------------------|-------|
+| 48 kHz | yes | yes | minimal IQ window, lowest CPU/network |
+| 96 kHz | yes | yes | |
+| 192 kHz | yes | yes | |
+| 384 kHz | yes | yes | default |
+| 768 kHz | no | yes | requires `tci_caps_ex` + `ddc_sample_rate_ex` |
+| 1536 kHz | no | yes | maximum, requires fork |
+
+- **Stock TCI** (`IQ_SAMPLERATE`): the rate is global per Thetis instance. Setting it for RX1 also affects RX2; the client dropdown clamps to the global value.
+- **Fork TCI `_ex`** (`ddc_sample_rate_ex:<rx>,<rate>;`): rate is selectable independently per RX0 and RX1. The server emits a push update (`ddc_sample_rate_ex:<rx>,<rate>;`) so other clients see the change live.
+- **Network impact**: Float32 I/Q at 1536 kHz is ~12 MB/s raw. Opus on the audio path is unaffected; only the IQ stream scales with the rate. ThetisLink streams IQ from the server's process memory to the client's spectrum processor — there is no IQ over UDP to the client; only `SpectrumPacket` (binned + smoothed) goes over the wire.
+- **FFT size**: `ddc_fft_size()` scales with sample rate; the bins/pixel ratio remains constant across rates.
 
 ### FFT Configuration
 
@@ -1402,18 +1481,17 @@ RX2 spectrum is processed in an independent `Rx2SpectrumProcessor`, identical to
 | rx2_spectrum_zoom | 1.0-1024.0 | 1.0 |
 | rx2_spectrum_pan | -0.5 to 0.5 | 0.0 |
 
-### RX2 CAT Commands
+### RX2 TCI Commands
 
-| Command | Function | Range |
-|---------|----------|-------|
-| `ZZFB` | VFO-B frequency | 11 digits (Hz) |
-| `ZZME` | RX2 mode | 00-11 |
-| `ZZLB` | RX2 AF volume | 000-100 |
-| `ZZFS` | RX2 filter low cut | Signed Hz |
-| `ZZFR` | RX2 filter high cut | Signed Hz |
-| `ZZNV` | RX2 NR level | 0-4 (0=off, 1-4=NR1-NR4) |
-| `ZZNU` | RX2 ANF | 0/1 |
-| `ZZRM2` | RX2 S-meter | 0-260 |
+| TCI command | Function | Range |
+|-------------|----------|-------|
+| `vfo:0,1,Hz;` | VFO-B frequency | u64 Hz |
+| `modulation:1,mode;` | RX2 mode | LSB/USB/CW/AM/FM/DIGU/DIGL/SAM |
+| `rx_volume:1,0,dB;` | RX2 AF volume | -60..0 dB (0..100% in UI) |
+| `rx_filter_band:1,low,high;` | RX2 filter low/high cut | Signed Hz |
+| `rx_nr_enable_ex:1,enabled,level;` | RX2 NR level | 0-4 (0=off, 1-4=NR1-NR4) |
+| `rx_anf_enable:1,bool;` | RX2 ANF | true/false |
+| `MeterPacket` push | RX2 S-meter | dBm via binary push |
 
 ### Desktop Client: Joined/Split Popout Windows
 
@@ -1437,7 +1515,7 @@ Two display modes:
 ### VFO Sync / Swap
 
 - **VfoSync** (ControlId 0x14): VFO-B automatically follows VFO-A frequency
-- **VfoSwap** (ControlId 0x19): swaps VFO A and B frequencies (maps to `ZZVS2`)
+- **VfoSwap** (ControlId 0x19): swaps VFO A and B frequencies (maps to TCI `vfo_swap_ex;`)
 
 ### Diversity
 
@@ -1463,11 +1541,14 @@ Replaces the separate Audio (0x01), AudioRx2 (0x0E) and AudioBinR (0x1A) packets
 
 ### Channel IDs
 
-| ID | Channel | Present when |
-|----|---------|--------------|
-| 0 | RX1 | Always |
-| 1 | BinR | Binaural on (RX1 right channel) |
-| 2 | RX2 | RX2 enabled |
+| ID | Channel | Codec | Sample rate | Present when |
+|----|---------|-------|-------------|--------------|
+| 0 | RX1 | Opus narrowband | 8 kHz | Always (Thetis RX) |
+| 1 | BinR | Opus narrowband | 8 kHz | Binaural on (RX1 right channel) |
+| 2 | RX2 | Opus narrowband | 8 kHz | RX2 enabled |
+| 3 | Yaesu RX | Opus narrowband | 8 kHz | Yaesu FT-991A connected |
+
+CH3 (Yaesu) is added when an FT-991A is connected via USB serial + USB Audio CODEC. The Yaesu RX path runs in parallel with the Thetis RX path; the client mixes CH0 (or CH1/2) and CH3 according to the user's audio routing settings. On Yaesu PTT the server captures from the client mic into Yaesu CH3 TX (Opus wideband 16 kHz, see §26) and routes Thetis RX away from the speaker for the duration of TX.
 
 ### Advantages
 
@@ -1604,26 +1685,20 @@ Desktop (egui) and Android (Compose Canvas) use identical color calculation. The
 
 ---
 
-## 24. CAT-to-TCI Translation (v0.6.7)
+## 24. CAT-to-TCI Translation (historical, v0.6.7)
 
-Automatic translation of ZZ CAT commands to TCI when the auxiliary CAT connection is not available (typically when TCI extensions are enabled).
+In v0.6.7 the server learned to internally translate ZZ-style CAT commands to their TCI equivalents when the auxiliary CAT connection was unavailable. **In v2.0.0 the auxiliary CAT path is removed entirely**, so this translation layer is no longer needed at runtime — every internal command is already a TCI command. The legacy mapping below remains useful for users connecting external CAT clients to the Thetis CAT server (Thetis-side, not ThetisLink-side).
 
-### Translation table
+| Legacy CAT | TCI equivalent |
+|------------|----------------|
+| `ZZFA{freq}` | `vfo:0,0,{freq}` |
+| `ZZFB{freq}` | `vfo:0,1,{freq}` |
+| `ZZMD{mode}` | `modulation:0,0,{mode}` |
+| `ZZME{mode}` | `modulation:0,1,{mode}` |
+| `ZZTU{0/1}` | `tune:0,{true/false}` |
+| `ZZTX{0/1}` | `trx:0,{true/false}` |
 
-| CAT command | TCI command | Description |
-|-------------|-------------|-------------|
-| `ZZFA{freq}` | `vfo:0,0,{freq}` | VFO-A frequency |
-| `ZZFB{freq}` | `vfo:0,1,{freq}` | VFO-B frequency |
-| `ZZMD{mode}` | `modulation:0,0,{mode}` | RX1 mode |
-| `ZZME{mode}` | `modulation:0,1,{mode}` | RX2 mode |
-| `ZZTU{0/1}` | `tune:0,{true/false}` | Tune on/off |
-| `ZZTX{0/1}` | `trx:0,{true/false}` | TX on/off |
-
-### When active
-
-- Only when there is no separate CAT TCP connection (no `--cat` argument or connection failed)
-- With TCI extensions: all controls go via TCI, CAT is not needed
-- Fallback: if a command cannot be translated, it is ignored with a debug log
+The v0.6.7 helper still ships in source as `cat_to_tci()` (in `ptt.rs`) for the single edge-case where a server-internal call site historically used a ZZ string; it now feeds straight into the TCI sender.
 
 ---
 
@@ -1660,7 +1735,32 @@ The FT-991A is controlled via USB serial (CP210x) and USB Audio CODEC. The serve
 | Yaesu RX | 991A USB -> server -> client | Opus narrowband | 8 kHz | ~13 kbps |
 | Yaesu TX | Client mic -> server -> 991A USB | Opus wideband | 16 kHz | ~24 kbps |
 
-**FM -> DATA-FM transparency:** On Yaesu PTT the server automatically switches from FM to DATA-FM (needed for USB mic) and restores FM after TX. The user only sees FM in all lists.
+**FM -> DATA-FM transparency (auto-DFM):** On Yaesu PTT the server automatically switches from FM to DATA-FM (needed for USB mic) and restores after PTT-off. The user only sees FM in all lists.
+
+Detailed flow (PTT-toggle, server-driven). The server uses **cached** Yaesu status (populated by the 500 ms `IF;` poll loop and incremental updates). It does not actively read state at PTT transitions.
+
+1. **PTT-on** (cached fields read: `mode_char`, `auto_dfm_active`, `vfo_select` for memory-mode flag, `memory_channel`):
+   - If `mode_char == '4'` (FM) **and** `auto_dfm_active == false`:
+     - Send `MD0A;` (DATA-FM on the FT-991A — mode digit `A`, **not** `MD08;`).
+     - Sleep 50 ms so the radio's mode-change transient settles before TX comes up.
+     - Set cached `auto_dfm_active = true` and `auto_dfm_saved_memory_channel` = `memory_channel` if currently in memory mode (`vfo_select == 1`) and `memory_channel > 0`, else 0.
+     - Send `TX1;`.
+   - If already in DATA-FM (`auto_dfm_active == true` from a previous toggle, or never in FM): just send `TX1;`, no mode change.
+   - If `mode_char == '4'` in memory mode but `memory_channel == 0`: a warning is logged ("state not initialised") and no MC-restore will be possible at PTT-off. This catches the IF-poll-init-transient (~100 ms after cold-boot) where the cached memory channel has not arrived yet.
+2. **TX**: Yaesu USB CODEC plays out client mic audio at 16 kHz Opus.
+3. **PTT-off** (cached field read: `auto_dfm_saved_memory_channel`):
+   - If `auto_dfm_active == true`:
+     - Send `TX0;`.
+     - Sleep 100 ms for the TX-transition to settle before mode-change.
+     - Send `MD04;` to restore FM.
+     - If `auto_dfm_saved_memory_channel > 0`: sleep 50 ms, then send `MC<nnn>;` (zero-padded, e.g. `MC012;`) to recall the saved memory channel. The radio re-enters memory mode with channel name, scanning state etc. preserved.
+     - Clear cached `auto_dfm_active = false` and `auto_dfm_saved_memory_channel = 0`.
+   - Else (radio was not auto-DFM'd by us): send `TX0;` and stop.
+4. **Edge cases**:
+   - Mode-change in memory mode forces the FT-991A out of memory mode into the VFO of that channel — this is unavoidable for getting USB mic audio routed. The MC-restore at PTT-off recovers memory mode.
+   - If serial reconnect happens during TX, the cached memory channel is dropped. The user lands in DATA-FM/VFO and has to re-recall the memory channel manually.
+
+The `auto_dfm_active: bool` and `auto_dfm_saved_memory_channel: u16` fields live on the cached Yaesu status struct (0 = no saved channel).
 
 ### Memory Channel Editor
 
@@ -1799,7 +1899,7 @@ Passwords and TOTP secrets are automatically obfuscated on saving.
 
 1. **AM/FM audio:** Currently no audio in AM/FM mode on Thetis (SSB/CW works correctly).
 
-2. **HPSDR Protocol 1:** Only Protocol 2 (ANAN 7000DLE, 8000DLE, etc.) is supported. Protocol 1 (Hermes, Angelia, Orion) is not implemented.
+2. **HPSDR protocol coverage:** ThetisLink talks to Thetis (via TCI), not to the SDR hardware directly. Both HPSDR Protocol 1 (Hermes, Angelia, Orion) and Protocol 2 (ANAN 7000DLE, 8000DLE, G2, Hermes-Lite 2, etc.) are therefore supported as long as Thetis itself supports the device.
 
 3. **Single TX:** Only one client can transmit at a time. Other clients receive PttDenied.
 

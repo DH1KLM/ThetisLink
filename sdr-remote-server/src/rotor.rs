@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#![allow(dead_code)]
 use std::net::UdpSocket;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -109,7 +108,9 @@ fn rotor_thread(
 
     info!("Rotor: UDP socket bound, sending to {}", remote);
 
-    let mut last_response = Instant::now() - OFFLINE_TIMEOUT;
+    let mut last_response = Instant::now()
+        .checked_sub(OFFLINE_TIMEOUT)
+        .unwrap_or_else(Instant::now);
 
     loop {
         // Send position query
@@ -238,6 +239,7 @@ fn parse_status_response(resp: &str, status: &Arc<Mutex<RotorStatus>>) {
     }
 }
 
+#[allow(dead_code)] // debug helper for command-name logging
 fn cmd_name(cmd: &RotorCmd) -> &'static str {
     match cmd {
         RotorCmd::GoTo(_) => "GoTo",

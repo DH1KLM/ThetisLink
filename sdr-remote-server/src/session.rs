@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #![allow(dead_code)]
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Instant;
@@ -80,6 +81,10 @@ pub struct ClientSession {
     pub vfo_sync: bool,
     pub yaesu_enabled: bool,
     pub audio_mode: u8, // 255=default(CH0 only), 0=Mono, 1=BIN, 2=Split
+    /// TL2-1 ctun-auto-recenter: per-client setup-vink "Allow zoom below 2x".
+    /// false=default (smear-vrij gegarandeerd, zoom-min 2x). true=opt-in (zoom 1x toegestaan).
+    /// Server enforces strictest: zolang één client false heeft, server-zoom-min = 2x.
+    pub allow_zoom_below_2x: bool,
 }
 
 /// Result of touching a session
@@ -168,6 +173,7 @@ impl SessionManager {
             rx2_spectrum_zoom: 1.0, rx2_spectrum_pan: 0.0,
             rx2_spectrum_max_bins: sdr_remote_core::DEFAULT_SPECTRUM_BINS as u16,
             vfo_sync: false, yaesu_enabled: false, audio_mode: 255,
+            allow_zoom_below_2x: false,
         });
         info!("Auth challenge sent to {}", addr);
         nonce
@@ -261,6 +267,7 @@ impl SessionManager {
                 vfo_sync: false,
                 yaesu_enabled: false,
                 audio_mode: 255, // default: CH0 only until client sends AudioMode
+                allow_zoom_below_2x: false,
             });
             TouchResult::NewClient
         }
@@ -544,5 +551,157 @@ impl SessionManager {
             .map(|s| s.spectrum_fps)
             .max()
             .unwrap_or(sdr_remote_core::DEFAULT_SPECTRUM_FPS)
+    }
+
+    /// TL2-1 ctun-auto-recenter: set per-client allow-zoom-below-2x setup-vink.
+    pub fn set_allow_zoom_below_2x(&mut self, addr: SocketAddr, allow: bool) {
+        if let Some(session) = self.clients.get_mut(&addr) {
+            session.allow_zoom_below_2x = allow;
+        }
+    }
+
+    /// TL2-1 ctun-auto-recenter: effective RX1 zoom for trigger-formula.
+    /// MIN-aggregation over all spectrum-enabled clients. Returns None if no clients
+    /// have RX1 spectrum enabled (no trigger-eval needed).
+    ///
+    /// Server-side **strictest enforce**: wanneer één of meer clients
+    /// allow_zoom_below_2x=false hebben, klemt de effectieve zoom op 2.0
+    /// ongeacht wat clients individueel pushen. Voorkomt dat een vink-aan-client
+    /// met zoom 1.0 de feature voor andere clients kapot maakt (formule
+    /// self-disabled onder zoom 1.2).
+    pub fn effective_zoom_rx1(&self) -> Option<f32> {
+        let raw = self.clients.values()
+            .filter(|s| s.spectrum_enabled)
+            .map(|s| s.spectrum_zoom)
+            .fold(None, |acc, z| Some(acc.map_or(z, |a: f32| a.min(z))));
+        let strictest = self.server_enforced_zoom_min();
+        raw.map(|z| z.max(strictest))
+    }
+
+    /// TL2-1 ctun-auto-recenter: effective RX2 zoom for trigger-formula.
+    /// Idem strictest-enforce als RX1.
+    pub fn effective_zoom_rx2(&self) -> Option<f32> {
+        let raw = self.clients.values()
+            .filter(|s| s.rx2_spectrum_enabled)
+            .map(|s| s.rx2_spectrum_zoom)
+            .fold(None, |acc, z| Some(acc.map_or(z, |a: f32| a.min(z))));
+        let strictest = self.server_enforced_zoom_min();
+        raw.map(|z| z.max(strictest))
+    }
+
+    /// TL2-1 ctun-auto-recenter: server-enforced zoom-min for clients.
+    /// Returns 1.0 only if ALL connected clients have allow_zoom_below_2x=true.
+    /// Returns 2.0 (strictest) when ≥1 client has the vink uit (default).
+    /// Re-applies on connect/disconnect/vink-toggle.
+    pub fn server_enforced_zoom_min(&self) -> f32 {
+        if self.clients.is_empty() {
+            return 2.0; // no clients connected → safe default
+        }
+        if self.clients.values().all(|s| s.allow_zoom_below_2x) {
+            1.0
+        } else {
+            2.0
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_session(addr_str: &str, allow: bool, rx1_zoom: f32, rx2_zoom: f32, rx1_en: bool, rx2_en: bool) -> ClientSession {
+        ClientSession {
+            addr: addr_str.parse().unwrap(),
+            last_seen: Instant::now(),
+            auth_state: AuthState::NoAuth,
+            last_heartbeat_seq: 0, rtt_ms: 0, loss_percent: 0, jitter_ms: 0,
+            spectrum_enabled: rx1_en,
+            spectrum_fps: 30,
+            spectrum_zoom: rx1_zoom,
+            spectrum_pan: 0.0,
+            spectrum_max_bins: 256,
+            rx2_enabled: rx2_en, rx2_spectrum_enabled: rx2_en,
+            rx2_spectrum_fps: 30,
+            rx2_spectrum_zoom: rx2_zoom,
+            rx2_spectrum_pan: 0.0,
+            rx2_spectrum_max_bins: 256,
+            vfo_sync: false, yaesu_enabled: false, audio_mode: 255,
+            allow_zoom_below_2x: allow,
+        }
+    }
+
+    /// Unit-test: effective_zoom MIN-aggregation over multiple clients.
+    /// Alle 3 clients vink-aan → strictest=1.0 → MIN doorgelaten.
+    #[test]
+    fn effective_zoom_min_aggregation() {
+        let mut mgr = SessionManager::new(None, None);
+        mgr.clients.insert("127.0.0.1:5001".parse().unwrap(), mk_session("127.0.0.1:5001", true, 8.0, 4.0, true, true));
+        mgr.clients.insert("127.0.0.1:5002".parse().unwrap(), mk_session("127.0.0.1:5002", true, 4.0, 8.0, true, true));
+        mgr.clients.insert("127.0.0.1:5003".parse().unwrap(), mk_session("127.0.0.1:5003", true, 2.0, 16.0, true, true));
+        // Alle vink-aan → strictest=1.0 → effective = raw MIN
+        // RX1: min(8, 4, 2) = 2; RX2: min(4, 8, 16) = 4
+        assert_eq!(mgr.server_enforced_zoom_min(), 1.0);
+        assert_eq!(mgr.effective_zoom_rx1(), Some(2.0));
+        assert_eq!(mgr.effective_zoom_rx2(), Some(4.0));
+    }
+
+    #[test]
+    fn effective_zoom_none_when_no_spectrum_enabled() {
+        let mut mgr = SessionManager::new(None, None);
+        mgr.clients.insert("127.0.0.1:5001".parse().unwrap(), mk_session("127.0.0.1:5001", true, 8.0, 4.0, false, false));
+        assert_eq!(mgr.effective_zoom_rx1(), None);
+        assert_eq!(mgr.effective_zoom_rx2(), None);
+    }
+
+    /// Unit-test: vink-strictest wins (zolang één client vink-uit, server zoom-min = 2.0).
+    #[test]
+    fn vink_strictest_wins() {
+        let mut mgr = SessionManager::new(None, None);
+        // 2 clients, 1 vink-aan + 1 vink-uit → strictest = 2.0
+        mgr.clients.insert("127.0.0.1:5001".parse().unwrap(), mk_session("127.0.0.1:5001", true, 8.0, 4.0, true, true));
+        mgr.clients.insert("127.0.0.1:5002".parse().unwrap(), mk_session("127.0.0.1:5002", false, 4.0, 8.0, true, true));
+        assert_eq!(mgr.server_enforced_zoom_min(), 2.0);
+
+        // Beide vink-aan → toegestaan zoom 1.0
+        mgr.clients.get_mut(&"127.0.0.1:5002".parse::<SocketAddr>().unwrap()).unwrap().allow_zoom_below_2x = true;
+        assert_eq!(mgr.server_enforced_zoom_min(), 1.0);
+
+        // Reset 1 naar vink-uit → terug naar strictest 2.0
+        mgr.clients.get_mut(&"127.0.0.1:5001".parse::<SocketAddr>().unwrap()).unwrap().allow_zoom_below_2x = false;
+        assert_eq!(mgr.server_enforced_zoom_min(), 2.0);
+    }
+
+    #[test]
+    fn vink_strictest_no_clients_returns_safe_default() {
+        let mgr = SessionManager::new(None, None);
+        // Geen clients → safe default 2.0
+        assert_eq!(mgr.server_enforced_zoom_min(), 2.0);
+    }
+
+    /// Unit-test: effective_zoom moet zelf clampen op strictest-min.
+    /// Mix van vink-aan + vink-uit met zoom 1.0 mag NIET 1.0 doorlaten.
+    #[test]
+    fn effective_zoom_clamps_to_strictest_min() {
+        let mut mgr = SessionManager::new(None, None);
+        // Mix: client A vink-uit zoom 8, client B vink-aan zoom 1.0
+        mgr.clients.insert("127.0.0.1:5001".parse().unwrap(), mk_session("127.0.0.1:5001", false, 8.0, 8.0, true, true));
+        mgr.clients.insert("127.0.0.1:5002".parse().unwrap(), mk_session("127.0.0.1:5002", true, 1.0, 1.0, true, true));
+        // Strictest = 2.0 (één client vink-uit). Raw MIN = 1.0. Clamp → 2.0.
+        assert_eq!(mgr.server_enforced_zoom_min(), 2.0);
+        assert_eq!(mgr.effective_zoom_rx1(), Some(2.0));
+        assert_eq!(mgr.effective_zoom_rx2(), Some(2.0));
+
+        // Beide vink-aan → strictest 1.0, raw MIN = 1.0, doorgelaten
+        mgr.clients.get_mut(&"127.0.0.1:5001".parse::<SocketAddr>().unwrap()).unwrap().allow_zoom_below_2x = true;
+        assert_eq!(mgr.effective_zoom_rx1(), Some(1.0));
+        assert_eq!(mgr.effective_zoom_rx2(), Some(1.0));
+
+        // Eén client zoom 4 + ander zoom 1.0 (beide vink-aan) → MIN 1.0
+        mgr.clients.get_mut(&"127.0.0.1:5001".parse::<SocketAddr>().unwrap()).unwrap().spectrum_zoom = 4.0;
+        assert_eq!(mgr.effective_zoom_rx1(), Some(1.0));
+
+        // Zelfde maar één van twee toggle vink-uit → clamp naar 2.0
+        mgr.clients.get_mut(&"127.0.0.1:5002".parse::<SocketAddr>().unwrap()).unwrap().allow_zoom_below_2x = false;
+        assert_eq!(mgr.effective_zoom_rx1(), Some(2.0));
     }
 }

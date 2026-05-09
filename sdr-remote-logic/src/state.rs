@@ -271,6 +271,7 @@ pub struct RadioState {
     pub diversity_source: u8,
     pub diversity_gain_rx1: u16,
     pub diversity_gain_rx2: u16,
+    pub diversity_gain_multi: u16, // multi × 100 (range 100..1000 = 1.00..10.00)
     pub diversity_phase: u16, // encoded: phase*100 + 18000
 
     pub ddc_sample_rate_rx1: u16, // kHz (e.g. 192, 384, 1536)
@@ -489,6 +490,7 @@ impl Default for RadioState {
             diversity_source: 0,
             diversity_gain_rx1: 1500,
             diversity_gain_rx2: 1500,
+            diversity_gain_multi: 100, // 1.00x default; updated on connect from Thetis caps
             diversity_phase: 18000,
             ddc_sample_rate_rx1: 0,
             ddc_sample_rate_rx2: 0,

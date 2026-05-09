@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 package com.sdrremote.ui.screens
 
 import android.content.Context
@@ -127,7 +129,19 @@ fun MainScreen(viewModel: SdrViewModel = viewModel()) {
     val spectrumRefState = rememberSaveable { mutableFloatStateOf(prefs.getFloat("spectrum_ref", -30f)) }
     val spectrumRangeState = rememberSaveable { mutableFloatStateOf(prefs.getFloat("spectrum_range", 80f)) }
     val waterfallContrastState = rememberSaveable { mutableFloatStateOf(prefs.getFloat("waterfall_contrast", 1f)) }
+    // TL2-1 ctun-auto-recenter setup-vink "Allow zoom below 2x".
+    // Default uit (zoom-min 2x; smear-vrij gegarandeerd via auto-recenter feature).
+    val allowZoomBelow2xState = rememberSaveable { mutableStateOf(prefs.getBoolean("allow_zoom_below_2x", false)) }
     val waterfallRingBuffer = remember { com.sdrremote.ui.components.WaterfallRingBuffer(100) }
+
+    // TL2-1 ctun-auto-recenter: push allow_zoom_below_2x state naar server bij elke
+    // (re)connect. Server enforced strictest over alle clients (zolang één client
+    // vink-uit heeft, server klemt zoom-min op 2x voor alle clients).
+    LaunchedEffect(state.connected) {
+        if (state.connected) {
+            viewModel.setControl(0x63, if (allowZoomBelow2xState.value) 1 else 0)
+        }
+    }
 
     // Push waterfall rows even when WaterfallView is off-screen
     LaunchedEffect(state.fullSpectrumSequence) {
@@ -837,6 +851,7 @@ fun MainScreen(viewModel: SdrViewModel = viewModel()) {
                             pan = spectrumPanState.floatValue,
                             contrast = waterfallContrastState.floatValue,
                             autoRefEnabled = autoRefEnabled,
+                            allowZoomBelow2x = allowZoomBelow2xState.value,
                             onRefDbChange = { v ->
                                 spectrumRefState.floatValue = v
                                 prefs.edit().putFloat("spectrum_ref", v).apply()
@@ -877,6 +892,13 @@ fun MainScreen(viewModel: SdrViewModel = viewModel()) {
                                     autoRefInitialized = false
                                 }
                                 prefs.edit().putBoolean("auto_ref_enabled", enabled).apply()
+                            },
+                            onAllowZoomBelow2xToggle = { allow ->
+                                allowZoomBelow2xState.value = allow
+                                prefs.edit().putBoolean("allow_zoom_below_2x", allow).apply()
+                                // Push direct naar server (ControlId::AllowZoomBelow2x = 0x63).
+                                // Server enforced strictest re-applies bij elke client-toggle.
+                                viewModel.setControl(0x63, if (allow) 1 else 0)
                             },
                         )
                     }

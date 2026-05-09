@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#![allow(dead_code)]
 use std::io::{Read, Write};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -74,6 +73,14 @@ pub struct YaesuState {
     pub memory_channel: u16, // Current memory channel number (from IF)
     pub split_active: bool,  // true = split mode active
     pub scan_active: bool,   // true = scanning
+    /// Auto-DFM PTT-toggle state: true wanneer huidige TX-cyclus tijdelijk DATA-FM
+    /// gebruikt (was FM='4' bij PTT-on, dan switch naar 'A' voor USB-mic-audio).
+    /// Bij PTT-off wordt mode hersteld naar '4'. Per owner-keuze 2026-05-08.
+    pub auto_dfm_active: bool,
+    /// Saved memory channel bij PTT-on als auto-DFM in Memory-mode actief is.
+    /// 0 = niet-in-memory of ongeldig; restore via MC<nnn>; na MD04; op PTT-off.
+    /// Per owner-keuze 2026-05-08 (build 14 memory-restore extension).
+    pub auto_dfm_saved_memory_channel: u16,
 }
 
 impl Default for YaesuState {
@@ -96,6 +103,8 @@ impl Default for YaesuState {
             memory_channel: 0,
             split_active: false,
             scan_active: false,
+            auto_dfm_active: false,
+            auto_dfm_saved_memory_channel: 0,
         }
     }
 }
@@ -146,15 +155,17 @@ fn yaesu_mode_to_internal(yaesu: char) -> u8 {
 }
 
 /// Map internal mode to Yaesu MD0x mode character.
-/// FM is sent as DATA-FM ('A') because USB mic audio only works in DATA-FM
-/// on the FT-991A (requires FM PKT PORT SELECT=USB in menu settings).
+/// FM is sent as native FM ('4') for normal RX with built-in audio. USB-mic
+/// TX-pad switcht runtime tijdelijk naar DATA-FM ('A') — zie SetPtt-handler in
+/// yaesu_poll_loop. Eerdere implementatie forceerde DATA-FM altijd; owner-test
+/// 2026-05-08 toonde dat USB-mic-audio in stand FM nu werkt na auto-toggle.
 fn internal_mode_to_yaesu(internal: u8) -> char {
     match internal {
         0 => '1',  // LSB
         1 => '2',  // USB
         3 => '3',  // CW-L → CW
         4 => '7',  // CW-U → CW-R
-        5 => 'A',  // FM → DATA-FM (for USB mic)
+        5 => '4',  // FM → FM (RX); auto-switch naar 'A' (DATA-FM) bij PTT-on, terug bij PTT-off
         6 => '5',  // AM
         7 => 'C',  // DIGU → DATA-USB
         9 => '8',  // DIGL → DATA-LSB
@@ -221,7 +232,13 @@ impl YaesuRadio {
             let producer = tx_producer.clone();
             let mut rx = tx_audio_rx;
             std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
+                let rt = match tokio::runtime::Runtime::new() {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        log::error!("Yaesu TX audio bridge: tokio runtime init failed: {} — TX-audio disabled, RX/CAT blijven werken", e);
+                        return;
+                    }
+                };
                 rt.block_on(async {
                     while let Some(samples) = rx.recv().await {
                         if let Ok(ref mut guard) = producer.try_lock() {
@@ -410,7 +427,9 @@ fn yaesu_poll_loop(
 ) {
     let mut read_buf = String::new();
     let mut raw_buf = [0u8; 256];
-    let mut last_full_poll = Instant::now() - Duration::from_secs(1);
+    let mut last_full_poll = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(Instant::now);
     let mut last_smeter_poll = Instant::now();
     let mut last_response = Instant::now();
 
@@ -484,7 +503,94 @@ fn yaesu_poll_loop(
                     YaesuCmd::SetFreqA(hz) => format!("FA{:09};", hz),
                     YaesuCmd::SetFreqB(hz) => format!("FB{:09};", hz),
                     YaesuCmd::SetMode(mode) => format!("MD0{};", internal_mode_to_yaesu(mode)),
-                    YaesuCmd::SetPtt(on) => format!("TX{};", if on { 1 } else { 0 }),
+                    YaesuCmd::SetPtt(on) => {
+                        // Auto-DFM PTT-toggle (per owner-keuze 2026-05-08): in stand
+                        // FM ('4') werkt USB-mic-TX niet; tijdelijk naar DATA-FM ('A')
+                        // voor de duur van TX-cyclus, daarna terug. Geeft schone
+                        // FM-RX-audio én bruikbare USB-mic-TX.
+                        //
+                        // Build 11 splitste TX-toggle en mode-change met sleep zodat
+                        // Yaesu TX-transition kan voltooien voor mode-change komt.
+                        //
+                        // Build 12:
+                        //   - Single source of truth: dit is het ENIGE auto-DFM
+                        //     emission-punt (oude network.rs wrapper verwijderd →
+                        //     geen race meer).
+                        //   - !in_memory guard — mode-change in Memory-mode forceert
+                        //     Yaesu naar VFO; skip auto-DFM in Memory-mode.
+                        //
+                        // Build 14 (memory-restore extension, owner-keuze 2026-05-08):
+                        //   - !in_memory guard verwijderd; auto-DFM werkt ook in Memory.
+                        //   - Bij PTT-on: bewaar memory_channel als in_memory.
+                        //   - Bij PTT-off: na MD04, restore Memory-mode via MC<nnn>;.
+                        //   - Resultaat: USB-mic-TX werkt in Memory-FM én owner blijft
+                        //     na PTT-off in Memory-mode op origineel kanaal.
+                        let s_lock = status.lock().unwrap();
+                        let mode_char = s_lock.mode_char;
+                        let was_dfm = s_lock.auto_dfm_active;
+                        let in_memory = s_lock.vfo_select == 1;
+                        let mem_ch = s_lock.memory_channel;
+                        drop(s_lock);
+
+                        if on {
+                            if mode_char == '4' && !was_dfm {
+                                // Defensieve diagnose-aid (build 15):
+                                // Memory-mode met memory_channel=0 betekent stille memory-loss
+                                // bij PTT-off (saved=0 → geen MC-restore). Komt voor bij
+                                // IF-poll-init-transient (~100ms na cold-boot) of parser-bug.
+                                if in_memory && mem_ch == 0 {
+                                    warn!("Yaesu auto-DFM: in Memory-mode maar memory_channel=0 — geen MC-restore (state mogelijk niet geïnitialiseerd)");
+                                }
+                                // FM (VFO of Memory) → DATA-FM eerst, settle 50ms, dan PTT-on.
+                                // Bij Memory-mode: Yaesu wordt geforceerd naar VFO door MD0A;
+                                // we bewaren het kanaal en restoren na PTT-off via MC<nnn>;.
+                                let pre = b"MD0A;";
+                                if let Err(e) = port.write_all(pre) {
+                                    warn!("Yaesu auto-DFM pre-PTT MD0A failed: {}", e);
+                                    return;
+                                }
+                                std::thread::sleep(Duration::from_millis(50));
+                                let mut s = status.lock().unwrap();
+                                s.auto_dfm_active = true;
+                                s.auto_dfm_saved_memory_channel =
+                                    if in_memory && mem_ch > 0 { mem_ch } else { 0 };
+                                info!("Yaesu auto-DFM: FM → DATA-FM voor PTT-on (memory={}, ch={})",
+                                    in_memory, s.auto_dfm_saved_memory_channel);
+                                "TX1;".to_string()
+                            } else {
+                                "TX1;".to_string()
+                            }
+                        } else if was_dfm {
+                            let saved_mem = status.lock().unwrap().auto_dfm_saved_memory_channel;
+                            // PTT-off eerst (Yaesu schakelt TX uit), settle 100ms voor
+                            // TX-transition, dan mode terug naar FM, evt. memory-restore.
+                            if let Err(e) = port.write_all(b"TX0;") {
+                                warn!("Yaesu auto-DFM pre-MD TX0 failed: {}", e);
+                                return;
+                            }
+                            std::thread::sleep(Duration::from_millis(100));
+                            if let Err(e) = port.write_all(b"MD04;") {
+                                warn!("Yaesu auto-DFM MD04 failed: {}", e);
+                                return;
+                            }
+                            if saved_mem > 0 {
+                                std::thread::sleep(Duration::from_millis(50));
+                                let mc_cmd = format!("MC{:03};", saved_mem);
+                                if let Err(e) = port.write_all(mc_cmd.as_bytes()) {
+                                    warn!("Yaesu auto-DFM memory-restore {} failed: {}",
+                                        mc_cmd, e);
+                                }
+                            }
+                            let mut s = status.lock().unwrap();
+                            s.auto_dfm_active = false;
+                            s.auto_dfm_saved_memory_channel = 0;
+                            info!("Yaesu auto-DFM: DATA-FM → FM na PTT-off (mem-restore={})",
+                                saved_mem);
+                            String::new()  // alle commando's al verstuurd
+                        } else {
+                            "TX0;".to_string()
+                        }
+                    }
                     YaesuCmd::SetAfGain(v) => format!("AG0{:03};", v.min(255)),
                     YaesuCmd::SetTxPower(v) => format!("PC{:03};", v.min(100)),
                     YaesuCmd::SetPower(on) => format!("PS{};", if on { 1 } else { 0 }),
@@ -1005,6 +1111,7 @@ fn read_all_menus(port: &mut Box<dyn serialport::SerialPort>) -> Result<String, 
     Ok(lines.join("\n"))
 }
 
+#[allow(dead_code)] // helper for UI port-picker; not yet used by config flow
 pub fn available_ports() -> Vec<String> {
     serialport::available_ports()
         .unwrap_or_default()
@@ -1042,11 +1149,28 @@ fn build_capture_stream(
     let stream = device.build_input_stream(
         &config.into(),
         move |data: &[f32], _: &cpal::InputCallbackInfo| {
-            let mono: Vec<f32> = if channels > 1 {
-                data.chunks(channels).map(|ch| ch[0]).collect()
+            // OWNER LATENCY-WAIVER (release v2.0.0, owner: PA3GHM/cjenschede):
+            // Per-callback Vec-allocatie is bewust geaccepteerd op deze server-side
+            // Yaesu RX-pad. Owner heeft de latency-prioriteit afgewogen tegen de
+            // implementatie-kosten en gekozen voor de huidige aanpak omdat:
+            //   (a) server runt op Thetis-PC, geen lokale real-time audio-output;
+            //       audio-latency wordt overschaduwd door encode + netwerk-pad
+            //   (b) alloc-cost ~50µs is <0.5% van ~10ms frame-budget — niet
+            //       hoorbaar onder normale belasting
+            //   (c) Vec::with_capacity(frames) voorkomt grow-realloc bij stabiele
+            //       input-config
+            //   (d) tokio::mpsc::Sender consumeert de Vec (ownership-move); zero
+            //       alloc vereist Vec-pool met return-channel — niet-triviale
+            //       refactor, gepland voor post-release optimization in v2.1+.
+            let frames = data.len() / channels.max(1);
+            let mut mono: Vec<f32> = Vec::with_capacity(frames);
+            if channels > 1 {
+                for ch in data.chunks(channels) {
+                    mono.push(ch[0]);
+                }
             } else {
-                data.to_vec()
-            };
+                mono.extend_from_slice(data);
+            }
             let _ = tx.try_send(mono);
             // Update watchdog timestamp
             let now_ms = std::time::SystemTime::now()
@@ -1112,6 +1236,7 @@ fn build_output_stream(
 }
 
 /// Legacy structs kept for API compatibility (unused internally now)
+#[allow(dead_code)]
 pub struct YaesuAudio {
     pub _capture_stream: cpal::Stream,
     pub rx_audio_rx: tokio::sync::mpsc::Receiver<Vec<f32>>,
@@ -1119,6 +1244,7 @@ pub struct YaesuAudio {
 }
 unsafe impl Send for YaesuAudio {}
 
+#[allow(dead_code)]
 pub struct YaesuAudioOutput {
     _playback_stream: cpal::Stream,
     pub tx_audio_tx: tokio::sync::mpsc::Sender<Vec<f32>>,

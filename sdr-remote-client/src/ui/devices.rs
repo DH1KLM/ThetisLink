@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#![allow(dead_code)]
 use super::*;
 
 impl SdrRemoteApp {
@@ -1019,12 +1018,26 @@ impl SdrRemoteApp {
                 .on_hover_text(format!("Auto-track {} frequency", track_label));
         });
 
-        // Motor progress bar (only when moving)
+        // Per-motor moving + progress bar (alleen tonen bij beweging).
+        // ub_motors_moving is een bitfield: bit 0 = motor 1, bit 1 = motor 2.
+        // De progress-balk is een gedeelde waarde; de RCU-06 deelt geen
+        // afzonderlijke voortgang per motor.
         if self.ub_motors_moving != 0 {
             ui.add_space(4.0);
             let progress = (self.ub_motor_completion as f32 / 60.0).clamp(0.0, 1.0);
+            let m1_active = (self.ub_motors_moving & 0x01) != 0;
+            let m2_active = (self.ub_motors_moving & 0x02) != 0;
+            let active_color = Color32::from_rgb(255, 170, 40);
+            let idle_color = Color32::from_rgb(100, 100, 100);
             ui.horizontal(|ui| {
-                ui.label("Motor:");
+                ui.colored_label(
+                    if m1_active { active_color } else { idle_color },
+                    RichText::new("M1").strong(),
+                );
+                ui.colored_label(
+                    if m2_active { active_color } else { idle_color },
+                    RichText::new("M2").strong(),
+                );
                 let bar = egui::ProgressBar::new(progress)
                     .text(format!("{:.0}%", progress * 100.0));
                 ui.add(bar);

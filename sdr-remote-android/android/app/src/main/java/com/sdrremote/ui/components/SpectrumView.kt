@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 package com.sdrremote.ui.components
 
 import android.graphics.Bitmap
@@ -441,14 +443,22 @@ fun SpectrumControls(
     pan: Float,
     contrast: Float,
     autoRefEnabled: Boolean,
+    allowZoomBelow2x: Boolean,
     onRefDbChange: (Float) -> Unit,
     onRangeDbChange: (Float) -> Unit,
     onZoomChange: (Float) -> Unit,
     onPanChange: (Float) -> Unit,
     onContrastChange: (Float) -> Unit,
     onAutoRefToggle: (Boolean) -> Unit,
+    onAllowZoomBelow2xToggle: (Boolean) -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    // TL2-1 ctun-auto-recenter: zoom-min 2.0 default; 1.0 toegestaan via vink "Allow <2x".
+    val zoomMin = if (allowZoomBelow2x) 1f else 2f
+    // Clamp huidige zoom-state als vink uit gaat terwijl zoom <2x stond
+    if (zoom < zoomMin) {
+        onZoomChange(zoomMin)
+    }
     // Row 1: Zoom + Pan
     Row(
         modifier = modifier.fillMaxWidth(),
@@ -457,9 +467,9 @@ fun SpectrumControls(
     ) {
         Text("Zoom", fontSize = 11.sp)
         Slider(
-            value = ln(zoom.coerceIn(1f, 1024f)) / ln(1024f),
+            value = ln(zoom.coerceIn(zoomMin, 1024f) / zoomMin) / ln(1024f / zoomMin),
             onValueChange = { t ->
-                val newZoom = 1024f.pow(t).coerceIn(1f, 1024f)
+                val newZoom = (zoomMin * (1024f / zoomMin).pow(t)).coerceIn(zoomMin, 1024f)
                 onZoomChange(newZoom)
             },
             modifier = Modifier.weight(1f),
@@ -514,13 +524,13 @@ fun SpectrumControls(
         Text("${rangeDb.roundToInt()}", fontSize = 11.sp)
     }
 
-    // Row 3: Waterfall contrast
+    // Row 3: Waterfall contrast + Allow zoom <2x vink
     Row(
         modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(4.dp),
     ) {
-        Text("WF Contrast", fontSize = 11.sp)
+        Text("WF", fontSize = 11.sp)
         Slider(
             value = ln(contrast.coerceIn(0.1f, 10f)) / ln(10f),
             onValueChange = { t ->
@@ -531,6 +541,14 @@ fun SpectrumControls(
             modifier = Modifier.weight(1f),
         )
         Text("%.1f".format(contrast), fontSize = 11.sp)
+        Spacer(Modifier.width(4.dp))
+        // TL2-1 ctun-auto-recenter setup-vink. Default uit (zoom-min 2x).
+        // Server enforced strictest over alle clients.
+        Text("Zoom <2x", fontSize = 11.sp)
+        androidx.compose.material3.Checkbox(
+            checked = allowZoomBelow2x,
+            onCheckedChange = onAllowZoomBelow2xToggle,
+        )
     }
 }
 

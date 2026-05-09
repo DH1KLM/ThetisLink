@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#![allow(dead_code)]
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::Stream;
@@ -193,6 +192,9 @@ impl ClientAudio {
         let level = self.capture_level.clone();
         let err_flag = self.audio_error.clone();
         let gate = self.capture_gate.clone();
+        // Pre-allocated scratch — bewaart capacity over callback-aanroepen heen om
+        // real-time alloc op de audio-thread te voorkomen (latency-prioriteit).
+        let mut mono_scratch: Vec<f32> = Vec::with_capacity(8192);
         let capture_stream = input_device
             .build_input_stream(
                 &in_stream_config,
@@ -203,13 +205,16 @@ impl ClientAudio {
                         level.store(0u32, Ordering::Relaxed);
                         return;
                     }
-                    let mono: Vec<f32> = data.chunks(in_channels).map(|frame| frame[0]).collect();
+                    mono_scratch.clear();
+                    for frame in data.chunks(in_channels) {
+                        mono_scratch.push(frame[0]);
+                    }
 
-                    let rms =
-                        (mono.iter().map(|&s| s * s).sum::<f32>() / mono.len() as f32).sqrt();
+                    let rms = (mono_scratch.iter().map(|&s| s * s).sum::<f32>()
+                        / mono_scratch.len().max(1) as f32).sqrt();
                     level.store(rms.to_bits(), Ordering::Relaxed);
 
-                    capture_producer.push_slice(&mono);
+                    capture_producer.push_slice(&mono_scratch);
                 },
                 move |err| {
                     log::error!("client capture error: {}", err);
@@ -223,14 +228,20 @@ impl ClientAudio {
         let level = self.playback_level.clone();
         let err_flag = self.audio_error.clone();
         let mute = self.playback_mute.clone();
+        // Pre-allocated scratches voor mute-drain en stereo-read. Capacity groeit
+        // automatisch bij eerste call die meer nodig heeft; daarna geen alloc meer.
+        let mut drain_scratch: Vec<f32> = Vec::with_capacity(8192);
+        let mut stereo_scratch: Vec<f32> = Vec::with_capacity(8192);
         let playback_stream = output_device
             .build_output_stream(
                 &out_stream_config,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     // Instant mute during TX: output zeros and drain ring buffer
                     if mute.load(Ordering::Relaxed) {
-                        let mut drain = vec![0.0f32; data.len()];
-                        playback_consumer.pop_slice(&mut drain);
+                        if drain_scratch.len() < data.len() {
+                            drain_scratch.resize(data.len(), 0.0);
+                        }
+                        playback_consumer.pop_slice(&mut drain_scratch[..data.len()]);
                         data.fill(0.0);
                         level.store(0u32, Ordering::Relaxed);
                         return;
@@ -239,8 +250,11 @@ impl ClientAudio {
                     // Read interleaved stereo (L,R,L,R,...) into temp buffer
                     let frames = data.len() / out_channels.max(1);
                     let stereo_samples = frames * 2;
-                    let mut stereo_buf = vec![0.0f32; stereo_samples];
-                    let read = playback_consumer.pop_slice(&mut stereo_buf);
+                    if stereo_scratch.len() < stereo_samples {
+                        stereo_scratch.resize(stereo_samples, 0.0);
+                    }
+                    let stereo_buf = &mut stereo_scratch[..stereo_samples];
+                    let read = playback_consumer.pop_slice(stereo_buf);
                     let read_frames = read / 2;
 
                     // Scatter stereo into output channels (supports >2ch devices)
@@ -287,6 +301,7 @@ impl ClientAudio {
         Ok(())
     }
 
+    #[allow(dead_code)] // public API kept symmetric to start()
     pub fn stop(&self) -> Result<()> {
         if let Some(ref s) = self.capture_stream {
             s.pause().context("pause client capture")?;
@@ -308,14 +323,23 @@ impl ClientAudio {
     }
 
     /// Write stereo: interleave L+R into single ring buffer.
+    /// Direct per-sample try_push voorkomt allocatie van een intermediate Vec
+    /// (latency-prioriteit). Pre-check `vacant_len >= 2` per frame voorkomt
+    /// een half-frame edge-case waarin L slaagt maar R faalt.
     pub fn write_playback_stereo(&mut self, left: &[f32], right: &[f32]) -> usize {
         let n = left.len().min(right.len());
-        let mut interleaved = Vec::with_capacity(n * 2);
+        let mut written = 0;
         for i in 0..n {
-            interleaved.push(left[i]);   // L sample
-            interleaved.push(right[i]);  // R sample
+            // Pre-check: ring must have room for both L and R together — anders
+            // frame-skip om geen half-frame in ring achter te laten.
+            if self.playback_producer.vacant_len() < 2 {
+                break;
+            }
+            let _ = self.playback_producer.try_push(left[i]);
+            let _ = self.playback_producer.try_push(right[i]);
+            written += 1;
         }
-        self.playback_producer.push_slice(&interleaved) / 2
+        written
     }
 
     pub fn capture_level(&self) -> f32 {

@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#![allow(dead_code)]
 use std::io::{Read, Write};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -237,6 +236,7 @@ fn classify_timeout_payload(collected: &[u8]) -> PollFailureKind {
 pub(crate) struct TransitionCtx {
     pub consecutive_fails: u32,
     pub offline_since: Option<Instant>,
+    #[allow(dead_code)] // status field tracked for future UI / log; not yet read
     pub tx_active: bool,
 }
 
@@ -773,6 +773,7 @@ fn read_ack(port: &mut Box<dyn serialport::SerialPort>) -> Result<(), String> {
 }
 
 /// Send STATUS query (0x90) and parse the response.
+#[allow(dead_code)] // alternate poll-path kept for future fallback to STATUS-only mode
 fn query_status(port: &mut Box<dyn serialport::SerialPort>) -> Result<SpeStatus, String> {
     send_single_command(port, CMD_STATUS)?;
 
@@ -786,6 +787,7 @@ fn query_status(port: &mut Box<dyn serialport::SerialPort>) -> Result<SpeStatus,
 
 /// Read STATUS response. The response ends with CR LF, so we read until we see that.
 /// Response: [0xAA 0xAA 0xAA] [CNT] [DATA...] [CHK_LO] [CHK_HI] [,] [CR] [LF]
+#[allow(dead_code)] // companion to query_status; same future-fallback rationale
 fn read_status_response(port: &mut Box<dyn serialport::SerialPort>) -> Result<Vec<u8>, String> {
     let mut collected = Vec::with_capacity(128);
     let mut buf = [0u8; 128];
@@ -1078,6 +1080,7 @@ pub fn band_name(band: u8) -> &'static str {
 }
 
 /// Convert power level code to display string.
+#[allow(dead_code)] // helper kept for future client-side display formatting
 pub fn power_level_name(level: u8) -> &'static str {
     match level {
         0 => "L",

@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 //! Audio encoding/sending loops extracted from network.rs.
-//! Provides a generic TCI audio loop that is parameterized by packet type and
-//! address-selection closure, plus Yaesu and IQ consumer loops.
+//! Provides multi-channel + Yaesu audio bundlers and an IQ consumer loop.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -18,7 +16,7 @@ use sdr_remote_core::codec::OpusEncoder;
 use sdr_remote_core::protocol::*;
 use sdr_remote_core::{FRAME_SAMPLES, MAX_PACKET_SIZE, NETWORK_SAMPLE_RATE};
 
-use crate::ptt::{PttController, RadioBackend};
+use crate::ptt::PttController;
 use crate::session::SessionManager;
 
 // â”€â”€ Resampling helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -56,143 +54,6 @@ pub fn hq_sinc_params() -> rubato::SincInterpolationParameters {
         window: rubato::WindowFunction::Blackman,
     }
 }
-
-// â”€â”€ Generic TCI audio loop â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-/// Configuration for a TCI audio encoding loop.
-// Legacy types — kept for reference, will be removed in next cleanup
-#[allow(dead_code)]
-pub struct TciAudioLoopConfig {
-    /// Human-readable label for logging (e.g., "RX1", "RX2", "BinR")
-    pub label: &'static str,
-    /// Packet type for serialization (Audio, AudioRx2, AudioBinR)
-    pub packet_type: PacketType,
-    /// How long to wait before retrying channel acquisition (ms)
-    pub reconnect_delay_ms: u64,
-}
-
-/// Closure type that extracts the audio receiver from PttController.
-/// Returns `Some(receiver)` if the channel is available, `None` otherwise.
-#[allow(dead_code)]
-pub type AudioChannelExtractor = Box<dyn Fn(&mut PttController) -> Option<tokio::sync::mpsc::Receiver<Vec<f32>>> + Send>;
-
-/// Closure type that returns the list of destination addresses from SessionManager.
-#[allow(dead_code)]
-pub type AddressSelector = Box<dyn Fn(&SessionManager) -> Vec<SocketAddr> + Send>;
-
-/// Generic TCI audio loop: reads from a TCI audio channel, resamples 48kâ†’8k,
-/// encodes with Opus, and sends to selected clients.
-///
-/// This replaces the three near-identical loops (tx_loop_tci, tx_rx2_loop_tci,
-/// tx_bin_r_loop_tci) with a single parameterized function.
-#[allow(dead_code)]
-pub async fn tci_audio_loop(
-    socket: Arc<UdpSocket>,
-    session: Arc<Mutex<SessionManager>>,
-    ptt: Arc<Mutex<PttController>>,
-    mut audio_rx: Option<tokio::sync::mpsc::Receiver<Vec<f32>>>,
-    shutdown: &mut watch::Receiver<bool>,
-    start: Instant,
-    config: TciAudioLoopConfig,
-    extract_channel: AudioChannelExtractor,
-    select_addrs: AddressSelector,
-) -> Result<()> {
-    let tci_rate = 48000u32;
-    let tci_frame_samples = (tci_rate * 20 / 1000) as usize; // 960
-
-    let mut encoder = OpusEncoder::new()?;
-    let mut resampler_in = rubato::SincFixedIn::<f32>::new(
-        NETWORK_SAMPLE_RATE as f64 / tci_rate as f64,
-        1.0,
-        hq_sinc_params(),
-        tci_frame_samples,
-        1,
-    ).context(format!("create TCI {} 48k->8k resampler", config.label))?;
-
-    let mut sequence: u32 = 0;
-    let mut accumulator: Vec<f32> = Vec::with_capacity(tci_frame_samples * 4);
-    let mut tick = interval(Duration::from_millis(20));
-
-    loop {
-        // Try to acquire the audio channel from PttController
-        if audio_rx.is_none() {
-            let mut ptt_guard = ptt.lock().await;
-            audio_rx = extract_channel(&mut ptt_guard);
-            drop(ptt_guard);
-            if audio_rx.is_none() {
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_millis(config.reconnect_delay_ms)) => continue,
-                    _ = shutdown.changed() => break,
-                }
-            }
-        }
-
-        tokio::select! {
-            // Receive audio â€” accumulate
-            result = async {
-                if let Some(rx) = audio_rx.as_mut() { rx.recv().await } else { std::future::pending().await }
-            } => {
-                let samples = match result {
-                    Some(s) => s,
-                    None => {
-                        info!("TCI {} audio channel closed, waiting for reconnect", config.label);
-                        audio_rx = None;
-                        continue;
-                    }
-                };
-                accumulator.extend_from_slice(&samples);
-                let max_accum = tci_frame_samples * 10;
-                if accumulator.len() > max_accum {
-                    accumulator.drain(..accumulator.len() - max_accum);
-                }
-            }
-            // Timer tick: encode and send one frame
-            _ = tick.tick() => {
-                if accumulator.len() < tci_frame_samples {
-                    continue;
-                }
-                let frame: Vec<f32> = accumulator.drain(..tci_frame_samples).collect();
-
-                let addrs = {
-                    let sess = session.lock().await;
-                    select_addrs(&sess)
-                };
-                if addrs.is_empty() {
-                    continue;
-                }
-
-                let pcm_8k = resample_to_network(&mut resampler_in, &frame);
-                let pcm_i16: Vec<i16> = pcm_8k.iter()
-                    .map(|&s| (s * 32767.0).clamp(-32768.0, 32767.0) as i16)
-                    .collect();
-
-                if pcm_i16.len() >= FRAME_SAMPLES {
-                    let opus_data = encoder.encode(&pcm_i16[..FRAME_SAMPLES])?;
-                    let timestamp = start.elapsed().as_millis() as u32;
-                    let packet = AudioPacket {
-                        flags: Flags::NONE,
-                        sequence,
-                        timestamp,
-                        opus_data,
-                    };
-                    sequence = sequence.wrapping_add(1);
-
-                    let mut send_buf = Vec::with_capacity(MAX_PACKET_SIZE);
-                    packet.serialize_as_type(&mut send_buf, config.packet_type);
-
-                    for &addr in &addrs {
-                        let _ = socket.send_to(&send_buf, addr).await;
-                    }
-                }
-            }
-            _ = shutdown.changed() => break,
-        }
-    }
-
-    Ok(())
-}
-
-// â”€â”€ Stereo mixer audio loop â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 // ── Multi-channel audio bundler ─────────────────────────────────────────
 
@@ -239,7 +100,7 @@ pub async fn tci_multichannel_audio_loop(
         // Try to acquire missing channels
         if rx1_audio_rx.is_none() || rx2_audio_rx.is_none() || bin_r_audio_rx.is_none() {
             let mut ptt_guard = ptt.lock().await;
-            if let RadioBackend::Tci(ref mut tci) = ptt_guard.radio {
+            if let Some(tci) = Some(&mut ptt_guard.tci) {
                 if rx1_audio_rx.is_none() { rx1_audio_rx = tci.rx1_audio_rx.take(); }
                 if rx2_audio_rx.is_none() { rx2_audio_rx = tci.rx2_audio_rx.take(); }
                 if bin_r_audio_rx.is_none() { bin_r_audio_rx = tci.bin_r_audio_rx.take(); }
@@ -458,14 +319,19 @@ pub async fn yaesu_audio_loop(
                 }
 
                 if !had_clients {
-                    encoder = OpusEncoder::new().unwrap_or_else(|e| {
-                        log::error!("Yaesu encoder reset failed: {}", e);
-                        panic!("Yaesu encoder reset failed: {}", e);
-                    });
-                    sequence = 0;
-                    accumulator.clear();
-                    had_clients = true;
-                    info!("Yaesu audio: client(s) enabled, encoder reset");
+                    match OpusEncoder::new() {
+                        Ok(new_enc) => {
+                            encoder = new_enc;
+                            sequence = 0;
+                            accumulator.clear();
+                            had_clients = true;
+                            info!("Yaesu audio: client(s) enabled, encoder reset");
+                        }
+                        Err(e) => {
+                            log::error!("Yaesu encoder reset failed: {} — Yaesu audio TX skipped this tick (server blijft draaien)", e);
+                            // had_clients stays false → retry next tick if clients still present.
+                        }
+                    }
                     continue;
                 }
 
@@ -529,7 +395,7 @@ pub async fn tci_iq_consumer(
     loop {
         if iq_rx1.is_none() || iq_rx2.is_none() {
             let mut ptt_guard = ptt.lock().await;
-            if let RadioBackend::Tci(ref mut tci) = ptt_guard.radio {
+            if let Some(tci) = Some(&mut ptt_guard.tci) {
                 if iq_rx1.is_none() { iq_rx1 = tci.iq_rx1_rx.take(); }
                 if iq_rx2.is_none() { iq_rx2 = tci.iq_rx2_rx.take(); }
             }

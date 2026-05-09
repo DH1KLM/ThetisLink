@@ -1,60 +1,50 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #![allow(dead_code)]
+
 //! TCI command setters for TciConnection.
 //! Each method formats a TCI command string, sends it via WebSocket,
 //! and updates the local state optimistically.
 
-use log::info;
+use log::{debug, info};
 use crate::tci::TciConnection;
 use crate::tci_parser::mode_u8_to_str;
 
 impl TciConnection {
     pub async fn set_vfo_a_freq(&mut self, hz: u64) {
         let cmd = format!("VFO:0,0,{};", hz);
-        info!("TCI: set VFO A = {} Hz", hz);
+        debug!("TCI: set VFO A = {} Hz", hz);
         self.send(&cmd).await;
     }
 
     pub async fn set_vfo_a_mode(&mut self, mode: u8) {
         let mode_str = mode_u8_to_str(mode);
         let cmd = format!("MODULATION:0,{};", mode_str);
-        info!("TCI: set VFO A mode = {} ({})", mode_str, mode);
+        debug!("TCI: set VFO A mode = {} ({})", mode_str, mode);
         self.send(&cmd).await;
     }
 
     pub async fn set_power(&mut self, on: bool) {
         let cmd = if on { "START;" } else { "STOP;" };
-        info!("TCI: Power {} ({})", if on { "ON" } else { "OFF" }, cmd);
+        debug!("TCI: Power {} ({})", if on { "ON" } else { "OFF" }, cmd);
         self.send(cmd).await;
     }
 
     pub async fn set_tx_profile(&mut self, idx: u8) {
-        if !self.has_cap("tx_profiles_ex") && !self.has_extensions() {
-            info!("TCI: TX profile selection skipped (tx_profiles_ex cap not available)");
-            return;
-        }
         if let Some(name) = self.tx_profile_names.get(idx as usize) {
             let safe_name = name.replace([',', ';'], "");
             let cmd = format!("tx_profile_ex:{};", safe_name);
-            info!("TCI: set TX profile = \"{}\" (index {})", safe_name, idx);
+            debug!("TCI: set TX profile = \"{}\" (index {})", safe_name, idx);
             self.send(&cmd).await;
         }
     }
 
     pub async fn set_nr(&mut self, level: u8) {
-        if self.has_cap("rx_nr_enable_ex") || self.has_extensions() {
-            // Extended: NR1-4 level selection (specific cap or fork extensions)
-            if level == 0 {
-                self.send("rx_nr_enable_ex:0,false,1;").await;
-            } else {
-                let cmd = format!("rx_nr_enable_ex:0,true,{};", level);
-                self.send(&cmd).await;
-            }
+        // Stock .14/.15 supports rx_nr_enable_ex without advertising the cap.
+        if level == 0 {
+            self.send("rx_nr_enable_ex:0,false,1;").await;
         } else {
-            // Standard TCI: on/off only, no level selection
-            let on = level > 0;
-            let cmd = format!("rx_nr_enable:0,{};", if on { "true" } else { "false" });
+            let cmd = format!("rx_nr_enable_ex:0,true,{};", level);
             self.send(&cmd).await;
         }
         self.nr_level = level;
@@ -68,64 +58,55 @@ impl TciConnection {
     pub async fn set_drive(&mut self, level: u8) {
         let level = level.min(100);
         let cmd = format!("DRIVE:0,{};", level);
-        info!("TCI: Drive = {}%", level);
+        debug!("TCI: Drive = {}%", level);
         self.send(&cmd).await;
     }
 
     pub async fn set_filter(&mut self, low_hz: i32, high_hz: i32) {
         let cmd = format!("RX_FILTER_BAND:0,{},{};", low_hz, high_hz);
-        info!("TCI: Filter = {} .. {} Hz", low_hz, high_hz);
+        debug!("TCI: Filter = {} .. {} Hz", low_hz, high_hz);
         self.send(&cmd).await;
     }
 
     pub async fn set_vfo_b_freq(&mut self, hz: u64) {
         // TCI: receiver 0 channel 1, or receiver 1 channel 0 depending on Thetis config
         let cmd = format!("VFO:0,1,{};", hz);
-        info!("TCI: set VFO B = {} Hz", hz);
+        debug!("TCI: set VFO B = {} Hz", hz);
         self.send(&cmd).await;
     }
 
     pub async fn set_vfo_b_mode(&mut self, mode: u8) {
         let mode_str = mode_u8_to_str(mode);
         let cmd = format!("MODULATION:1,{};", mode_str);
-        info!("TCI: set VFO B mode = {} ({})", mode_str, mode);
+        debug!("TCI: set VFO B mode = {} ({})", mode_str, mode);
         self.send(&cmd).await;
     }
 
     pub async fn vfo_swap(&mut self) {
-        if self.has_cap("vfo_swap_ex") {
-            // Extensions: use Thetis native swap (swaps freq, mode, filter, etc.)
-            self.send("vfo_swap_ex;").await;
-        } else {
-            // Fallback: swap frequencies only
-            let a = self.vfo_a_freq;
-            let b = self.vfo_b_freq;
-            if a != 0 && b != 0 {
-                self.set_vfo_a_freq(b).await;
-                self.set_vfo_b_freq(a).await;
-            }
-        }
+        // Stock .14/.15 supports vfo_swap_ex without advertising the cap (consistent
+        // patroon met andere stock-supported _ex commands). Native swap doet freq +
+        // mode + filter; eerdere fallback ("swap freq alleen") was incompleet.
+        // Bij smoke-test FAIL: revert naar manual freq-swap fallback.
+        self.send("vfo_swap_ex;").await;
     }
 
     pub async fn set_rx2_af_gain(&mut self, level: u8) {
-        // rx_volume supported since Thetis v2.10.3.13
-        let db = (level as i32) - 100; // 0-100 → -100..0 dB
+        // rx_volume supported since Thetis v2.10.3.13.
+        // Schaal: 0..100 % → −60..0 dB (matches RxVolume parser/handler in tci.rs).
+        let level = level.min(100);
+        let db = ((level as i32 - 100) * 60) / 100;
         let cmd = format!("rx_volume:1,0,{};", db);
         self.send(&cmd).await;
-        self.rx2_af_gain = level;
+        // No optimistic state update — Thetis echoes rx_volume back and the
+        // RxVolume notification handler updates `rx2_af_gain`.
     }
 
     pub async fn set_rx2_nr(&mut self, level: u8) {
-        if self.has_cap("rx_nr_enable_ex") || self.has_extensions() {
-            if level == 0 {
-                self.send("rx_nr_enable_ex:1,false,1;").await;
-            } else {
-                let cmd = format!("rx_nr_enable_ex:1,true,{};", level);
-                self.send(&cmd).await;
-            }
+        // Stock .14/.15 supports rx_nr_enable_ex without advertising the cap.
+        if level == 0 {
+            self.send("rx_nr_enable_ex:1,false,1;").await;
         } else {
-            let on = level > 0;
-            let cmd = format!("rx_nr_enable:1,{};", if on { "true" } else { "false" });
+            let cmd = format!("rx_nr_enable_ex:1,true,{};", level);
             self.send(&cmd).await;
         }
         self.rx2_nr_level = level;
@@ -138,18 +119,14 @@ impl TciConnection {
 
     pub async fn set_rx2_filter(&mut self, low_hz: i32, high_hz: i32) {
         let cmd = format!("RX_FILTER_BAND:1,{},{};", low_hz, high_hz);
-        info!("TCI: RX2 Filter = {} .. {} Hz", low_hz, high_hz);
+        debug!("TCI: RX2 Filter = {} .. {} Hz", low_hz, high_hz);
         self.send(&cmd).await;
     }
 
     pub async fn set_mon(&mut self, on: bool) {
         let cmd = format!("MON_ENABLE:{};", if on { "true" } else { "false" });
-        info!("TCI: MON {}", if on { "ON" } else { "OFF" });
+        debug!("TCI: MON {}", if on { "ON" } else { "OFF" });
         self.send(&cmd).await;
-    }
-
-    pub async fn set_vfo_sync_cat(&mut self, _on: bool) {
-        // Legacy stub — VFO Sync now handled via TCI _ex command (see extended section)
     }
 
     pub async fn set_agc_mode(&mut self, mode: u8) {
@@ -212,27 +189,15 @@ impl TciConnection {
 
     /// Set NB level: 0=off, 1=NB1, 2=NB2
     pub async fn set_nb(&mut self, level: u8) {
-        if self.has_cap("rx_nb_enable_ex") || self.has_extensions() {
-            // Extended: NB1/NB2 level selection.
-            // In het _ex-pad bepaalt het `level`-argument de uiteindelijke NB-stand
-            // bij de server; de `enabled` flag wordt daar niet gebruikt om het
-            // level te resetten. Bij disable moeten we dus `level=0` sturen in
-            // plaats van `level.max(1)`, anders blijft NB1 actief en werkt de
-            // cycle→off transitie niet.
-            let enabled = level > 0;
-            let cmd = format!("rx_nb_enable_ex:0,{},{};", if enabled { "true" } else { "false" }, level);
-            self.send(&cmd).await;
-            self.nb_enable = enabled;
-            self.nb_level = level;
-        } else {
-            // Standard TCI: on/off only. Level ≥2 degrades to NB1 (better than silent fail).
-            let actual = level.min(1);
-            let enabled = actual > 0;
-            let cmd = format!("rx_nb_enable:0,{};", if enabled { "true" } else { "false" });
-            self.send(&cmd).await;
-            self.nb_enable = enabled;
-            self.nb_level = actual;
-        }
+        // Stock .14/.15 supports rx_nb_enable_ex without advertising the cap.
+        // Het `level`-argument bepaalt de uiteindelijke NB-stand bij de server;
+        // bij disable sturen we `level=0` (niet `.max(1)`), anders blijft NB1
+        // actief en werkt de cycle→off transitie niet.
+        let enabled = level > 0;
+        let cmd = format!("rx_nb_enable_ex:0,{},{};", if enabled { "true" } else { "false" }, level);
+        self.send(&cmd).await;
+        self.nb_enable = enabled;
+        self.nb_level = level;
     }
 
     pub async fn set_cw_keyer_speed(&mut self, wpm: u8) {
@@ -251,7 +216,7 @@ impl TciConnection {
     }
 
     pub async fn cw_macro_stop(&mut self) {
-        info!("TCI: CW macro stop");
+        debug!("TCI: CW macro stop");
         self.send("cw_macros_stop;").await;
     }
 
@@ -262,12 +227,19 @@ impl TciConnection {
     }
 
     pub async fn set_binaural(&mut self, on: bool) {
+        // Idempotency-guard: skip if state already matches. Defense in depth
+        // against client-side spam (alpha-5 testlog: 38k+ rx_bin_enable events
+        // from engine.rs SetPtt-side-effect path, root-fixed there in alpha-8
+        // sub-B; this guard makes the server resilient to future variants).
+        if on == self.binaural {
+            return;
+        }
         let cmd = format!("rx_bin_enable:0,{};", if on { "true" } else { "false" });
         self.send(&cmd).await;
         // Switch TCI audio channels: stereo for binaural, mono otherwise
         let ch_cmd = format!("AUDIO_STREAM_CHANNELS:{};", if on { 2 } else { 1 });
         self.send(&ch_cmd).await;
-        info!("TCI: binaural {} → audio channels {}", if on { "ON" } else { "OFF" }, if on { 2 } else { 1 });
+        debug!("TCI: binaural {} → audio channels {}", if on { "ON" } else { "OFF" }, if on { 2 } else { 1 });
         self.binaural = on;
     }
 
@@ -312,19 +284,12 @@ impl TciConnection {
     }
 
     pub async fn set_rx2_nb(&mut self, level: u8) {
-        if self.has_cap("rx_nb_enable_ex") || self.has_extensions() {
-            // Zie set_nb() — zelfde Thetis-gotcha, stuur echte level i.p.v. .max(1).
-            let enabled = level > 0;
-            let cmd = format!("rx_nb_enable_ex:1,{},{};", if enabled { "true" } else { "false" }, level);
-            self.send(&cmd).await;
-            self.rx2_nb_enable = enabled;
-        } else {
-            let actual = level.min(1);
-            let enabled = actual > 0;
-            let cmd = format!("rx_nb_enable:1,{};", if enabled { "true" } else { "false" });
-            self.send(&cmd).await;
-            self.rx2_nb_enable = enabled;
-        }
+        // Stock .14/.15 supports rx_nb_enable_ex without advertising the cap.
+        // Zie set_nb() — zelfde Thetis-gotcha, stuur echte level i.p.v. .max(1).
+        let enabled = level > 0;
+        let cmd = format!("rx_nb_enable_ex:1,{},{};", if enabled { "true" } else { "false" }, level);
+        self.send(&cmd).await;
+        self.rx2_nb_enable = enabled;
     }
 
     pub async fn set_rx2_binaural(&mut self, on: bool) {
@@ -378,7 +343,7 @@ impl TciConnection {
 
     pub async fn set_tune(&mut self, on: bool) {
         let cmd = format!("tune:0,{};", if on { "true" } else { "false" });
-        info!("TCI: TUNE {}", if on { "ON" } else { "OFF" });
+        debug!("TCI: TUNE {}", if on { "ON" } else { "OFF" });
         self.send(&cmd).await;
         self.tune_active = on;
     }
@@ -386,14 +351,14 @@ impl TciConnection {
     pub async fn set_tune_drive(&mut self, level: u8) {
         let level = level.min(100);
         let cmd = format!("tune_drive:0,{};", level);
-        info!("TCI: Tune drive = {}%", level);
+        debug!("TCI: Tune drive = {}%", level);
         self.send(&cmd).await;
         self.tune_drive = level;
     }
 
     pub async fn set_mon_volume(&mut self, db: i8) {
         let cmd = format!("mon_volume:{};", db);
-        info!("TCI: Mon volume = {} dB", db);
+        debug!("TCI: Mon volume = {} dB", db);
         self.send(&cmd).await;
         self.mon_volume = db;
     }
@@ -419,14 +384,6 @@ impl TciConnection {
 
     // ── Extended TCI commands (_ex, capability-gated) ──────────────────
 
-    pub async fn set_ddc_sample_rate(&mut self, rx: u32, rate: u32) {
-        if self.has_cap("ddc_sample_rate_ex") {
-            let cmd = format!("ddc_sample_rate_ex:{},{};", rx, rate);
-            self.send(&cmd).await;
-            if rx == 0 { self.ddc_sample_rate_rx1 = rate; }
-            else { self.ddc_sample_rate_rx2 = rate; }
-        }
-    }
 
     /// Start auto-null on Thetis with step plan. Results arrive via DiversityAutonull notifications.
     /// Steps format: Vec of (is_phase, offsets) — same as client's diversity-smart.txt
@@ -456,40 +413,28 @@ impl TciConnection {
     }
 
     pub async fn set_ctun(&mut self, rx: u32, enabled: bool) {
-        if self.has_cap("ctun_ex") {
-            let cmd = format!("rx_ctun_ex:{},{};", rx, enabled);
-            self.send(&cmd).await;
-            if rx == 0 { self.ctun = enabled; }
-        }
+        // Stock .14/.15 supports rx_ctun_ex without advertising the cap.
+        let cmd = format!("rx_ctun_ex:{},{};", rx, enabled);
+        self.send(&cmd).await;
+        if rx == 0 { self.ctun = enabled; }
     }
 
     pub async fn set_vfo_sync(&mut self, enabled: bool) {
-        if self.has_cap("vfo_sync_ex") {
-            let cmd = format!("vfo_sync_ex:{};", enabled);
-            self.send(&cmd).await;
-            self.vfo_sync_on = enabled;
-        }
+        // Stock .14/.15 supports vfo_sync_ex without advertising the cap.
+        let cmd = format!("vfo_sync_ex:{};", enabled);
+        self.send(&cmd).await;
+        self.vfo_sync_on = enabled;
     }
 
     pub async fn set_fm_deviation(&mut self, rx: u32, hz: u32) {
-        if self.has_cap("fm_deviation_ex") {
-            let cmd = format!("fm_deviation_ex:{},{};", rx, hz);
-            self.send(&cmd).await;
-            self.fm_deviation = if hz >= 5000 { 1 } else { 0 };
-        }
-    }
-
-    pub async fn set_step_attenuator(&mut self, rx: u32, db: i32) {
-        if self.has_cap("step_attenuator_ex") {
-            let cmd = format!("step_attenuator_ex:{},{};", rx, db);
-            self.send(&cmd).await;
-            if rx == 0 { self.step_att_rx1 = db; }
-            else { self.step_att_rx2 = db; }
-        }
+        // Stock .14/.15 supports fm_deviation_ex without advertising the cap.
+        let cmd = format!("fm_deviation_ex:{},{};", rx, hz);
+        self.send(&cmd).await;
+        self.fm_deviation = if hz >= 5000 { 1 } else { 0 };
     }
 
     pub async fn set_diversity_enable(&mut self, enabled: bool) {
-        if self.has_cap("diversity_ex") {
+        if self.has_cap("diversity_enable_ex") {
             let cmd = format!("diversity_enable_ex:{};", enabled);
             self.send(&cmd).await;
             self.diversity_enabled = enabled;
@@ -497,7 +442,7 @@ impl TciConnection {
     }
 
     pub async fn set_diversity_ref(&mut self, rx1_ref: bool) {
-        if self.has_cap("diversity_ex") {
+        if self.has_cap("diversity_ref_ex") {
             let cmd = format!("diversity_ref_ex:{};", rx1_ref);
             self.send(&cmd).await;
             self.diversity_ref = if rx1_ref { 0 } else { 1 };
@@ -505,7 +450,7 @@ impl TciConnection {
     }
 
     pub async fn set_diversity_source(&mut self, source: u32) {
-        if self.has_cap("diversity_ex") {
+        if self.has_cap("diversity_source_ex") {
             let cmd = format!("diversity_source_ex:{};", source);
             self.send(&cmd).await;
             self.diversity_source = source as u8;
@@ -513,7 +458,7 @@ impl TciConnection {
     }
 
     pub async fn set_diversity_gain(&mut self, rx: u32, gain: u16) {
-        if self.has_cap("diversity_ex") {
+        if self.has_cap("diversity_gain_ex") {
             let cmd = format!("diversity_gain_ex:{},{};", rx, gain.min(10000));
             self.send(&cmd).await;
             if rx == 0 { self.diversity_gain_rx1 = gain; }
@@ -522,10 +467,111 @@ impl TciConnection {
     }
 
     pub async fn set_diversity_phase(&mut self, phase: i32) {
-        if self.has_cap("diversity_ex") {
+        if self.has_cap("diversity_phase_ex") {
             let cmd = format!("diversity_phase_ex:{};", phase.clamp(-18000, 18000));
             self.send(&cmd).await;
             self.diversity_phase = phase;
         }
+    }
+
+    pub async fn set_diversity_gain_multi(&mut self, multi: u16) {
+        if self.has_cap("diversity_gain_multi_ex") {
+            let clamped = multi.clamp(100, 1000);
+            let cmd = format!("diversity_gain_multi_ex:{};", clamped);
+            self.send(&cmd).await;
+            self.diversity_gain_multi = clamped;
+        }
+    }
+
+    /// Send DDC sample-rate change via TL2-1 fork extension (no CAT fallback —
+    /// stock Thetis has no equivalent in TCI, only via Setup-form UI).
+    /// `rate_hz` must be one of 48000/96000/192000/384000/768000/1536000.
+    pub async fn set_ddc_sample_rate(&mut self, rx: u32, rate_hz: u32) {
+        if !self.has_cap("ddc_sample_rate_ex") { return; }
+        match rate_hz {
+            48000 | 96000 | 192000 | 384000 | 768000 | 1536000 => {}
+            _ => return,
+        }
+        let cmd = format!("ddc_sample_rate_ex:{},{};", rx, rate_hz);
+        self.send(&cmd).await;
+    }
+
+    // ── Stock Thetis v2.10.3.14 native commands ────────────────────────────
+
+    // ── Note: stock v2.10.3.14 setters do NOT optimistically mutate local state.
+    // Thetis echoes the change back as a notification (rx_step_att_ex, etc.),
+    // which is parsed and dispatched in `handle_notification` — that is the single
+    // source of truth. Skipping the optimistic update prevents drift if `send()`
+    // silently dropped the frame (no return value to check). See
+    // `feedback_dispatch_return_checked.md`.
+
+    /// Set step attenuator value via stock v2.10.3.14 rx_step_att_ex.
+    /// Wire format requires |attenuation| (positive only, per Math.Abs in Thetis).
+    pub async fn set_rx_step_att(&mut self, rx: u32, db: i32) {
+        let abs_db = db.unsigned_abs().min(31);
+        let cmd = format!("rx_step_att_ex:{},{};", rx, abs_db);
+        debug!("TCI: set rx_step_att RX{} = {} dB", rx + 1, abs_db);
+        self.send(&cmd).await;
+        // state will be updated by RxStepAttEx echo notification
+    }
+
+    /// Toggle step attenuator on/off via stock v2.10.3.14 rx_step_att_enabled_ex.
+    pub async fn set_rx_step_att_enabled(&mut self, rx: u32, enabled: bool) {
+        let cmd = format!("rx_step_att_enabled_ex:{},{};", rx, enabled);
+        debug!("TCI: set rx_step_att_enabled RX{} = {}", rx + 1, enabled);
+        self.send(&cmd).await;
+        // state will be updated by RxStepAttEnabledEx echo notification
+    }
+
+    /// Set combined preamp+attenuator via stock v2.10.3.14 rx_preamp_att_ex.
+    /// Signed wire format: negative value = preamp gain, positive = attenuation.
+    pub async fn set_rx_preamp_att(&mut self, rx: u32, db: i32) {
+        let cmd = format!("rx_preamp_att_ex:{},{};", rx, db);
+        debug!("TCI: set rx_preamp_att RX{} = {} dB (signed)", rx + 1, db);
+        self.send(&cmd).await;
+        // state will be updated by RxPreampAttEx echo notification
+    }
+
+    /// Set TX filter band via stock v2.10.3.14 tx_filter_band_ex.
+    pub async fn set_tx_filter_band(&mut self, low_hz: i32, high_hz: i32) {
+        let cmd = format!("tx_filter_band_ex:{},{};", low_hz, high_hz);
+        debug!("TCI: set tx_filter_band = {} .. {} Hz", low_hz, high_hz);
+        self.send(&cmd).await;
+        // state will be updated by TxFilterBandEx echo notification
+    }
+
+    /// Send tx_frequency_ex (stock v2.10.3.14). Used for split TX state.
+    /// Format: tx_frequency_ex:freq,band,rx2_enabled,tx_vfob
+    /// All boolean values are sent as lowercase strings per the TCI protocol spec.
+    pub async fn set_tx_frequency(&mut self, freq: u64, band: &str, rx2_enabled: bool, tx_vfob: bool) {
+        let cmd = format!(
+            "tx_frequency_ex:{},{},{},{};",
+            freq, band.to_lowercase(), rx2_enabled, tx_vfob
+        );
+        debug!("TCI: set tx_frequency = {} Hz band={} rx2={} tx_vfob={}",
+            freq, band, rx2_enabled, tx_vfob);
+        self.send(&cmd).await;
+    }
+
+    /// run_cat_ex helper: relay a Kenwood-style ZZ command via TCI (stock v2.10.3.14).
+    /// Wire format: `run_cat_ex:ZZxxx;` (Thetis appends `;` on its side before invoking CAT).
+    /// Response arrives via `TciNotification::RunCatExResponse`.
+    /// Caller should pass the ZZ command WITHOUT a trailing `;` (helper strips defensively).
+    pub async fn run_cat(&mut self, zz_cmd: &str) {
+        let stripped = zz_cmd.trim().trim_end_matches(';');
+        if stripped.is_empty() {
+            return;
+        }
+        let cmd = format!("run_cat_ex:{};", stripped);
+        // ZZFI/ZZFJ are 2-second filter-preset polls (alpha-1 sub-E); demote
+        // their helper-log to debug to keep info-log readable. Response-handler
+        // (tci.rs RunCatExResponse arm) still logs on actual state-change.
+        let stripped_upper = stripped.to_uppercase();
+        if stripped_upper.starts_with("ZZFI") || stripped_upper.starts_with("ZZFJ") {
+            log::debug!("TCI: run_cat_ex({})", stripped);
+        } else {
+            debug!("TCI: run_cat_ex({})", stripped);
+        }
+        self.send(&cmd).await;
     }
 }

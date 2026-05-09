@@ -13,7 +13,7 @@ FlexRadio's PowerSDR.
   approximately 2020, continued by Richard Samphire (MW0LGE) from 2019 to
   the present
 - **`ramdor/Thetis`** — the upstream repository that this project's
-  Thetis fork (`cjenschede/Thetis`, branch `thetislink-tci-extended`)
+  Thetis fork (`cjenschede/Thetis`, branch `thetislink-tl2`)
   derives from
 
 ## Contributors to the upstream Thetis lineage
@@ -39,7 +39,7 @@ Thetis lineage):
 
 ## Scope of this project's derivative relationship
 
-### `cjenschede/Thetis` fork (branch `thetislink-tci-extended`)
+### `cjenschede/Thetis` fork (branch `thetislink-tl2`)
 
 This fork is a direct derivative of `ramdor/Thetis` under GPL-2.0-or-later.
 All upstream copyright notices, license text, and per-file attribution

@@ -42,7 +42,6 @@ enum Mode {
 }
 
 pub struct ServerApp {
-    cat_addr: String,
     tci_addr: String,
     thetis_path: String,
     yaesu_port: String,
@@ -184,7 +183,6 @@ impl ServerApp {
         };
 
         Self {
-            cat_addr: config.cat_addr,
             tci_addr: config.tci_addr.unwrap_or_default(),
             thetis_path: config.thetis_path.unwrap_or_default(),
             yaesu_port: config.yaesu_port.unwrap_or_default(),
@@ -302,7 +300,6 @@ impl ServerApp {
         let ub_port = self.ultrabeam_port.trim().to_string();
         let rotor_addr_str = self.rotor_addr.trim().to_string();
         let config = ServerConfig {
-            cat_addr: self.cat_addr.clone(),
             spectrum_enabled: true,
             thetis_path: if thetis.is_empty() { None } else { Some(thetis) },
             yaesu_port: if yaesu_port_str.is_empty() { None } else { Some(yaesu_port_str.clone()) },
@@ -550,11 +547,6 @@ impl eframe::App for ServerApp {
                 Mode::Settings => {
                     ui.heading(format!("ThetisLink Server v{}", sdr_remote_core::VERSION));
                     ui.add_space(10.0);
-
-                    ui.label("Thetis CAT adres:");
-                    ui.text_edit_singleline(&mut self.cat_addr);
-
-                    ui.add_space(8.0);
 
                     ui.label("Thetis TCI adres (bijv. 127.0.0.1:40001):");
                     ui.text_edit_singleline(&mut self.tci_addr);

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 package com.sdrremote.ui.screens
 
 import androidx.compose.foundation.Canvas
@@ -1359,15 +1361,31 @@ private fun UltraBeamTab(
         }
     }
 
-    // Motor progress bar (only when moving)
+    // Per-motor moving + progress bar (alleen tonen bij beweging).
+    // ubMotorsMoving is een bitfield: bit 0 = motor 1, bit 1 = motor 2.
+    // De progress-balk is een gedeelde waarde; de RCU-06 deelt geen
+    // afzonderlijke voortgang per motor.
     if (state.ubMotorsMoving != 0) {
         Spacer(Modifier.height(8.dp))
         val progress = (state.ubMotorCompletion / 60f).coerceIn(0f, 1f)
+        val m1Active = (state.ubMotorsMoving.toInt() and 0x01) != 0
+        val m2Active = (state.ubMotorsMoving.toInt() and 0x02) != 0
+        val activeColor = Color(0xFFFFAA28)
+        val idleColor = Color(0xFF646464)
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Text("Motor:", fontWeight = FontWeight.Bold)
+            Text(
+                "M1",
+                color = if (m1Active) activeColor else idleColor,
+                fontWeight = FontWeight.Bold,
+            )
+            Text(
+                "M2",
+                color = if (m2Active) activeColor else idleColor,
+                fontWeight = FontWeight.Bold,
+            )
             LinearProgressIndicator(
                 progress = { progress },
                 modifier = Modifier.weight(1f).height(12.dp),

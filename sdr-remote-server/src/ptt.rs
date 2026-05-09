@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#![allow(dead_code)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use log::{error, info, warn};
 
-use crate::cat::CatConnection;
 use crate::tci::TciConnection;
 
 /// Launch an application using Windows ShellExecuteW (works from elevated processes)
@@ -139,12 +137,6 @@ const PTT_TAIL_MIN_MS_TCI: u64 = 25;
 const PTT_TAIL_MARGIN_MS_TCI: u64 = 10;
 const PTT_PREFILL_MS_TCI: u64 = 10;
 
-/// Radio backend: CAT (TCP) or TCI (WebSocket)
-pub enum RadioBackend {
-    Cat(CatConnection),
-    Tci(TciConnection),
-}
-
 /// PTT state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PttState {
@@ -168,17 +160,11 @@ pub struct PttController {
     pending_release: Option<Instant>,
     tail_delay_ms: u64,
     ptt_active: Arc<AtomicBool>,
-    /// Radio backend — CAT or TCI
-    pub radio: RadioBackend,
-    /// Auxiliary TCP CAT connection (runs alongside TCI for commands TCI doesn't support)
-    aux_cat: Option<CatConnection>,
-    /// Deferred aux CAT address — created lazily when TCI _ex caps are not available
-    aux_cat_addr: Option<String>,
+    /// TCI WebSocket connection — TL2 v2 is TCI-only, no CAT backend.
+    pub tci: TciConnection,
     thetis_path: Option<String>,
     pending_power_on: bool,
     thetis_launch_time: Option<Instant>,
-    /// Whether using TCI mode (affects timing constants and PTT commands)
-    is_tci: bool,
     // --- Latency metrics ---
     ptt_prefill_start: Option<Instant>,
     ptt_release_start: Option<Instant>,
@@ -187,38 +173,8 @@ pub struct PttController {
 }
 
 impl PttController {
-    /// Create with CAT backend (legacy mode)
-    pub fn new(cat_addr: Option<&str>, thetis_path: Option<String>) -> Self {
-        Self {
-            state: PttState::Rx,
-            last_ptt_packet: None,
-            last_heartbeat: None,
-            pending_activate: None,
-            pending_release: None,
-            tail_delay_ms: PTT_TAIL_MIN_MS,
-            ptt_active: Arc::new(AtomicBool::new(false)),
-            radio: RadioBackend::Cat(CatConnection::new(cat_addr)),
-            aux_cat: None,
-            aux_cat_addr: None,
-            thetis_path,
-            pending_power_on: false,
-            thetis_launch_time: None,
-            is_tci: false,
-            ptt_prefill_start: None,
-            ptt_release_start: None,
-            ptt_prefill_latencies: Vec::new(),
-            ptt_tail_latencies: Vec::new(),
-        }
-    }
-
-    /// Create with TCI backend + auxiliary TCP CAT for commands TCI doesn't support
-    pub fn new_tci(tci_addr: Option<&str>, cat_addr: Option<&str>, thetis_path: Option<String>) -> Self {
-        // Don't create aux CAT connection yet — wait for TCI cap detection.
-        // If _ex caps are available, aux CAT is never needed.
-        // If caps are missing (vanilla Thetis), aux CAT is created lazily.
-        if cat_addr.is_some() {
-            info!("TCI mode: auxiliary CAT address configured (deferred until cap detection)");
-        }
+    /// Create PTT controller (TL2 v2: TCI-only).
+    pub fn new_tci(tci_addr: Option<&str>, thetis_path: Option<String>) -> Self {
         Self {
             state: PttState::Rx,
             last_ptt_packet: None,
@@ -227,13 +183,10 @@ impl PttController {
             pending_release: None,
             tail_delay_ms: PTT_TAIL_MIN_MS_TCI,
             ptt_active: Arc::new(AtomicBool::new(false)),
-            radio: RadioBackend::Tci(TciConnection::new(tci_addr)),
-            aux_cat: None,
-            aux_cat_addr: cat_addr.map(|s| s.to_string()),
+            tci: TciConnection::new(tci_addr),
             thetis_path,
             pending_power_on: false,
             thetis_launch_time: None,
-            is_tci: true,
             ptt_prefill_start: None,
             ptt_release_start: None,
             ptt_prefill_latencies: Vec::new(),
@@ -242,15 +195,15 @@ impl PttController {
     }
 
     fn prefill_ms(&self) -> u64 {
-        if self.is_tci { PTT_PREFILL_MS_TCI } else { PTT_PREFILL_MS }
+        if true { PTT_PREFILL_MS_TCI } else { PTT_PREFILL_MS }
     }
 
     fn tail_min_ms(&self) -> u64 {
-        if self.is_tci { PTT_TAIL_MIN_MS_TCI } else { PTT_TAIL_MIN_MS }
+        if true { PTT_TAIL_MIN_MS_TCI } else { PTT_TAIL_MIN_MS }
     }
 
     fn tail_margin_ms(&self) -> u64 {
-        if self.is_tci { PTT_TAIL_MARGIN_MS_TCI } else { PTT_TAIL_MARGIN_MS }
+        if true { PTT_TAIL_MARGIN_MS_TCI } else { PTT_TAIL_MARGIN_MS }
     }
 
     pub fn record_ptt_packet(&mut self) {
@@ -338,67 +291,7 @@ impl PttController {
         }
 
         // Poll radio backend
-        match &mut self.radio {
-            RadioBackend::Cat(cat) => cat.poll_and_parse().await,
-            RadioBackend::Tci(tci) => tci.poll_and_parse().await,
-        }
-
-        // Auxiliary TCP CAT — deferred creation, only for vanilla Thetis (no _ex caps).
-        // With all _ex caps, aux CAT is never created or polled.
-        if self.is_tci {
-            let all_ex = match &self.radio {
-                RadioBackend::Tci(tci) => tci.has_cap("ctun_ex")
-                    && tci.has_cap("vfo_sync_ex")
-                    && tci.has_cap("step_attenuator_ex")
-                    && tci.has_cap("diversity_ex")
-                    && tci.has_cap("fm_deviation_ex"),
-                _ => false,
-            };
-
-            // Only create aux CAT after TCI init is complete (power_on=true, set after ready;)
-            // and _ex caps are confirmed missing. Vanilla Thetis has empty server_caps after ready.
-            let tci_init_done = match &self.radio {
-                RadioBackend::Tci(tci) => tci.power_on,
-                _ => false,
-            };
-            if !all_ex && tci_init_done && self.aux_cat.is_none() && self.aux_cat_addr.is_some() {
-                let addr = self.aux_cat_addr.as_ref().unwrap().clone();
-                info!("TCI connected but _ex caps missing — creating auxiliary CAT on {}", addr);
-                self.aux_cat = Some(CatConnection::new(Some(&addr)));
-            }
-
-            if let Some(ref mut cat) = self.aux_cat {
-                if all_ex {
-                    if !cat.volume_only_mode {
-                        info!("All TCI _ex caps available — auxiliary CAT disabled");
-                        cat.volume_only_mode = true;
-                    }
-                } else {
-                    if cat.volume_only_mode {
-                        info!("TCI _ex caps lost — restoring full CAT polling");
-                        cat.volume_only_mode = false;
-                    }
-                    cat.poll_and_parse().await;
-                    if let RadioBackend::Tci(ref mut tci) = self.radio {
-                        tci.rx_af_gain = cat.rx_af_gain;
-                        tci.rx2_af_gain = cat.rx2_af_gain;
-                        if !tci.has_cap("ctun_ex") { tci.ctun = cat.ctun; }
-                        if !tci.has_cap("step_attenuator_ex") {
-                            tci.step_att_rx1 = cat.step_att_rx1 as i32;
-                            tci.step_att_rx2 = cat.step_att_rx2 as i32;
-                        }
-                        if !tci.has_cap("vfo_sync_ex") { tci.vfo_sync_on = cat.vfo_sync_on; }
-                        tci.nr_level = cat.nr_level;
-                        tci.anf_on = cat.anf_on;
-                        if tci.vfo_b_freq == 0 && cat.vfo_b_freq != 0 {
-                            tci.vfo_b_freq = cat.vfo_b_freq;
-                        }
-                    }
-                }
-            }
-        } else if let Some(ref mut cat) = self.aux_cat {
-            cat.poll_and_parse().await;
-        }
+        self.tci.poll_and_parse().await;
 
         // Auto-launch: if pending_power_on and backend connected
         if self.pending_power_on && self.is_connected() {
@@ -474,79 +367,40 @@ impl PttController {
             }
         }
 
-        match &mut self.radio {
-            RadioBackend::Cat(cat) => {
-                cat.set_tx_active(is_tx);
-                let cmd = if is_tx { "ZZTX1;" } else { "ZZTX0;" };
-                info!("PTT: {:?} -> {:?} (CAT: {})", old, new_state, cmd);
-                cat.send(cmd).await;
-            }
-            RadioBackend::Tci(tci) => {
-                tci.set_tx_active(is_tx);
-                // TCI: use ,tci source so Thetis takes audio from TCI stream
-                let cmd = if is_tx { "TRX:0,true,tci;" } else { "TRX:0,false;" };
-                info!("PTT: {:?} -> {:?} (TCI: {})", old, new_state, cmd);
-                tci.send(cmd).await;
-            }
-        }
+        self.tci.set_tx_active(is_tx);
+        // TCI: use ,tci source so Thetis takes audio from TCI stream
+        let cmd = if is_tx { "TRX:0,true,tci;" } else { "TRX:0,false;" };
+        info!("PTT: {:?} -> {:?} (TCI: {})", old, new_state, cmd);
+        self.tci.send(cmd).await;
     }
 
     fn is_connected(&self) -> bool {
-        match &self.radio {
-            RadioBackend::Cat(cat) => cat.is_connected(),
-            RadioBackend::Tci(tci) => tci.is_connected(),
-        }
+        self.tci.is_connected()
     }
 
     async fn radio_send(&mut self, cmd: &str) {
-        match &mut self.radio {
-            RadioBackend::Cat(cat) => cat.send(cmd).await,
-            RadioBackend::Tci(tci) => tci.send(cmd).await,
-        }
+        self.tci.send(cmd).await
     }
 
     async fn radio_set_power(&mut self, on: bool) {
-        match &mut self.radio {
-            RadioBackend::Cat(cat) => cat.set_power(on).await,
-            RadioBackend::Tci(tci) => tci.set_power(on).await,
-        }
+        self.tci.set_power(on).await
     }
 
     // --- Delegated accessors ---
 
-    /// Query a CAT command and return the response value.
-    pub async fn query_cat(&mut self, cmd: &str) -> Option<String> {
-        if let Some(ref mut cat) = self.aux_cat {
-            cat.query(cmd).await
-        } else {
-            None
-        }
-    }
-
     pub async fn send_cat(&mut self, cmd: &str) {
-        // In TCI mode: ZZ* commands → auxiliary TCP CAT or TCI translation
-        if self.is_tci {
-            if cmd.starts_with("ZZ") {
-                // Try auxiliary CAT first (if available)
-                if let Some(ref mut cat) = self.aux_cat {
-                    cat.send(cmd).await;
-                    return;
-                }
-                // Aux CAT not available — translate known ZZ commands to TCI
-                if let Some(tci_cmd) = Self::cat_to_tci(cmd) {
-                    log::info!("CAT→TCI: {} → {}", cmd.trim_end_matches(';'), tci_cmd.trim_end_matches(';'));
-                    self.radio_send(&tci_cmd).await;
-                } else {
-                    log::warn!("CAT command dropped (no aux CAT, no TCI translation): {}", cmd.trim_end_matches(';'));
-                }
-                return;
+        // ZZ* commands need TCI translation via cat_to_tci; alles anders gaat as-is.
+        if cmd.starts_with("ZZ") {
+            if let Some(tci_cmd) = Self::cat_to_tci(cmd) {
+                log::debug!("CAT→TCI: {} → {}", cmd.trim_end_matches(';'), tci_cmd.trim_end_matches(';'));
+                self.radio_send(&tci_cmd).await;
             } else {
-                // TCI command (e.g. TUNE:0,true;) → send via WebSocket
-                self.radio_send(cmd).await;
-                return;
+                log::warn!("CAT command dropped (no aux CAT, no TCI translation): {}", cmd.trim_end_matches(';'));
             }
+        } else {
+            // TCI command (bv. TUNE:0,true;) → direct via WebSocket
+            self.radio_send(cmd).await;
         }
-        self.radio_send(cmd).await;
     }
 
     /// Translate a ZZ CAT command to a TCI equivalent. Returns None if unknown.
@@ -602,100 +456,57 @@ fn cat_mode_to_tci(mode: u8) -> &'static str {
 impl PttController {
     /// Send a TCI SPOT command to Thetis. Only works in TCI mode.
     pub async fn send_tci_spot(&mut self, callsign: &str, mode: &str, freq_hz: u64, color: u32, text: &str) {
-        if let RadioBackend::Tci(ref mut tci) = self.radio {
+        if let Some(tci) = Some(&mut self.tci) {
             tci.send_spot(callsign, mode, freq_hz, color, text).await;
         }
     }
 
     pub fn vfo_a_freq(&self) -> u64 {
-        match &self.radio {
-            RadioBackend::Cat(c) => c.vfo_a_freq,
-            RadioBackend::Tci(t) => t.vfo_a_freq,
-        }
+        self.tci.vfo_a_freq
     }
 
     pub fn vfo_a_mode(&self) -> u8 {
-        match &self.radio {
-            RadioBackend::Cat(c) => c.vfo_a_mode,
-            RadioBackend::Tci(t) => t.vfo_a_mode,
-        }
+        self.tci.vfo_a_mode
     }
 
     pub fn smeter_avg(&self) -> u16 {
-        match &self.radio {
-            RadioBackend::Cat(c) => c.smeter_avg(),
-            RadioBackend::Tci(t) => t.smeter_avg(),
-        }
+        self.tci.smeter_avg()
     }
 
     pub fn power_on(&self) -> bool {
-        match &self.radio {
-            RadioBackend::Cat(c) => c.power_on,
-            RadioBackend::Tci(t) => t.power_on,
-        }
+        self.tci.power_on
     }
 
     pub fn tx_profile(&self) -> u8 {
-        match &self.radio {
-            RadioBackend::Cat(c) => c.tx_profile,
-            RadioBackend::Tci(t) => t.tx_profile,
-        }
+        self.tci.tx_profile
     }
 
     pub fn nr_level(&self) -> u8 {
-        match &self.radio {
-            RadioBackend::Cat(c) => c.nr_level,
-            RadioBackend::Tci(t) => t.nr_level,
-        }
+        self.tci.nr_level
     }
 
     pub fn anf_on(&self) -> bool {
-        match &self.radio {
-            RadioBackend::Cat(c) => c.anf_on,
-            RadioBackend::Tci(t) => t.anf_on,
-        }
+        self.tci.anf_on
     }
 
     pub fn drive_level(&self) -> u8 {
-        match &self.radio {
-            RadioBackend::Cat(c) => c.drive_level,
-            RadioBackend::Tci(t) => t.drive_level,
-        }
+        self.tci.drive_level
     }
 
     pub fn rx_af_gain(&self) -> u8 {
-        match &self.radio {
-            RadioBackend::Cat(c) => c.rx_af_gain,
-            RadioBackend::Tci(t) => t.rx_af_gain,
-        }
-    }
-
-    pub fn set_rx_af_gain(&mut self, val: u8) {
-        match &mut self.radio {
-            RadioBackend::Cat(c) => c.rx_af_gain = val,
-            RadioBackend::Tci(t) => t.rx_af_gain = val,
-        }
+        self.tci.rx_af_gain
     }
 
     pub fn filter_low_hz(&self) -> i32 {
-        match &self.radio {
-            RadioBackend::Cat(c) => c.filter_low_hz,
-            RadioBackend::Tci(t) => t.filter_low_hz,
-        }
+        self.tci.filter_low_hz
     }
 
     pub fn filter_high_hz(&self) -> i32 {
-        match &self.radio {
-            RadioBackend::Cat(c) => c.filter_high_hz,
-            RadioBackend::Tci(t) => t.filter_high_hz,
-        }
+        self.tci.filter_high_hz
     }
 
     pub fn ctun(&self) -> bool {
-        match &self.radio {
-            RadioBackend::Cat(c) => c.ctun,
-            RadioBackend::Tci(t) => t.ctun,
-        }
+        self.tci.ctun
     }
 
     pub fn is_transmitting(&self) -> bool {
@@ -703,32 +514,20 @@ impl PttController {
     }
 
     pub fn fwd_power_raw(&self) -> u16 {
-        match &self.radio {
-            RadioBackend::Cat(c) => c.fwd_power_raw(),
-            RadioBackend::Tci(t) => t.fwd_power_raw(),
-        }
+        self.tci.fwd_power_raw()
     }
 
     /// SWR × 100 (e.g. 150 = 1.50:1). Returns 100 when not transmitting.
     pub fn swr_x100(&self) -> u16 {
-        match &self.radio {
-            RadioBackend::Tci(t) => (t.swr * 100.0).round() as u16,
-            _ => 100,
-        }
+        (self.tci.swr * 100.0).round() as u16
     }
 
     pub async fn set_vfo_a_freq(&mut self, hz: u64) {
-        match &mut self.radio {
-            RadioBackend::Cat(c) => c.set_vfo_a_freq(hz).await,
-            RadioBackend::Tci(t) => t.set_vfo_a_freq(hz).await,
-        }
+        self.tci.set_vfo_a_freq(hz).await
     }
 
     pub async fn set_vfo_a_mode(&mut self, mode: u8) {
-        match &mut self.radio {
-            RadioBackend::Cat(c) => c.set_vfo_a_mode(mode).await,
-            RadioBackend::Tci(t) => t.set_vfo_a_mode(mode).await,
-        }
+        self.tci.set_vfo_a_mode(mode).await
     }
 
     pub async fn set_power(&mut self, on: bool) {
@@ -782,149 +581,98 @@ impl PttController {
     }
 
     pub async fn set_tx_profile(&mut self, idx: u8) {
-        match &mut self.radio {
-            RadioBackend::Cat(c) => c.set_tx_profile(idx).await,
-            RadioBackend::Tci(t) => t.set_tx_profile(idx).await,
-        }
+        self.tci.set_tx_profile(idx).await
     }
 
     pub async fn set_nr(&mut self, level: u8) {
-        match &mut self.radio {
-            RadioBackend::Cat(c) => c.set_nr(level).await,
-            RadioBackend::Tci(t) => t.set_nr(level).await,
-        }
+        self.tci.set_nr(level).await
     }
 
     pub async fn set_anf(&mut self, on: bool) {
-        match &mut self.radio {
-            RadioBackend::Cat(c) => c.set_anf(on).await,
-            RadioBackend::Tci(t) => t.set_anf(on).await,
-        }
+        self.tci.set_anf(on).await
     }
 
     pub async fn set_drive(&mut self, level: u8) {
-        match &mut self.radio {
-            RadioBackend::Cat(c) => c.set_drive(level).await,
-            RadioBackend::Tci(t) => t.set_drive(level).await,
-        }
+        self.tci.set_drive(level).await
     }
 
     pub async fn set_filter(&mut self, low_hz: i32, high_hz: i32) {
-        match &mut self.radio {
-            RadioBackend::Cat(c) => c.set_filter(low_hz, high_hz).await,
-            RadioBackend::Tci(t) => t.set_filter(low_hz, high_hz).await,
-        }
+        self.tci.set_filter(low_hz, high_hz).await
     }
 
     // --- RX2 / VFO-B ---
 
     pub fn vfo_b_freq(&self) -> u64 {
-        match &self.radio {
-            RadioBackend::Cat(c) => c.vfo_b_freq,
-            RadioBackend::Tci(t) => t.vfo_b_freq,
-        }
+        self.tci.vfo_b_freq
     }
 
     pub fn vfo_b_mode(&self) -> u8 {
-        match &self.radio {
-            RadioBackend::Cat(c) => c.vfo_b_mode,
-            RadioBackend::Tci(t) => t.vfo_b_mode,
-        }
+        self.tci.vfo_b_mode
     }
 
     pub fn smeter_rx2_avg(&self) -> u16 {
-        match &self.radio {
-            RadioBackend::Cat(c) => c.smeter_rx2_avg(),
-            RadioBackend::Tci(t) => t.smeter_rx2_avg(),
-        }
+        self.tci.smeter_rx2_avg()
     }
 
     pub fn rx2_af_gain(&self) -> u8 {
-        match &self.radio {
-            RadioBackend::Cat(c) => c.rx2_af_gain,
-            RadioBackend::Tci(t) => t.rx2_af_gain,
-        }
+        self.tci.rx2_af_gain
     }
 
     pub fn filter_rx2_low_hz(&self) -> i32 {
-        match &self.radio {
-            RadioBackend::Cat(c) => c.filter_rx2_low_hz,
-            RadioBackend::Tci(t) => t.filter_rx2_low_hz,
-        }
+        self.tci.filter_rx2_low_hz
     }
 
     pub fn filter_rx2_high_hz(&self) -> i32 {
-        match &self.radio {
-            RadioBackend::Cat(c) => c.filter_rx2_high_hz,
-            RadioBackend::Tci(t) => t.filter_rx2_high_hz,
-        }
+        self.tci.filter_rx2_high_hz
     }
 
     pub fn rx2_nr_level(&self) -> u8 {
-        match &self.radio {
-            RadioBackend::Cat(c) => c.rx2_nr_level,
-            RadioBackend::Tci(t) => t.rx2_nr_level,
-        }
+        self.tci.rx2_nr_level
     }
 
     pub fn rx2_anf_on(&self) -> bool {
-        match &self.radio {
-            RadioBackend::Cat(c) => c.rx2_anf_on,
-            RadioBackend::Tci(t) => t.rx2_anf_on,
-        }
+        self.tci.rx2_anf_on
     }
 
     pub fn tx_profile_names(&self) -> &[String] {
-        match &self.radio {
-            RadioBackend::Cat(_) => &[],
-            RadioBackend::Tci(t) => &t.tx_profile_names,
-        }
+        &self.tci.tx_profile_names
     }
 
     pub fn tx_profile_name(&self) -> &str {
-        match &self.radio {
-            RadioBackend::Cat(_) => "",
-            RadioBackend::Tci(t) => &t.tx_profile_name,
-        }
+        &self.tci.tx_profile_name
     }
 
     pub fn mon_on(&self) -> bool {
-        match &self.radio {
-            RadioBackend::Cat(c) => c.mon_on,
-            RadioBackend::Tci(t) => t.mon_on,
-        }
+        self.tci.mon_on
     }
 
     // New TCI state getters (v2.10.3.13) — TCI-only, return defaults for CAT
     pub fn agc_mode(&self) -> u8 {
-        match &self.radio { RadioBackend::Tci(t) => t.agc_mode, _ => 3 }
+        self.tci.agc_mode
     }
     pub fn agc_gain(&self) -> u8 {
-        match &self.radio { RadioBackend::Tci(t) => t.agc_gain, _ => 80 }
+        self.tci.agc_gain
     }
     pub fn rit_enable(&self) -> bool {
-        match &self.radio { RadioBackend::Tci(t) => t.rit_enable, _ => false }
+        self.tci.rit_enable
     }
     pub fn rit_offset(&self) -> i32 {
-        match &self.radio { RadioBackend::Tci(t) => t.rit_offset, _ => 0 }
+        self.tci.rit_offset
     }
     pub fn xit_enable(&self) -> bool {
-        match &self.radio { RadioBackend::Tci(t) => t.xit_enable, _ => false }
+        self.tci.xit_enable
     }
     pub fn xit_offset(&self) -> i32 {
-        match &self.radio { RadioBackend::Tci(t) => t.xit_offset, _ => 0 }
+        self.tci.xit_offset
     }
     pub fn sql_enable(&self) -> bool {
-        match &self.radio { RadioBackend::Tci(t) => t.sql_enable, _ => false }
+        self.tci.sql_enable
     }
     pub fn sql_level(&self) -> u8 {
-        match &self.radio { RadioBackend::Tci(t) => t.sql_level, _ => 0 }
-    }
-    pub fn nb_enable(&self) -> bool {
-        match &self.radio { RadioBackend::Tci(t) => t.nb_enable, _ => false }
+        self.tci.sql_level
     }
     pub async fn diversity_smartnull(&mut self, params: &[f32]) {
-        if let RadioBackend::Tci(t) = &mut self.radio {
+        if let Some(t) = Some(&mut self.tci) {
             if !t.has_cap("diversity_sweep_ex") {
                 info!("Diversity smartnull skipped (diversity_sweep_ex cap not available)");
                 return;
@@ -936,7 +684,7 @@ impl PttController {
         }
     }
     pub async fn diversity_ultranull(&mut self, params: &[f32]) {
-        if let RadioBackend::Tci(t) = &mut self.radio {
+        if let Some(t) = Some(&mut self.tci) {
             if !t.has_cap("diversity_sweep_ex") {
                 info!("Diversity ultranull skipped (diversity_sweep_ex cap not available)");
                 return;
@@ -948,7 +696,7 @@ impl PttController {
         }
     }
     pub async fn diversity_fastsweep(&mut self, start: f32, end: f32, step: f32, settle_ms: u32, meter: u32) {
-        if let RadioBackend::Tci(t) = &mut self.radio {
+        if let Some(t) = Some(&mut self.tci) {
             if !t.has_cap("diversity_sweep_ex") {
                 info!("Diversity fastsweep skipped (diversity_sweep_ex cap not available)");
                 return;
@@ -958,154 +706,118 @@ impl PttController {
         }
     }
     pub async fn diversity_autonull(&mut self, settle_ms: u32, steps: &[(Vec<f32>, bool)]) {
-        if let RadioBackend::Tci(t) = &mut self.radio {
+        if let Some(t) = Some(&mut self.tci) {
             t.diversity_auto_done = None; // clear previous result
             t.diversity_autonull(settle_ms, steps).await;
         }
     }
     /// Returns improvement × 10 + 32000 as u16 when done, 0 when not done.
     pub fn diversity_autonull_done(&self) -> u16 {
-        match &self.radio {
-            RadioBackend::Tci(t) => {
-                if let Some((_, _, improvement)) = t.diversity_auto_done {
-                    ((improvement * 10.0).clamp(-320.0, 320.0) as i16 as u16).wrapping_add(32000)
-                } else { 0 }
-            }
-            _ => 0,
-        }
+        if let Some((_, _, improvement)) = self.tci.diversity_auto_done {
+            ((improvement * 10.0).clamp(-320.0, 320.0) as i16 as u16).wrapping_add(32000)
+        } else { 0 }
     }
     pub fn diversity_phase(&self) -> i32 {
-        match &self.radio {
-            RadioBackend::Tci(t) => t.diversity_phase,
-            _ => 0,
-        }
+        self.tci.diversity_phase
     }
     pub fn diversity_gain(&self, rx: usize) -> u16 {
-        match &self.radio {
-            RadioBackend::Tci(t) => if rx == 0 { t.diversity_gain_rx1 } else { t.diversity_gain_rx2 },
-            _ => 1000,
-        }
+        if rx == 0 { self.tci.diversity_gain_rx1 } else { self.tci.diversity_gain_rx2 }
+    }
+    pub fn diversity_gain_multi(&self) -> u16 {
+        self.tci.diversity_gain_multi
     }
     pub fn diversity_enabled(&self) -> bool {
-        match &self.radio {
-            RadioBackend::Tci(t) => t.diversity_enabled,
-            _ => false,
-        }
+        self.tci.diversity_enabled
     }
     pub fn agc_auto(&self, rx: usize) -> bool {
-        match &self.radio {
-            RadioBackend::Tci(t) => if rx == 0 { t.agc_auto_rx1 } else { t.agc_auto_rx2 },
-            _ => false,
-        }
+        if rx == 0 { self.tci.agc_auto_rx1 } else { self.tci.agc_auto_rx2 }
     }
     pub async fn set_agc_auto(&mut self, rx: u32, enabled: bool) {
-        if let RadioBackend::Tci(t) = &mut self.radio {
-            if t.has_cap("agc_auto_ex") {
-                let cmd = format!("agc_auto_ex:{},{};", rx, enabled);
-                t.send(&cmd).await;
-                if rx == 0 { t.agc_auto_rx1 = enabled; }
-                else { t.agc_auto_rx2 = enabled; }
-            }
-        }
+        // Stock .14/.15 supports agc_auto_ex without advertising the cap.
+        let t = &mut self.tci;
+        let cmd = format!("agc_auto_ex:{},{};", rx, enabled);
+        t.send(&cmd).await;
+        if rx == 0 { t.agc_auto_rx1 = enabled; }
+        else { t.agc_auto_rx2 = enabled; }
     }
     pub fn nb_level(&self) -> u8 {
-        match &self.radio { RadioBackend::Tci(t) => t.nb_level, _ => 0 }
+        self.tci.nb_level
     }
     pub fn cw_keyer_speed(&self) -> u8 {
-        match &self.radio { RadioBackend::Tci(t) => t.cw_keyer_speed, _ => 20 }
+        self.tci.cw_keyer_speed
     }
     pub fn vfo_lock(&self) -> bool {
-        match &self.radio { RadioBackend::Tci(t) => t.vfo_lock, _ => false }
+        self.tci.vfo_lock
     }
     pub fn binaural(&self) -> bool {
-        match &self.radio { RadioBackend::Tci(t) => t.binaural, _ => false }
+        self.tci.binaural
     }
     pub fn apf_enable(&self) -> bool {
-        match &self.radio { RadioBackend::Tci(t) => t.apf_enable, _ => false }
+        self.tci.apf_enable
     }
 
     // RX2 TCI state getters
     pub fn rx2_agc_mode(&self) -> u8 {
-        match &self.radio { RadioBackend::Tci(t) => t.rx2_agc_mode, _ => 3 }
+        self.tci.rx2_agc_mode
     }
     pub fn rx2_agc_gain(&self) -> u8 {
-        match &self.radio { RadioBackend::Tci(t) => t.rx2_agc_gain, _ => 80 }
+        self.tci.rx2_agc_gain
     }
     pub fn rx2_sql_enable(&self) -> bool {
-        match &self.radio { RadioBackend::Tci(t) => t.rx2_sql_enable, _ => false }
+        self.tci.rx2_sql_enable
     }
     pub fn rx2_sql_level(&self) -> u8 {
-        match &self.radio { RadioBackend::Tci(t) => t.rx2_sql_level, _ => 0 }
+        self.tci.rx2_sql_level
     }
     pub fn rx2_nb_enable(&self) -> bool {
-        match &self.radio { RadioBackend::Tci(t) => t.rx2_nb_enable, _ => false }
+        self.tci.rx2_nb_enable
     }
     pub fn rx2_binaural(&self) -> bool {
-        match &self.radio { RadioBackend::Tci(t) => t.rx2_binaural, _ => false }
+        self.tci.rx2_binaural
     }
     pub fn rx2_apf_enable(&self) -> bool {
-        match &self.radio { RadioBackend::Tci(t) => t.rx2_apf_enable, _ => false }
+        self.tci.rx2_apf_enable
     }
     pub fn rx2_vfo_lock(&self) -> bool {
-        match &self.radio { RadioBackend::Tci(t) => t.rx2_vfo_lock, _ => false }
+        self.tci.rx2_vfo_lock
     }
     pub fn mute(&self) -> bool {
-        match &self.radio { RadioBackend::Tci(t) => t.mute, _ => false }
+        self.tci.mute
     }
     pub fn rx_mute(&self) -> bool {
-        match &self.radio { RadioBackend::Tci(t) => t.rx_mute, _ => false }
+        self.tci.rx_mute
     }
     pub fn nf_enable(&self) -> bool {
-        match &self.radio { RadioBackend::Tci(t) => t.nf_enable, _ => false }
+        self.tci.nf_enable
     }
     pub fn rx2_nf_enable(&self) -> bool {
-        match &self.radio { RadioBackend::Tci(t) => t.rx2_nf_enable, _ => false }
+        self.tci.rx2_nf_enable
     }
     pub fn rx_balance(&self) -> i8 {
-        match &self.radio { RadioBackend::Tci(t) => t.rx_balance, _ => 0 }
+        self.tci.rx_balance
     }
 
     pub fn vfo_sync_on(&self) -> bool {
-        match &self.radio {
-            RadioBackend::Cat(c) => c.vfo_sync_on,
-            RadioBackend::Tci(t) => t.vfo_sync_on,
-        }
+        self.tci.vfo_sync_on
     }
 
     pub async fn set_mon(&mut self, on: bool) {
-        match &mut self.radio {
-            RadioBackend::Cat(c) => c.set_mon(on).await,
-            RadioBackend::Tci(t) => t.set_mon(on).await,
-        }
+        self.tci.set_mon(on).await
     }
 
     pub async fn set_vfo_sync_thetis(&mut self, on: bool) {
-        if self.is_tci {
-            // Prefer TCI _ex command if available, fallback to auxiliary CAT
-            if let RadioBackend::Tci(ref mut tci) = self.radio {
-                if tci.has_cap("vfo_sync_ex") {
-                    tci.set_vfo_sync(on).await;
-                    return;
-                }
-            }
-            let cmd = if on { "ZZSY1;" } else { "ZZSY0;" };
-            if let Some(ref mut cat) = self.aux_cat {
-                info!("VFO Sync via aux CAT: {}", cmd);
-                cat.send(cmd).await;
-            }
-        } else {
-            match &mut self.radio {
-                RadioBackend::Cat(c) => c.set_vfo_sync(on).await,
-                RadioBackend::Tci(_) => {}
-            }
-        }
+        // Stock .14/.15 supports vfo_sync_ex without advertising the cap (cap-check is
+        // a TL-26 erfgoed). Use the optimistic _ex setter directly — owner-keuze 1a:
+        // "Plus vfo_sync_ex _ex pad uitlijnen". Compat-statement (alpha-4 ≥ Thetis
+        // v2.10.3.14) maakt de oude run_cat(ZZSY) fallback overbodig.
+        self.tci.set_vfo_sync(on).await;
     }
 
     // ── Diversity dispatch (TCI _ex with CAT fallback) ────────────────
 
     pub async fn set_diversity_enable(&mut self, enabled: bool) {
-        if let RadioBackend::Tci(ref mut tci) = self.radio {
-            if tci.has_cap("diversity_ex") {
+        if let Some(tci) = Some(&mut self.tci) {
+            if tci.has_cap("diversity_enable_ex") {
                 tci.set_diversity_enable(enabled).await;
                 return;
             }
@@ -1115,8 +827,8 @@ impl PttController {
     }
 
     pub async fn set_diversity_ref(&mut self, rx1_ref: bool) {
-        if let RadioBackend::Tci(ref mut tci) = self.radio {
-            if tci.has_cap("diversity_ex") {
+        if let Some(tci) = Some(&mut self.tci) {
+            if tci.has_cap("diversity_ref_ex") {
                 tci.set_diversity_ref(rx1_ref).await;
                 return;
             }
@@ -1126,8 +838,8 @@ impl PttController {
     }
 
     pub async fn set_diversity_source(&mut self, source: u32) {
-        if let RadioBackend::Tci(ref mut tci) = self.radio {
-            if tci.has_cap("diversity_ex") {
+        if let Some(tci) = Some(&mut self.tci) {
+            if tci.has_cap("diversity_source_ex") {
                 tci.set_diversity_source(source).await;
                 return;
             }
@@ -1137,8 +849,8 @@ impl PttController {
     }
 
     pub async fn set_diversity_gain(&mut self, rx: u32, gain: u16) {
-        if let RadioBackend::Tci(ref mut tci) = self.radio {
-            if tci.has_cap("diversity_ex") {
+        if let Some(tci) = Some(&mut self.tci) {
+            if tci.has_cap("diversity_gain_ex") {
                 tci.set_diversity_gain(rx, gain).await;
                 return;
             }
@@ -1152,8 +864,8 @@ impl PttController {
     }
 
     pub async fn set_diversity_phase(&mut self, phase: i32) {
-        if let RadioBackend::Tci(ref mut tci) = self.radio {
-            if tci.has_cap("diversity_ex") {
+        if let Some(tci) = Some(&mut self.tci) {
+            if tci.has_cap("diversity_phase_ex") {
                 tci.set_diversity_phase(phase).await;
                 return;
             }
@@ -1163,204 +875,162 @@ impl PttController {
         self.send_cat(&cmd).await;
     }
 
-    pub async fn set_vfo_b_freq(&mut self, hz: u64) {
-        match &mut self.radio {
-            RadioBackend::Cat(c) => c.set_vfo_b_freq(hz).await,
-            RadioBackend::Tci(t) => t.set_vfo_b_freq(hz).await,
+    /// TL2-1 fork-only — no CAT fallback (stock Thetis has no ZZ-CAT for GainMulti).
+    pub async fn set_diversity_gain_multi(&mut self, multi: u16) {
+        if self.tci.has_cap("diversity_gain_multi_ex") {
+            self.tci.set_diversity_gain_multi(multi).await;
         }
+    }
+
+    /// TL2-1 fork-only — DDC per-RX sample-rate change. No CAT fallback (stock
+    /// Thetis has no ZZ-CAT for the per-RX sample rate; only Setup-form UI).
+    pub async fn set_ddc_sample_rate(&mut self, rx: u32, rate_hz: u32) {
+        if self.tci.has_cap("ddc_sample_rate_ex") {
+            self.tci.set_ddc_sample_rate(rx, rate_hz).await;
+        }
+    }
+
+    pub async fn set_vfo_b_freq(&mut self, hz: u64) {
+        self.tci.set_vfo_b_freq(hz).await
     }
 
     pub async fn set_vfo_b_mode(&mut self, mode: u8) {
-        match &mut self.radio {
-            RadioBackend::Cat(c) => c.set_vfo_b_mode(mode).await,
-            RadioBackend::Tci(t) => t.set_vfo_b_mode(mode).await,
-        }
+        self.tci.set_vfo_b_mode(mode).await
     }
 
     pub async fn vfo_swap(&mut self) {
-        match &mut self.radio {
-            RadioBackend::Cat(c) => c.vfo_swap().await,
-            RadioBackend::Tci(t) => t.vfo_swap().await,
-        }
+        self.tci.vfo_swap().await
     }
 
     pub async fn set_rx2_af_gain(&mut self, level: u8) {
-        match &mut self.radio {
-            RadioBackend::Cat(c) => c.set_rx2_af_gain(level).await,
-            RadioBackend::Tci(t) => t.set_rx2_af_gain(level).await,
-        }
+        self.tci.set_rx2_af_gain(level).await
     }
 
     pub async fn set_rx2_nr(&mut self, level: u8) {
-        match &mut self.radio {
-            RadioBackend::Cat(c) => c.set_rx2_nr(level).await,
-            RadioBackend::Tci(t) => t.set_rx2_nr(level).await,
-        }
+        self.tci.set_rx2_nr(level).await
     }
 
     pub async fn set_rx2_anf(&mut self, on: bool) {
-        match &mut self.radio {
-            RadioBackend::Cat(c) => c.set_rx2_anf(on).await,
-            RadioBackend::Tci(t) => t.set_rx2_anf(on).await,
-        }
+        self.tci.set_rx2_anf(on).await
     }
 
     pub async fn set_rx2_filter(&mut self, low_hz: i32, high_hz: i32) {
-        match &mut self.radio {
-            RadioBackend::Cat(c) => c.set_rx2_filter(low_hz, high_hz).await,
-            RadioBackend::Tci(t) => t.set_rx2_filter(low_hz, high_hz).await,
-        }
+        self.tci.set_rx2_filter(low_hz, high_hz).await
     }
 
     // --- New TCI controls (v2.10.3.13) ---
 
     pub async fn set_agc_mode(&mut self, mode: u8) {
-        if let RadioBackend::Tci(t) = &mut self.radio { t.set_agc_mode(mode).await; }
+        if let Some(t) = Some(&mut self.tci) { t.set_agc_mode(mode).await; }
     }
     pub async fn set_agc_gain(&mut self, gain: u8) {
-        if let RadioBackend::Tci(t) = &mut self.radio { t.set_agc_gain(gain).await; }
+        if let Some(t) = Some(&mut self.tci) { t.set_agc_gain(gain).await; }
     }
     pub async fn set_rit_enable(&mut self, on: bool) {
-        if let RadioBackend::Tci(t) = &mut self.radio { t.set_rit_enable(on).await; }
+        if let Some(t) = Some(&mut self.tci) { t.set_rit_enable(on).await; }
     }
     pub async fn set_rit_offset(&mut self, hz: i32) {
-        if let RadioBackend::Tci(t) = &mut self.radio { t.set_rit_offset(hz).await; }
+        if let Some(t) = Some(&mut self.tci) { t.set_rit_offset(hz).await; }
     }
     pub async fn set_xit_enable(&mut self, on: bool) {
-        if let RadioBackend::Tci(t) = &mut self.radio { t.set_xit_enable(on).await; }
+        if let Some(t) = Some(&mut self.tci) { t.set_xit_enable(on).await; }
     }
     pub async fn set_xit_offset(&mut self, hz: i32) {
-        if let RadioBackend::Tci(t) = &mut self.radio { t.set_xit_offset(hz).await; }
+        if let Some(t) = Some(&mut self.tci) { t.set_xit_offset(hz).await; }
     }
     pub async fn set_sql_enable(&mut self, on: bool) {
-        if let RadioBackend::Tci(t) = &mut self.radio { t.set_sql_enable(on).await; }
+        if let Some(t) = Some(&mut self.tci) { t.set_sql_enable(on).await; }
     }
     pub async fn set_sql_level(&mut self, level: i16) {
-        if let RadioBackend::Tci(t) = &mut self.radio { t.set_sql_level(level).await; }
-    }
-    pub async fn set_nb_enable(&mut self, on: bool) {
-        if let RadioBackend::Tci(t) = &mut self.radio { t.set_nb_enable(on).await; }
+        if let Some(t) = Some(&mut self.tci) { t.set_sql_level(level).await; }
     }
     pub async fn set_nb(&mut self, level: u8) {
-        if let RadioBackend::Tci(t) = &mut self.radio { t.set_nb(level).await; }
+        if let Some(t) = Some(&mut self.tci) { t.set_nb(level).await; }
     }
     pub async fn set_cw_keyer_speed(&mut self, wpm: u8) {
-        if let RadioBackend::Tci(t) = &mut self.radio { t.set_cw_keyer_speed(wpm).await; }
+        if let Some(t) = Some(&mut self.tci) { t.set_cw_keyer_speed(wpm).await; }
     }
     pub async fn cw_key(&mut self, pressed: bool, duration_ms: Option<u16>) {
-        if let RadioBackend::Tci(t) = &mut self.radio { t.cw_key(pressed, duration_ms).await; }
+        if let Some(t) = Some(&mut self.tci) { t.cw_key(pressed, duration_ms).await; }
     }
     pub async fn cw_macro_stop(&mut self) {
-        if let RadioBackend::Tci(t) = &mut self.radio { t.cw_macro_stop().await; }
+        if let Some(t) = Some(&mut self.tci) { t.cw_macro_stop().await; }
     }
     pub async fn set_vfo_lock(&mut self, on: bool) {
-        if let RadioBackend::Tci(t) = &mut self.radio { t.set_vfo_lock(on).await; }
+        if let Some(t) = Some(&mut self.tci) { t.set_vfo_lock(on).await; }
     }
     pub async fn set_binaural(&mut self, on: bool) {
-        if let RadioBackend::Tci(t) = &mut self.radio { t.set_binaural(on).await; }
+        if let Some(t) = Some(&mut self.tci) { t.set_binaural(on).await; }
     }
     pub async fn set_apf_enable(&mut self, on: bool) {
-        if let RadioBackend::Tci(t) = &mut self.radio { t.set_apf_enable(on).await; }
+        if let Some(t) = Some(&mut self.tci) { t.set_apf_enable(on).await; }
     }
 
     // RX2 TCI control setters
     pub async fn set_rx2_agc_mode(&mut self, mode: u8) {
-        if let RadioBackend::Tci(t) = &mut self.radio { t.set_rx2_agc_mode(mode).await; }
+        if let Some(t) = Some(&mut self.tci) { t.set_rx2_agc_mode(mode).await; }
     }
     pub async fn set_rx2_agc_gain(&mut self, gain: u8) {
-        if let RadioBackend::Tci(t) = &mut self.radio { t.set_rx2_agc_gain(gain).await; }
+        if let Some(t) = Some(&mut self.tci) { t.set_rx2_agc_gain(gain).await; }
     }
     pub async fn set_rx2_sql_enable(&mut self, on: bool) {
-        if let RadioBackend::Tci(t) = &mut self.radio { t.set_rx2_sql_enable(on).await; }
+        if let Some(t) = Some(&mut self.tci) { t.set_rx2_sql_enable(on).await; }
     }
     pub async fn set_rx2_sql_level(&mut self, level: i16) {
-        if let RadioBackend::Tci(t) = &mut self.radio { t.set_rx2_sql_level(level).await; }
-    }
-    pub async fn set_rx2_nb_enable(&mut self, on: bool) {
-        if let RadioBackend::Tci(t) = &mut self.radio { t.set_rx2_nb_enable(on).await; }
+        if let Some(t) = Some(&mut self.tci) { t.set_rx2_sql_level(level).await; }
     }
     pub async fn set_rx2_nb(&mut self, level: u8) {
-        if let RadioBackend::Tci(t) = &mut self.radio { t.set_rx2_nb(level).await; }
+        if let Some(t) = Some(&mut self.tci) { t.set_rx2_nb(level).await; }
     }
     pub async fn set_rx2_binaural(&mut self, on: bool) {
-        if let RadioBackend::Tci(t) = &mut self.radio { t.set_rx2_binaural(on).await; }
+        if let Some(t) = Some(&mut self.tci) { t.set_rx2_binaural(on).await; }
     }
     pub async fn set_rx2_apf_enable(&mut self, on: bool) {
-        if let RadioBackend::Tci(t) = &mut self.radio { t.set_rx2_apf_enable(on).await; }
+        if let Some(t) = Some(&mut self.tci) { t.set_rx2_apf_enable(on).await; }
     }
     pub async fn set_rx2_vfo_lock(&mut self, on: bool) {
-        if let RadioBackend::Tci(t) = &mut self.radio { t.set_rx2_vfo_lock(on).await; }
+        if let Some(t) = Some(&mut self.tci) { t.set_rx2_vfo_lock(on).await; }
     }
     pub async fn set_mute(&mut self, on: bool) {
-        if let RadioBackend::Tci(t) = &mut self.radio { t.set_mute(on).await; }
+        if let Some(t) = Some(&mut self.tci) { t.set_mute(on).await; }
     }
     pub async fn set_rx_mute(&mut self, on: bool) {
-        if let RadioBackend::Tci(t) = &mut self.radio { t.set_rx_mute(on).await; }
+        if let Some(t) = Some(&mut self.tci) { t.set_rx_mute(on).await; }
     }
     pub async fn set_nf_enable(&mut self, on: bool) {
-        if let RadioBackend::Tci(t) = &mut self.radio { t.set_nf_enable(on).await; }
+        if let Some(t) = Some(&mut self.tci) { t.set_nf_enable(on).await; }
     }
     pub async fn set_rx2_nf_enable(&mut self, on: bool) {
-        if let RadioBackend::Tci(t) = &mut self.radio { t.set_rx2_nf_enable(on).await; }
+        if let Some(t) = Some(&mut self.tci) { t.set_rx2_nf_enable(on).await; }
     }
     pub async fn set_rx_balance(&mut self, value: i8) {
-        if let RadioBackend::Tci(t) = &mut self.radio { t.set_rx_balance(value).await; }
+        if let Some(t) = Some(&mut self.tci) { t.set_rx_balance(value).await; }
     }
 
     // Tune, tune drive, monitor volume
-    pub fn tune_active(&self) -> bool {
-        match &self.radio { RadioBackend::Tci(t) => t.tune_active, _ => false }
-    }
     pub fn tune_drive(&self) -> u8 {
-        match &self.radio { RadioBackend::Tci(t) => t.tune_drive, _ => 0 }
+        self.tci.tune_drive
     }
     pub fn mon_volume(&self) -> i8 {
-        match &self.radio { RadioBackend::Tci(t) => t.mon_volume, _ => -40 }
+        self.tci.mon_volume
     }
     pub async fn set_tune(&mut self, on: bool) {
-        if let RadioBackend::Tci(t) = &mut self.radio { t.set_tune(on).await; }
+        if let Some(t) = Some(&mut self.tci) { t.set_tune(on).await; }
     }
     pub async fn set_tune_drive(&mut self, level: u8) {
-        if let RadioBackend::Tci(t) = &mut self.radio { t.set_tune_drive(level).await; }
+        if let Some(t) = Some(&mut self.tci) { t.set_tune_drive(level).await; }
     }
     pub async fn set_mon_volume(&mut self, db: i8) {
-        if let RadioBackend::Tci(t) = &mut self.radio { t.set_mon_volume(db).await; }
+        if let Some(t) = Some(&mut self.tci) { t.set_mon_volume(db).await; }
     }
 
     /// Check which connections need to be established (brief, no I/O).
-    /// Returns (tci_url, cat_addr, aux_cat_addr).
-    pub fn needed_connections(&mut self) -> (Option<String>, Option<String>, Option<String>) {
-        let tci_url = match &mut self.radio {
-            RadioBackend::Tci(tci) => tci.needs_connect_info(),
-            RadioBackend::Cat(_) => None,
-        };
-        let cat_addr = match &mut self.radio {
-            RadioBackend::Cat(cat) => cat.needs_connect(),
-            RadioBackend::Tci(_) => None,
-        };
-        // Skip aux CAT connection when TCI _ex covers everything.
-        // Check both the cached flag AND live caps to prevent initial connect before caps arrive.
-        let all_ex_live = match &self.radio {
-            RadioBackend::Tci(tci) => tci.has_cap("ctun_ex")
-                && tci.has_cap("vfo_sync_ex")
-                && tci.has_cap("step_attenuator_ex")
-                && tci.has_cap("diversity_ex")
-                && tci.has_cap("fm_deviation_ex"),
-            _ => false,
-        };
-        let aux_addr = if let Some(ref mut cat) = self.aux_cat {
-            if cat.volume_only_mode || all_ex_live {
-                None
-            } else {
-                cat.needs_connect()
-            }
-        } else {
-            None
-        };
-        (tci_url, cat_addr, aux_addr)
+    /// Returns (tci_url,) — TL2 v2: TCI-only, no CAT.
+    pub fn needed_connections(&mut self) -> Option<String> {
+        self.tci.needs_connect_info()
     }
 
-    /// Accept established connections from the background connector.
+    /// Accept established TCI connection from the background connector.
     pub fn accept_connections(
         &mut self,
         tci_stream: Option<
@@ -1368,108 +1038,64 @@ impl PttController {
                 tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
             >,
         >,
-        cat_stream: Option<tokio::net::TcpStream>,
-        aux_stream: Option<tokio::net::TcpStream>,
     ) {
         if let Some(stream) = tci_stream {
-            if let RadioBackend::Tci(ref mut tci) = self.radio {
-                tci.accept_stream(stream);
-            }
-        }
-        if let Some(stream) = cat_stream {
-            if let RadioBackend::Cat(ref mut cat) = self.radio {
-                cat.accept_stream(stream);
-            }
-        }
-        if let Some(stream) = aux_stream {
-            if let Some(ref mut cat) = self.aux_cat {
-                cat.accept_stream(stream);
-            }
+            self.tci.accept_stream(stream);
         }
     }
 
-    /// Whether using TCI backend
-    pub fn is_tci_mode(&self) -> bool {
-        self.is_tci
-    }
-
-    pub async fn set_ddc_sample_rate(&mut self, rx: u32, rate: u32) {
-        match &mut self.radio {
-            RadioBackend::Tci(t) => t.set_ddc_sample_rate(rx, rate).await,
-            _ => {}
-        }
-    }
-
-    /// DDC sample rate per receiver in Hz (0=unknown)
+    /// DDC sample rate per receiver in Hz. In stock-mode beide RX1 en RX2 dezelfde
+    /// waarde (TCI exposes één globale `iq_samplerate`); per-RX divergence komt
+    /// terug via TL2-x fork extensions (Phase 3).
     pub fn ddc_sample_rate(&self, rx: usize) -> u32 {
-        match &self.radio {
-            RadioBackend::Tci(t) => if rx == 0 { t.ddc_sample_rate_rx1 } else { t.ddc_sample_rate_rx2 },
-            _ => 0,
-        }
+        if rx == 0 { self.tci.ddc_sample_rate_rx1 } else { self.tci.ddc_sample_rate_rx2 }
     }
 
-    /// Step attenuator value per receiver (0=RX1, 1=RX2). Negative dB from TCI _ex.
+    /// Step attenuator value per receiver (0=RX1, 1=RX2). Positive dB from stock v2.10.3.14 rx_step_att_ex.
     pub fn step_att(&self, rx: usize) -> i32 {
-        match &self.radio {
-            RadioBackend::Tci(t) => if rx == 0 { t.step_att_rx1 } else { t.step_att_rx2 },
-            RadioBackend::Cat(c) => if rx == 0 { c.step_att_rx1 as i32 } else { c.step_att_rx2 as i32 },
-        }
+        if rx == 0 { self.tci.step_att_rx1 } else { self.tci.step_att_rx2 }
+    }
+
+    /// Whether the step attenuator is currently enabled for the given receiver
+    /// (stock v2.10.3.14 rx_step_att_enabled_ex).
+    pub fn step_att_enabled(&self, rx: usize) -> bool {
+        if rx == 0 { self.tci.step_att_enabled_rx1 } else { self.tci.step_att_enabled_rx2 }
     }
 
     /// Check if the connected TCI server advertises a capability
     pub fn has_tci_cap(&self, cap: &str) -> bool {
-        match &self.radio {
-            RadioBackend::Tci(t) => t.has_cap(cap),
-            _ => false,
-        }
+        self.tci.has_cap(cap)
     }
 
-    /// Borrow the TCI connection (if in TCI mode)
+    /// Borrow the TCI connection (TL2 v2 always TCI).
     pub fn tci_ref(&self) -> Option<&crate::tci::TciConnection> {
-        match &self.radio {
-            RadioBackend::Tci(t) => Some(t),
-            _ => None,
-        }
+        Some(&self.tci)
     }
     /// Check if Thetis advertises a TCI capability
     pub fn has_cap(&self, cap: &str) -> bool {
-        match &self.radio {
-            RadioBackend::Tci(t) => t.has_cap(cap),
-            _ => false,
-        }
+        self.tci.has_cap(cap)
     }
 
     /// TCI DDS center frequency per receiver (0=RX1, 1=RX2). Returns 0 if not in TCI mode.
     pub fn dds_freq(&self, receiver: usize) -> u64 {
-        match &self.radio {
-            RadioBackend::Tci(t) => t.dds_freq[receiver.min(1)],
-            _ => 0,
-        }
+        self.tci.dds_freq[receiver.min(1)]
     }
 
     /// Static calibration offset (dB) from TCI calibration_ex.
     /// This is meter_cal + xvtr_gain + 6m_gain — everything except step ATT.
     pub fn static_cal_offset(&self, receiver: usize) -> f32 {
-        match &self.radio {
-            RadioBackend::Tci(t) => {
-                let idx = receiver.min(1);
-                t.meter_cal_offset[idx] + t.xvtr_gain_offset[idx] + t.six_m_gain_offset[idx]
-            }
-            _ => 0.0,
-        }
+        let idx = receiver.min(1);
+        self.tci.meter_cal_offset[idx] + self.tci.xvtr_gain_offset[idx] + self.tci.six_m_gain_offset[idx]
     }
 
     /// Raw TCI S-meter dBm (peakBinDbm) for auto-calibration.
     pub fn smeter_raw_dbm(&self, receiver: usize) -> Option<f32> {
-        match &self.radio {
-            RadioBackend::Tci(t) => t.smeter_raw_dbm[receiver.min(1)],
-            _ => None,
-        }
+        self.tci.smeter_raw_dbm[receiver.min(1)]
     }
 
     /// Write TX audio to TCI ring buffer (only in TCI mode, no-op for CAT)
     pub fn write_tx_audio(&mut self, samples: &[f32]) {
-        if let RadioBackend::Tci(ref mut tci) = self.radio {
+        if let Some(tci) = Some(&mut self.tci) {
             tci.write_tx_audio(samples);
         }
     }
