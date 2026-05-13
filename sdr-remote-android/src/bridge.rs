@@ -170,9 +170,43 @@ pub struct BridgeRadioState {
     pub rotor_available: bool,
     // DX Cluster spots
     pub dx_spots: Vec<BridgeDxSpot>,
-    // Auth
+    // Auth (legacy bools — Compose UI should prefer connect_status_* fields below)
     pub auth_rejected: bool,
     pub totp_required: bool,
+    // PATCH-1: connect-status as pre-rendered text. Single source of truth in
+    // sdr-remote-logic::i18n (NL+EN). Compose UI just renders these strings.
+    pub connect_status_headline: String,
+    pub connect_status_action: String, // empty if no action hint
+    pub connect_status_is_error: bool,
+    pub connect_status_is_awaiting_totp: bool,
+}
+
+/// PATCH-1: build a BridgeRadioState with connect-status text rendered in the
+/// caller-specified language. `From<RadioState>` defaults to English for
+/// compatibility; call sites that know the user's language preference should
+/// use this helper.
+pub fn bridge_state_from_radio_state(
+    s: RadioState,
+    lang: sdr_remote_logic::i18n::Lang,
+) -> BridgeRadioState {
+    let (headline, action) = sdr_remote_logic::i18n::connect_status_text(
+        &s.connect_status,
+        lang,
+        sdr_remote_logic::i18n::Platform::Mobile,
+    );
+    BridgeRadioState {
+        connect_status_headline: headline,
+        connect_status_action: action.unwrap_or_default(),
+        connect_status_is_error: matches!(
+            s.connect_status,
+            sdr_remote_logic::state::ConnectStatus::Failed(_)
+        ),
+        connect_status_is_awaiting_totp: matches!(
+            s.connect_status,
+            sdr_remote_logic::state::ConnectStatus::AwaitingTotp
+        ),
+        ..BridgeRadioState::from(s)
+    }
 }
 
 impl From<RadioState> for BridgeRadioState {
@@ -322,6 +356,33 @@ impl From<RadioState> for BridgeRadioState {
             }).collect(),
             auth_rejected: s.auth_rejected,
             totp_required: s.totp_required,
+            // PATCH-1: render connect_status text once in Rust so Android Compose
+            // UI is automatically lockstep with desktop egui UI on NL/EN strings.
+            // TODO(PATCH-1 follow-up): expose Lang as user config + OS-locale detect.
+            connect_status_headline: {
+                let (h, _) = sdr_remote_logic::i18n::connect_status_text(
+                    &s.connect_status,
+                    sdr_remote_logic::i18n::Lang::En,
+                    sdr_remote_logic::i18n::Platform::Mobile,
+                );
+                h
+            },
+            connect_status_action: {
+                let (_, a) = sdr_remote_logic::i18n::connect_status_text(
+                    &s.connect_status,
+                    sdr_remote_logic::i18n::Lang::En,
+                    sdr_remote_logic::i18n::Platform::Mobile,
+                );
+                a.unwrap_or_default()
+            },
+            connect_status_is_error: matches!(
+                s.connect_status,
+                sdr_remote_logic::state::ConnectStatus::Failed(_)
+            ),
+            connect_status_is_awaiting_totp: matches!(
+                s.connect_status,
+                sdr_remote_logic::state::ConnectStatus::AwaitingTotp
+            ),
         }
     }
 }
@@ -352,6 +413,9 @@ pub struct SdrBridge {
     cmd_tx: mpsc::UnboundedSender<Command>,
     state_rx: Mutex<watch::Receiver<RadioState>>,
     shutdown_tx: Mutex<Option<watch::Sender<bool>>>,
+    /// PATCH-1: UI language for connect-status / connect-error rendering in
+    /// `get_state()`. Set via `set_language("nl" | "en")`. Defaults to "en".
+    ui_language: Mutex<String>,
 }
 
 impl SdrBridge {
@@ -382,7 +446,21 @@ impl SdrBridge {
             cmd_tx,
             state_rx: Mutex::new(state_rx),
             shutdown_tx: Mutex::new(Some(shutdown_tx)),
+            ui_language: Mutex::new("en".to_string()),
         }
+    }
+
+    /// PATCH-1: set the UI language used for connect-status / connect-error
+    /// text in `get_state()`. Accepts "nl" or "en"; any other value falls
+    /// back to "en". Compose UI should call this once from SharedPreferences
+    /// on startup.
+    pub fn set_language(&self, lang: String) {
+        let normalized = if lang.to_lowercase() == "nl" {
+            "nl".to_string()
+        } else {
+            "en".to_string()
+        };
+        *self.ui_language.lock().unwrap() = normalized;
     }
 
     pub fn connect(&self, addr: String, password: String) {
@@ -689,7 +767,13 @@ impl SdrBridge {
     pub fn get_state(&self) -> BridgeRadioState {
         let rx = self.state_rx.lock().unwrap();
         let state = rx.borrow().clone();
-        BridgeRadioState::from(state)
+        let lang_str = self.ui_language.lock().unwrap().clone();
+        let lang = if lang_str == "nl" {
+            sdr_remote_logic::i18n::Lang::Nl
+        } else {
+            sdr_remote_logic::i18n::Lang::En
+        };
+        bridge_state_from_radio_state(state, lang)
     }
 
     pub fn shutdown(&self) {

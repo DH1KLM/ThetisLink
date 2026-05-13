@@ -68,6 +68,15 @@ pub struct NetworkService {
     vfo_b_freq_shared: Option<Arc<AtomicU64>>,
     yaesu_ptt_flag: Arc<std::sync::atomic::AtomicBool>,
     yaesu: Option<Arc<crate::yaesu::YaesuRadio>>,
+    /// PATCH-2: lock-free audio-activity counters shared with the
+    /// audio loops AND the UI Status panel.
+    audio_stats: Arc<crate::audio_stats::AudioActivityStats>,
+    /// PATCH-2: lock-free TCI-connection probe — updated from the
+    /// heartbeat handler, read by the Status panel.
+    tci_probe: Arc<crate::audio_stats::TciStatusProbe>,
+    /// PATCH-2: server start time — used as the mono-clock reference
+    /// for `AudioActivityStats::tick()` and the Status panel snapshot.
+    server_start: Instant,
 }
 
 impl NetworkService {
@@ -92,6 +101,10 @@ impl NetworkService {
         vfo_freq_shared: Option<Arc<AtomicU64>>,
         vfo_b_freq_shared: Option<Arc<AtomicU64>>,
         yaesu: Option<Arc<crate::yaesu::YaesuRadio>>,
+        audio_stats: Arc<crate::audio_stats::AudioActivityStats>,
+        tci_probe: Arc<crate::audio_stats::TciStatusProbe>,
+        server_start: Instant,
+        bind_status_slot: Arc<std::sync::OnceLock<crate::audio_stats::BindStatus>>,
     ) -> Result<Self> {
         // Wrap bind in 30s timeout to catch cold-boot kernel-hangs (memory
         // project_tl2_coldboot_bind_fail.md). On Err: emit [BIND-FAIL] with
@@ -106,10 +119,23 @@ impl NetworkService {
             Duration::from_secs(BIND_TIMEOUT_SECS),
             UdpSocket::bind(bind_addr),
         ).await {
-            Ok(Ok(s)) => s,
+            Ok(Ok(s)) => {
+                // Publish to the Status-panel slot so the UI shows the real
+                // listen address instead of a hardcoded placeholder.
+                let _ = bind_status_slot.set(
+                    crate::audio_stats::BindStatus::Ok { addr: bind_addr.to_string() },
+                );
+                s
+            }
             Ok(Err(e)) => {
                 let entry = format!("[BIND-FAIL] ts={} addr={} error={}\n", ts, bind_addr, e);
                 write_bind_diag(&entry);
+                let _ = bind_status_slot.set(
+                    crate::audio_stats::BindStatus::Failed {
+                        addr: bind_addr.to_string(),
+                        error: format!("{}", e),
+                    },
+                );
                 return Err(anyhow::Error::new(e)).context("bind UDP socket");
             }
             Err(_elapsed) => {
@@ -118,6 +144,12 @@ impl NetworkService {
                     ts, bind_addr, BIND_TIMEOUT_SECS
                 );
                 write_bind_diag(&entry);
+                let _ = bind_status_slot.set(
+                    crate::audio_stats::BindStatus::Failed {
+                        addr: bind_addr.to_string(),
+                        error: format!("bind timed out after {}s", BIND_TIMEOUT_SECS),
+                    },
+                );
                 return Err(anyhow::anyhow!(
                     "bind UDP socket timed out after {}s on {}",
                     BIND_TIMEOUT_SECS, bind_addr
@@ -158,6 +190,9 @@ impl NetworkService {
             vfo_b_freq_shared,
             yaesu_ptt_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             yaesu,
+            audio_stats,
+            tci_probe,
+            server_start,
         })
     }
 
@@ -199,11 +234,14 @@ impl NetworkService {
             let session = self.session.clone();
             let mut shutdown = self.shutdown.clone();
             let ptt = self.ptt.clone();
+            let audio_stats = self.audio_stats.clone();
+            let server_start = self.server_start;
             tokio::spawn(async move {
                 if let Err(e) = tci_multichannel_audio_loop(
                     socket, session, ptt,
                     tci_rx1_audio, tci_rx2_audio, tci_bin_r_audio,
                     &mut shutdown, start,
+                    audio_stats, server_start,
                 ).await { log::error!("Multi-channel audio bundler error: {}", e); }
             })
         };
@@ -218,14 +256,43 @@ impl NetworkService {
                 let socket = self.socket.clone();
                 let session = self.session.clone();
                 let mut shutdown = self.shutdown.clone();
+                let audio_stats = self.audio_stats.clone();
+                let server_start = self.server_start;
                 Some(tokio::spawn(async move {
-                    if let Err(e) = crate::audio_loops::yaesu_audio_loop(socket, session, audio_rx, sample_rate, &mut shutdown, start).await {
+                    if let Err(e) = crate::audio_loops::yaesu_audio_loop(socket, session, audio_rx, sample_rate, &mut shutdown, start, audio_stats, server_start).await {
                         log::error!("Yaesu audio loop error: {}", e);
                     }
                 }))
             } else {
                 None
             }
+        };
+
+        // PATCH-2 owner-feedback (2026-05-13): drive the TCI status probe
+        // from an independent 1Hz ticker so the Status panel reflects reality
+        // even when no clients are connected (heartbeat-driven updates only
+        // fire on client traffic — without this the panel would say
+        // "Disconnected since start" while Thetis is happily attached).
+        let _tci_probe_ticker = {
+            let ptt = self.ptt.clone();
+            let probe = self.tci_probe.clone();
+            let server_start = self.server_start;
+            let mut shutdown = self.shutdown.clone();
+            tokio::spawn(async move {
+                let mut tick = interval(Duration::from_millis(1000));
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {
+                            let tci_up = {
+                                let p = ptt.lock().await;
+                                p.tci_connected()
+                            };
+                            probe.update(tci_up, server_start);
+                        }
+                        _ = shutdown.changed() => break,
+                    }
+                }
+            })
         };
 
         // Spawn Yaesu state broadcast task (separate from Thetis broadcast)
@@ -1140,6 +1207,22 @@ impl NetworkService {
                         match &packet {
                             Packet::AuthResponse(hmac) => {
                                 let result = session.verify_auth(addr, hmac);
+                                // PATCH-2: record outcome in Status-panel ringbuffer.
+                                let outcome = match result {
+                                    sdr_remote_core::protocol::AUTH_ACCEPTED => {
+                                        Some(crate::session::ConnectOutcome::Accepted)
+                                    }
+                                    sdr_remote_core::protocol::AUTH_TOTP_REQUIRED => {
+                                        Some(crate::session::ConnectOutcome::TotpRequired)
+                                    }
+                                    sdr_remote_core::protocol::AUTH_REJECTED => {
+                                        Some(crate::session::ConnectOutcome::WrongPassword)
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(o) = outcome {
+                                    session.record_connect_attempt(addr, o);
+                                }
                                 drop(session);
                                 // Send AuthResult
                                 let mut buf = [0u8; 5];
@@ -1160,6 +1243,13 @@ impl NetworkService {
                             }
                             Packet::TotpResponse(code) => {
                                 let accepted = session.verify_totp(addr, code);
+                                // PATCH-2: record TOTP outcome in Status-panel ringbuffer.
+                                let outcome = if accepted {
+                                    crate::session::ConnectOutcome::Accepted
+                                } else {
+                                    crate::session::ConnectOutcome::WrongTotp
+                                };
+                                session.record_connect_attempt(addr, outcome);
                                 drop(session);
                                 // Send AuthResult with final verdict
                                 let mut buf = [0u8; 5];
@@ -1181,6 +1271,11 @@ impl NetworkService {
                                 if session.get_auth_state(addr).is_none()
                                     || matches!(session.get_auth_state(addr), Some(crate::session::AuthState::NoAuth)) {
                                     let nonce = session.create_challenge(addr);
+                                    // PATCH-2: record diagnostic "client started handshake".
+                                    session.record_connect_attempt(
+                                        addr,
+                                        crate::session::ConnectOutcome::ChallengeSent,
+                                    );
                                     drop(session);
                                     // Send AuthChallenge
                                     let mut buf = [0u8; 20];
@@ -1254,7 +1349,16 @@ impl NetworkService {
                             // else: non-PTT audio from non-TX-holder — ignore
                         }
                         Packet::Heartbeat(hb) => {
-                            self.ptt.lock().await.heartbeat_received();
+                            // Acquire PTT lock once: signal heartbeat received + read TCI/process/launch status
+                            // in the same scope so we don't lock multiple times per heartbeat.
+                            let (tci_connected, thetis_running, thetis_starting) = {
+                                let mut ptt = self.ptt.lock().await;
+                                ptt.heartbeat_received();
+                                (ptt.tci_connected(), ptt.thetis_process_running(), ptt.thetis_starting())
+                            };
+                            // PATCH-2: feed the Status-panel TCI probe.
+                            // Idempotent — only stamps last_state_change on real flips.
+                            self.tci_probe.update(tci_connected, self.server_start);
                             self.session.lock().await.update_heartbeat(
                                 addr,
                                 hb.sequence,
@@ -1263,11 +1367,35 @@ impl NetworkService {
                                 hb.jitter_ms,
                             );
 
+                            // PATCH-1: report TCI + Thetis process status in HeartbeatAck.
+                            // The two bits together let the client give a targeted hint:
+                            //   TCI_CONNECTED clear + THETIS_RUNNING set   → "Thetis runs, check TCI settings"
+                            //   TCI_CONNECTED clear + THETIS_RUNNING clear → "Thetis is not running, press Start"
+                            let mut state_flags = sdr_remote_core::protocol::ServerStateFlags::NONE;
+                            if tci_connected {
+                                state_flags = state_flags
+                                    .with(sdr_remote_core::protocol::ServerStateFlags::TCI_CONNECTED);
+                            }
+                            if thetis_running {
+                                state_flags = state_flags
+                                    .with(sdr_remote_core::protocol::ServerStateFlags::THETIS_RUNNING);
+                            }
+                            if thetis_starting {
+                                state_flags = state_flags
+                                    .with(sdr_remote_core::protocol::ServerStateFlags::THETIS_STARTING);
+                            }
+
+                            // PATCH-1 review finding (B3): advertise REPORTS_STATE_FLAGS
+                            // so the client knows the state_flags field is authoritative.
+                            // Old servers (pre-PATCH-1) leave both at NONE — client must
+                            // NOT then assume "TCI down" from an absent flag.
                             let ack = HeartbeatAck {
                                 flags: Flags::NONE,
                                 echo_sequence: hb.sequence,
                                 echo_time: hb.local_time,
-                                capabilities: Capabilities::NONE,
+                                capabilities: Capabilities::NONE
+                                    .with(Capabilities::REPORTS_STATE_FLAGS),
+                                state_flags,
                             };
                             let mut ack_buf = [0u8; HeartbeatAck::SIZE];
                             ack.serialize(&mut ack_buf);
@@ -1550,7 +1678,11 @@ impl NetworkService {
                         Packet::AudioYaesu(pkt) => {
                             if yaesu_ptt_active && !pkt.opus_data.is_empty() {
                                 if let Some(ref tx) = yaesu_tx_packet_tx {
-                                    let _ = tx.try_send(pkt.opus_data);
+                                    // Only tick on successful enqueue — dropped
+                                    // frames (channel full) didn't reach Yaesu.
+                                    if tx.try_send(pkt.opus_data).is_ok() {
+                                        self.audio_stats.yaesu_tx.tick(self.server_start);
+                                    }
                                 }
                             }
                         }
@@ -2212,6 +2344,7 @@ impl NetworkService {
                                         &pcm,
                                     );
                                     self.ptt.lock().await.write_tx_audio(&resampled);
+                                    self.audio_stats.tx.tick(self.server_start);
                                 }
                                 Err(e) => warn!("Opus decode error: {}", e),
                             }
@@ -2224,6 +2357,7 @@ impl NetworkService {
                                         &pcm,
                                     );
                                     self.ptt.lock().await.write_tx_audio(&resampled);
+                                    self.audio_stats.tx.tick(self.server_start);
                                 }
                                 Err(e) => warn!("PLC error: {}", e),
                             }

@@ -8,6 +8,7 @@ mod macros_ui;
 mod spe;
 mod rf2k;
 mod ultrabeam;
+mod status_panel;
 
 pub(crate) use utils::*;
 use rotor::*;
@@ -148,6 +149,8 @@ pub struct ServerApp {
     password: String,
     totp_enabled: bool,
     totp_secret: String,
+    // PATCH-3 mDNS friendly name (optional human-readable label)
+    friendly_name: String,
     // Autostart
     autostart: bool,
     pending_autostart: bool,
@@ -162,6 +165,21 @@ pub struct ServerApp {
     ultrabeam_window_size: Option<[f32; 2]>,
     rotor_window_size: Option<[f32; 2]>,
     show_about: bool,
+    /// PATCH-2: shared Status-panel probes — `Some` while a server is running,
+    /// `None` before start_server / after Settings teardown.
+    status_panel_state: Option<crate::audio_stats::StatusPanelShared>,
+    /// PATCH-2: bind address shown in the Status panel (e.g. "0.0.0.0:4580").
+    status_bind_addr: String,
+    /// PATCH-2: which Mode::Running view is active.
+    status_view: StatusView,
+}
+
+/// PATCH-2: top-level view in Mode::Running — Logs (existing) or
+/// Status (new compact server-state panel).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusView {
+    Status,
+    Logs,
 }
 
 impl ServerApp {
@@ -272,6 +290,7 @@ impl ServerApp {
             dxcluster_expiry_min: config.dxcluster_expiry_min,
             password: config.password.clone().unwrap_or_default(),
             totp_enabled: config.totp_enabled,
+            friendly_name: config.friendly_name.clone().unwrap_or_default(),
             totp_secret: config.totp_secret.clone().unwrap_or_else(|| sdr_remote_core::auth::generate_totp_secret()),
             main_window_pos: config.main_window_pos,
             autostart: config.autostart,
@@ -284,6 +303,9 @@ impl ServerApp {
             ultrabeam_window_size: config.ultrabeam_window_size,
             rotor_window_size: config.rotor_window_size,
             show_about: false,
+            status_panel_state: None,
+            status_bind_addr: format!("0.0.0.0:{}", sdr_remote_core::DEFAULT_PORT),
+            status_view: StatusView::Status,
         }
     }
 
@@ -350,6 +372,11 @@ impl ServerApp {
             password: if self.password.is_empty() { None } else { Some(self.password.clone()) },
             totp_secret: if self.totp_enabled { Some(self.totp_secret.clone()) } else { None },
             totp_enabled: self.totp_enabled,
+            friendly_name: if self.friendly_name.trim().is_empty() {
+                None
+            } else {
+                Some(self.friendly_name.trim().to_string())
+            },
         };
         crate::config::save(&config);
 
@@ -481,10 +508,13 @@ impl ServerApp {
         let ultrabeam_for_net = self.ultrabeam.clone();
         let rotor_for_net = self.rotor.clone();
         let yaesu_for_net = self.yaesu.clone();
+        // PATCH-2: build the Status-panel state bundle and keep a clone for the UI.
+        let status_panel_state = crate::audio_stats::StatusPanelShared::new();
+        self.status_panel_state = Some(status_panel_state.clone());
         let handle = std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
             rt.block_on(async {
-                if let Err(e) = crate::run_server_async(config, shutdown_rx, amplitec, tuner_arc, spe_arc, rf2k_arc, ultrabeam_for_net, rotor_for_net, Some(cat_rx), Some(drive_level_shared), Some(active_pa_shared), Some(vfo_freq_shared), Some(vfo_b_freq_shared), yaesu_for_net).await {
+                if let Err(e) = crate::run_server_async(config, shutdown_rx, amplitec, tuner_arc, spe_arc, rf2k_arc, ultrabeam_for_net, rotor_for_net, Some(cat_rx), Some(drive_level_shared), Some(active_pa_shared), Some(vfo_freq_shared), Some(vfo_b_freq_shared), yaesu_for_net, Some(status_panel_state)).await {
                     log::error!("Server error: {}", e);
                 }
             });
@@ -781,34 +811,66 @@ impl eframe::App for ServerApp {
                             }
                         });
                     });
+                    // PATCH-2: Status / Logs tabs.
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.status_view, StatusView::Status, "Status");
+                        ui.selectable_value(&mut self.status_view, StatusView::Logs, "Logs");
+                    });
                     ui.separator();
 
-                    let logs = self.log_buffer.lock().unwrap();
                     let available = ui.available_height() - 30.0;
-                    egui::ScrollArea::vertical()
-                        .stick_to_bottom(true)
-                        .max_height(available)
-                        .show(ui, |ui| {
-                            for (level, msg) in logs.iter() {
-                                let color = match *level {
-                                    Level::Error => egui::Color32::from_rgb(255, 80, 80),
-                                    Level::Warn => egui::Color32::from_rgb(255, 170, 40),
-                                    _ => ui.visuals().text_color(),
-                                };
-                                let prefix = match *level {
-                                    Level::Error => "[ERROR]",
-                                    Level::Warn => " [WARN]",
-                                    Level::Info => " [INFO]",
-                                    Level::Debug => "[DEBUG]",
-                                    Level::Trace => "[TRACE]",
-                                };
-                                ui.colored_label(
-                                    color,
-                                    egui::RichText::new(format!("{} {}", prefix, msg))
-                                        .monospace(),
-                                );
-                            }
-                        });
+                    match self.status_view {
+                        StatusView::Status => {
+                            egui::ScrollArea::vertical()
+                                .max_height(available)
+                                .show(ui, |ui| {
+                                    if let Some(ref shared) = self.status_panel_state {
+                                        status_panel::render_status_panel(
+                                            ui,
+                                            shared,
+                                            &self.status_bind_addr,
+                                            self.yaesu.is_some(),
+                                            self.amplitec.is_some(),
+                                            self.tuner.is_some(),
+                                            self.spe.is_some(),
+                                            self.rf2k.is_some(),
+                                        );
+                                    } else {
+                                        ui.colored_label(
+                                            Color32::from_rgb(160, 160, 160),
+                                            "Status panel not ready (server starting…)",
+                                        );
+                                    }
+                                });
+                        }
+                        StatusView::Logs => {
+                            let logs = self.log_buffer.lock().unwrap();
+                            egui::ScrollArea::vertical()
+                                .stick_to_bottom(true)
+                                .max_height(available)
+                                .show(ui, |ui| {
+                                    for (level, msg) in logs.iter() {
+                                        let color = match *level {
+                                            Level::Error => egui::Color32::from_rgb(255, 80, 80),
+                                            Level::Warn => egui::Color32::from_rgb(255, 170, 40),
+                                            _ => ui.visuals().text_color(),
+                                        };
+                                        let prefix = match *level {
+                                            Level::Error => "[ERROR]",
+                                            Level::Warn => " [WARN]",
+                                            Level::Info => " [INFO]",
+                                            Level::Debug => "[DEBUG]",
+                                            Level::Trace => "[TRACE]",
+                                        };
+                                        ui.colored_label(
+                                            color,
+                                            egui::RichText::new(format!("{} {}", prefix, msg))
+                                                .monospace(),
+                                        );
+                                    }
+                                });
+                        }
+                    }
 
                     ui.separator();
                     if ui.button("Settings").clicked() {
@@ -823,6 +885,7 @@ impl eframe::App for ServerApp {
                         self.rf2k = None;
                         self.ultrabeam = None;
                         self.rotor = None;
+                        self.status_panel_state = None;
                         self.mode = Mode::Settings;
                     }
 

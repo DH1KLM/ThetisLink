@@ -25,6 +25,89 @@ pub fn mode_color_rgba(mode: &str, alpha: u8) -> [u8; 4] {
     }
 }
 
+/// High-level connect-status that the engine reports to the UI.
+///
+/// Distinguishes intermediate states (no error) from terminal errors. The UI
+/// renders different controls per variant: `AwaitingTotp` shows the 2FA input,
+/// `Failed(err)` shows the error message via the i18n helper.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConnectStatus {
+    /// Not currently attempting connect (initial / idle / after disconnect).
+    Disconnected,
+    /// Connection attempt in progress (sent first heartbeat, awaiting auth challenge or response).
+    Connecting,
+    /// Server has sent `AUTH_TOTP_REQUIRED`; client is awaiting user TOTP code.
+    /// This is NOT an error — it is an expected step in the 2FA flow.
+    AwaitingTotp,
+    /// Fully connected and authenticated; receiving heartbeat acks and state pushes.
+    Connected,
+    /// Connect attempt failed. See `ConnectError` for the specific cause.
+    Failed(ConnectError),
+}
+
+/// Specific reason a connect attempt failed.
+///
+/// All variants are `Clone` so the enum can live inside `RadioState`
+/// (which is broadcast via `tokio::sync::watch` and must be clone-able).
+/// `std::io::Error` is NOT stored directly because it is not `Clone`;
+/// instead we keep the `io::ErrorKind` (which is `Copy`) plus a stringified
+/// `Display` of the original error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConnectError {
+    /// DNS resolution failed for the server hostname.
+    DnsResolutionFailed {
+        host: String,
+        io_kind: std::io::ErrorKind,
+        message: String,
+    },
+    /// No UDP response on the ThetisLink server port within the timeout window.
+    /// Causes: server not running, firewall blocking UDP, wrong IP/port.
+    NoUdpResponse {
+        addr: String,
+        timeout_secs: u32,
+    },
+    /// The remote endpoint replied but the bytes are not a valid ThetisLink
+    /// protocol frame (something else listens on the port, or the handshake
+    /// is mangled).
+    MalformedResponse {
+        addr: String,
+        detail: String,
+    },
+    /// Server rejected the password before the TOTP step. Distinguished from
+    /// `WrongTotp` by which phase the auth-state-machine was in when the
+    /// reject arrived.
+    WrongPassword,
+    /// Server rejected the TOTP code after a successful password step.
+    WrongTotp,
+    /// Server protocol VERSION does not match client VERSION. The UI
+    /// chooses the wording (client-too-old vs server-too-old) based on
+    /// whether `server_version > client_version` or vice versa.
+    ProtocolVersionMismatch {
+        server_version: u8,
+        client_version: u8,
+    },
+    /// Client is connected and authenticated, but the server itself cannot
+    /// reach Thetis (the TCI WebSocket to Thetis is down). Primarily driven
+    /// by an explicit server-side hint in the state-push; audio absence
+    /// alone is NOT used because it would false-positive on a quiet band.
+    TciUnreachable {
+        server_addr: String,
+        server_reported_detail: Option<String>,
+        /// Server-side process-state hint: is Thetis.exe currently running on
+        /// the server PC? `None` for old servers that don't advertise this
+        /// (THETIS_RUNNING bit gated by REPORTS_STATE_FLAGS capability).
+        /// `Some(true)` → "Thetis runs but TCI is down, check TCI settings".
+        /// `Some(false)` → "Thetis is not running, press Start on Thetis tab".
+        thetis_process_running: Option<bool>,
+    },
+    /// Any other failure (unhandled I/O error, etc.). Carries a Display
+    /// message for the log; UI shows a generic "connection failed" plus
+    /// the detail in small text.
+    Other {
+        message: String,
+    },
+}
+
 /// Read-only radio state, broadcast from engine to UI via tokio::sync::watch.
 #[derive(Clone, Debug)]
 pub struct RadioState {
@@ -32,6 +115,11 @@ pub struct RadioState {
     pub connected: bool,
     pub ptt_denied: bool,
     pub audio_error: bool,
+    /// High-level connect-status with optional error detail. Replaces the
+    /// older `auth_rejected` / `totp_required` booleans (which are kept
+    /// for backwards-compatibility during migration but should not be
+    /// used in new UI code).
+    pub connect_status: ConnectStatus,
 
     // Stats
     pub rtt_ms: u16,
@@ -285,6 +373,7 @@ impl Default for RadioState {
             connected: false,
             ptt_denied: false,
             audio_error: false,
+            connect_status: ConnectStatus::Disconnected,
             rtt_ms: 0,
             jitter_ms: 0.0,
             buffer_depth: 0,

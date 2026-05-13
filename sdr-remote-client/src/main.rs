@@ -4,6 +4,7 @@
 
 mod audio;
 mod catsync;
+mod mdns;
 mod midi;
 mod ui;
 mod websdr;

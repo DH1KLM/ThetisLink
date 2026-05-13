@@ -8,6 +8,7 @@ mod spectrum;
 mod config;
 mod devices;
 mod screens;
+mod wizard;
 pub(crate) mod controls;
 pub(crate) mod yaesu_memory;
 pub(crate) mod yaesu_menu;
@@ -135,6 +136,9 @@ pub struct SdrRemoteApp {
     /// TL2-1 ctun-auto-recenter setup-vink "Allow zoom below 2x (with smear during tune)".
     /// Default false → zoom-min 2x. True → zoom-min 1x toegestaan.
     allow_zoom_below_2x: bool,
+    /// PATCH-1: UI language for connect-status / connect-error display.
+    /// "en" or "nl" from config; defaults to "en".
+    ui_language: String,
     reboot_confirm: bool,
     diversity_enabled: bool,
     diversity_state_read: bool,
@@ -291,6 +295,20 @@ pub struct SdrRemoteApp {
     show_about: bool,
     // Devices screen
     active_tab: Tab,
+    /// PATCH-1 smoke-test fix (2026-05-13): track the previous frame's
+    /// connect_status so we can auto-switch to the Server tab on transitions
+    /// that demand user attention (AwaitingTotp, Failed). Without this the
+    /// user might be on the Radio tab and never see the 2FA prompt or
+    /// error message until they manually switch tabs.
+    last_connect_status: sdr_remote_logic::state::ConnectStatus,
+    /// PATCH-3 mDNS discovery: background browse for servers on the LAN.
+    /// `None` if the mDNS daemon failed to start (silent fallback to
+    /// manual IP entry).
+    mdns_browse: Option<crate::mdns::BrowseHandle>,
+    /// PATCH-4 first-run wizard. `Some` while the wizard owns the
+    /// viewport; transitions back to `None` on Skip / Finished / when
+    /// the owner re-launches the wizard manually.
+    wizard_state: Option<wizard::WizardState>,
     device_tab: u8, // 0=Amplitec, 1=Tuner, 2=SPE, 3=RF2K, 4=UltraBeam
     amplitec_connected: bool,
     amplitec_switch_a: u8,
@@ -669,7 +687,7 @@ impl SdrRemoteApp {
             state_rx,
             cmd_tx,
             ui_event_sink: std::sync::Arc::new(controls::TracingSink),
-            server_input: config.server,
+            server_input: config.server.clone(),
             password_input: config.password.clone(),
             totp_input: String::new(),
             mouse_ptt: false,
@@ -684,6 +702,7 @@ impl SdrRemoteApp {
             last_recorded_path: None,
             midi_ptt_toggle_mode: config.midi_ptt_toggle,
             allow_zoom_below_2x: config.allow_zoom_below_2x,
+            ui_language: config.language.clone(),
             reboot_confirm: false,
             diversity_enabled: false,
             diversity_state_read: false,
@@ -823,6 +842,23 @@ impl SdrRemoteApp {
             show_log: false,
             show_about: false,
             active_tab: Tab::Radio,
+            last_connect_status: sdr_remote_logic::state::ConnectStatus::Disconnected,
+            // PATCH-3: kick off the mDNS browse on app start. Daemon-init failure
+            // is caught inside `BrowseHandle::start` and surfaces as an empty
+            // dropdown — manual IP entry stays available.
+            mdns_browse: Some(crate::mdns::BrowseHandle::start()),
+            // PATCH-4: arm the first-run wizard if the user has never had a
+            // successful connect (counter==0). Seeds with whatever
+            // server/password the config already has — wizard still walks
+            // through the steps but the fields are pre-populated.
+            wizard_state: if crate::ui::config::is_first_run() {
+                Some(wizard::WizardState::new(
+                    config.server.clone(),
+                    config.password.clone(),
+                ))
+            } else {
+                None
+            },
             device_tab: config.device_tab,
             amplitec_connected: false,
             amplitec_switch_a: 0,
@@ -3163,6 +3199,58 @@ impl eframe::App for SdrRemoteApp {
         self.sync_state();
         self.process_midi_events();
 
+        // PATCH-4: first-run / re-launched wizard owns the viewport
+        // while present. Render it edge-to-edge and short-circuit the
+        // rest of update() — none of the regular UI panes are valid
+        // until the wizard exits.
+        if self.wizard_state.is_some() {
+            let lang = if self.ui_language == "nl" {
+                sdr_remote_logic::i18n::Lang::Nl
+            } else {
+                sdr_remote_logic::i18n::Lang::En
+            };
+            let outcome = egui::CentralPanel::default()
+                .show(ctx, |ui| {
+                    let st = self.wizard_state.as_mut().expect("checked above");
+                    wizard::render_wizard(
+                        ui,
+                        st,
+                        &self.cmd_tx,
+                        &self.state_rx,
+                        self.mdns_browse.as_ref(),
+                        lang,
+                    )
+                })
+                .inner;
+            match outcome {
+                wizard::WizardOutcome::Continue => {}
+                wizard::WizardOutcome::SkipToManual => {
+                    // No config write — wizard re-arms on next launch.
+                    self.wizard_state = None;
+                }
+                wizard::WizardOutcome::Finished => {
+                    // Connect succeeded; persist server+password and bump
+                    // successful_connects so we don't re-arm next launch.
+                    if let Some(ref st) = self.wizard_state {
+                        self.server_input = st.server_input.clone();
+                        self.password_input = st.password_input.clone();
+                    }
+                    self.save_full_config();
+                    crate::ui::config::mark_successful_connect();
+                    self.wizard_state = None;
+                }
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+            return;
+        }
+
+        // PATCH-4: bump the successful-connect counter the first time the
+        // user reaches Connected (incl. when they skipped the wizard).
+        // Idempotent — mark_successful_connect() no-ops past 0.
+        if self.connected {
+            crate::ui::config::mark_successful_connect();
+        }
+
         // Sync frequency to embedded WebSDR (debounced)
         self.catsync.sync_freq(self.frequency_hz, self.mode);
 
@@ -3483,7 +3571,23 @@ impl eframe::App for SdrRemoteApp {
                     }
                     ui.colored_label(Color32::GREEN, "Connected");
                 } else {
-                    let can_connect = !self.password_input.is_empty();
+                    // PATCH-1 smoke-test fix (2026-05-12): when we are mid-auth in
+                    // AwaitingTotp, Connect must not be clickable — the user should
+                    // use the Verify-button on the 2FA input. A second Connect-press
+                    // would otherwise pull the engine back to "Connecting…" while
+                    // the server still has an active PendingTotp session, which
+                    // would never recover.
+                    let in_awaiting_totp = matches!(
+                        self.state_rx.borrow().connect_status,
+                        sdr_remote_logic::state::ConnectStatus::AwaitingTotp
+                    );
+                    let in_connecting = matches!(
+                        self.state_rx.borrow().connect_status,
+                        sdr_remote_logic::state::ConnectStatus::Connecting
+                    );
+                    let can_connect = !self.password_input.is_empty()
+                        && !in_awaiting_totp
+                        && !in_connecting;
                     if ui.add_enabled(can_connect, egui::Button::new("Connect")).clicked() {
                         // Reset span to 0 so first spectrum packet triggers zoom calculation
                         self.full_spectrum_span_hz = 0;
@@ -3504,6 +3608,54 @@ impl eframe::App for SdrRemoteApp {
                 }
                 if self.audio_error {
                     ui.colored_label(Color32::from_rgb(255, 165, 0), "Audio error");
+                }
+                // PATCH-1 smoke-test fix (2026-05-13): auto-switch to the
+                // Server tab when connect_status transitions into a state
+                // that demands user attention (AwaitingTotp, Failed). Without
+                // this the user can be on the Radio tab and never see the
+                // 2FA prompt or error message until they manually navigate.
+                {
+                    use sdr_remote_logic::state::ConnectStatus;
+                    let current = self.state_rx.borrow().connect_status.clone();
+                    let needs_attention = matches!(
+                        current,
+                        ConnectStatus::AwaitingTotp | ConnectStatus::Failed(_)
+                    );
+                    let was_attention = matches!(
+                        self.last_connect_status,
+                        ConnectStatus::AwaitingTotp | ConnectStatus::Failed(_)
+                    );
+                    if needs_attention && !was_attention {
+                        self.active_tab = Tab::Server;
+                    }
+                    self.last_connect_status = current;
+                }
+                // PATCH-1 smoke-test fix (2026-05-12 #2): show connect-status
+                // error globally in the top bar so users on any tab see it,
+                // not just on the Server tab. Avoids the "press Connect on
+                // Radio tab → silent failure" UX gap.
+                {
+                    use sdr_remote_logic::i18n::{connect_status_text, Lang};
+                    use sdr_remote_logic::state::ConnectStatus;
+                    let connect_status = self.state_rx.borrow().connect_status.clone();
+                    let lang = if self.ui_language == "nl" { Lang::Nl } else { Lang::En };
+                    // PATCH-1 smoke-test fix (2026-05-13): top-bar headline 16pt bold
+                    // so it stands out — owner feedback: was smaller than other UI.
+                    match &connect_status {
+                        ConnectStatus::Failed(_) => {
+                            let (headline, _) = connect_status_text(&connect_status, lang, sdr_remote_logic::i18n::Platform::Desktop);
+                            ui.label(egui::RichText::new(headline).size(16.0).strong().color(Color32::from_rgb(220, 40, 40)));
+                        }
+                        ConnectStatus::AwaitingTotp => {
+                            let (headline, _) = connect_status_text(&connect_status, lang, sdr_remote_logic::i18n::Platform::Desktop);
+                            ui.label(egui::RichText::new(headline).size(16.0).strong().color(Color32::from_rgb(255, 165, 0)));
+                        }
+                        ConnectStatus::Connecting => {
+                            let (headline, _) = connect_status_text(&connect_status, lang, sdr_remote_logic::i18n::Platform::Desktop);
+                            ui.label(egui::RichText::new(headline).size(16.0).strong().color(Color32::from_rgb(180, 180, 60)));
+                        }
+                        _ => {}
+                    }
                 }
             });
         });

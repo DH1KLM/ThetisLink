@@ -85,6 +85,10 @@ pub struct ServerConfig {
     pub totp_secret: Option<String>,
     /// TOTP 2FA enabled
     pub totp_enabled: bool,
+    /// PATCH-3: human-readable name advertised via mDNS so clients can
+    /// distinguish multiple ThetisLink servers on the same LAN
+    /// (e.g. "Shack PC"). `None` falls back to the OS hostname.
+    pub friendly_name: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -140,6 +144,7 @@ impl Default for ServerConfig {
             password: None,
             totp_secret: None,
             totp_enabled: false,
+            friendly_name: None,
         }
     }
 }
@@ -474,6 +479,12 @@ pub fn load() -> ServerConfig {
                     "totp_enabled" => {
                         config.totp_enabled = value.trim() == "true";
                     }
+                    "friendly_name" => {
+                        let v = value.trim();
+                        if !v.is_empty() {
+                            config.friendly_name = Some(v.to_string());
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -572,6 +583,9 @@ pub fn save(config: &ServerConfig) {
     contents.push_str(&format!("totp_enabled={}\n", config.totp_enabled));
     if let Some(ref secret) = config.totp_secret {
         contents.push_str(&format!("totp_secret={}\n", sdr_remote_core::auth::obfuscate_password(secret)));
+    }
+    if let Some(ref name) = config.friendly_name {
+        contents.push_str(&format!("friendly_name={}\n", name));
     }
     let _ = fs::write(&path, contents);
 }

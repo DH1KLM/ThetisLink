@@ -147,6 +147,10 @@ dictionary BridgeRadioState {
     sequence<BridgeDxSpot> dx_spots;
     boolean auth_rejected;
     boolean totp_required;
+    string connect_status_headline;
+    string connect_status_action;
+    boolean connect_status_is_error;
+    boolean connect_status_is_awaiting_totp;
 };
 
 interface SdrBridge {
@@ -154,6 +158,7 @@ interface SdrBridge {
     void connect(string addr, string password);
     void send_totp_code(string code);
     void disconnect();
+    void set_language(string lang);
     void set_ptt(boolean active);
     void set_rx_volume(f32 volume);
     void set_local_volume(f32 volume);

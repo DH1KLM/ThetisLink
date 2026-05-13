@@ -90,6 +90,43 @@ fun MainScreen(viewModel: SdrViewModel = viewModel()) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("thetislink", Context.MODE_PRIVATE) }
 
+    // PATCH-4: first-run wizard owns the viewport until the user finishes
+    // it OR explicitly skips. `wizardActive` is also flipped on by a small
+    // "Re-run setup wizard" entry in the settings dialog so an owner can
+    // restart it manually after a fresh app install OR a misconfigure.
+    var wizardActive by rememberSaveable {
+        mutableStateOf(WizardPrefs.isFirstRun(context))
+    }
+    // Bump the counter on every transition into Connected — covers both
+    // the wizard path and the skipped-wizard / manual path.
+    LaunchedEffect(state.connected) {
+        if (state.connected) WizardPrefs.markSuccessful(context)
+    }
+    if (wizardActive) {
+        ConnectWizard(
+            initialServer = prefs.getString("server_addr", "") ?: "",
+            initialPassword = prefs.getString("password", "") ?: "",
+            connected = state.connected,
+            awaitingTotp = state.connectStatusIsAwaitingTotp,
+            connectStatusIsError = state.connectStatusIsError,
+            connectStatusHeadline = state.connectStatusHeadline,
+            connectStatusAction = state.connectStatusAction,
+            onConnect = { server, pw ->
+                prefs.edit().putString("server_addr", server).putString("password", pw).apply()
+                viewModel.connect(server, pw)
+            },
+            onSendTotp = { code -> viewModel.sendTotpCode(code) },
+            onDisconnect = { viewModel.disconnect() },
+            onSkip = { wizardActive = false },
+            onFinished = { server, pw ->
+                prefs.edit().putString("server_addr", server).putString("password", pw).apply()
+                WizardPrefs.markSuccessful(context)
+                wizardActive = false
+            },
+        )
+        return
+    }
+
     // Volume-up button as PTT (BT remote)
     val activity = context as? com.sdrremote.MainActivity
     val volumePttEnabled = prefs.getBoolean("volume_ptt", false)
@@ -703,6 +740,11 @@ fun MainScreen(viewModel: SdrViewModel = viewModel()) {
                         paForwardW = paForwardW,
                         paMaxW = paMaxW,
                         paName = paName,
+                        // PATCH-1: pre-rendered connect-status text from Rust i18n.rs
+                        connectStatusHeadline = state.connectStatusHeadline,
+                        connectStatusAction = state.connectStatusAction,
+                        connectStatusIsError = state.connectStatusIsError,
+                        connectStatusIsAwaitingTotp = state.connectStatusIsAwaitingTotp,
                         onConnect = { addr, password ->
                             spectrumZoomState.floatValue = 20f
                             spectrumPanState.floatValue = 0f
@@ -714,7 +756,6 @@ fun MainScreen(viewModel: SdrViewModel = viewModel()) {
                             viewModel.setAgcEnabled(agcEnabled)
                         },
                         onDisconnect = { viewModel.disconnect() },
-                        totpRequired = state.totpRequired,
                         onSendTotp = { code -> viewModel.sendTotpCode(code) },
                     )
                 }
@@ -992,6 +1033,14 @@ fun MainScreen(viewModel: SdrViewModel = viewModel()) {
                         Spacer(Modifier.width(8.dp))
                         TextButton(onClick = { showAbout = true }) {
                             Text("About")
+                        }
+                        Spacer(Modifier.width(8.dp))
+                        // PATCH-4 follow-up: parity with the desktop
+                        // "Re-run setup wizard" entry on the Server tab.
+                        // Owner-escape-hatch to relaunch the wizard
+                        // manually without wiping app data.
+                        TextButton(onClick = { wizardActive = true }) {
+                            Text("Wizard")
                         }
                     }
                 }

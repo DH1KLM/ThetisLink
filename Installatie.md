@@ -1,10 +1,10 @@
-﻿# ThetisLink v2.0.0 - Installatiehandleiding
+﻿# ThetisLink v2.0.1 - Installatiehandleiding
 
 ThetisLink is een remote bediening voor de ANAN 7000DLE SDR met Thetis. Audio, spectrum, PTT en volledige radiobediening over het netwerk via TCI WebSocket.
 
 **Compatibiliteit:** ThetisLink praat alleen met **Thetis** (via TCI WebSocket) en niet rechtstreeks met de SDR-hardware. Werkt daarom met elk SDR-apparaat dat door **Thetis v2.10.3.15** (officiële release door ramdor) ondersteund wordt — zowel HPSDR Protocol 1 (Hermes, Angelia, Orion) als HPSDR Protocol 2 (ANAN-7000DLE, ANAN-8000DLE, ANAN-G2, Hermes-Lite 2, etc.). Optioneel: Yaesu FT-991A als tweede radio (via COM-poort).
 
-**PA3GHM Thetis fork (optioneel, aanbevolen voor TL2-extensies):** ThetisLink v2.0.0 werkt prima met stock Thetis v2.10.3.15 via TCI alleen — er is geen aparte CAT TCP verbinding nodig. De PA3GHM fork is een **optionele** vervanger die ThetisLink-specifieke TL2 `_ex` extensies toevoegt bovenop stock Thetis: uitgebreide IQ-bandbreedte tot 1536 kHz (vs de 384 kHz stock cap), `tci_caps_ex` capability-broadcast, server-side CTUN auto-recenter (`auto_recenter_ex`), filter-preset en per-RX DDC-rate push-notificaties, plus diversity auto-null met live cirkel-broadcast. Alle uitbreidingen zitten achter de **"ThetisLink extensions"** checkbox in Thetis en zijn standaard uit; met de vink uit blijft het TCI-extensiegedrag van stock v2.10.3.15 behouden (let op: de fork bevat wel een eigen build-tag, release-notes en About-metadata). Zie de Gebruikershandleiding (`User-Manual.md`) voor details.
+**PA3GHM Thetis fork (optioneel, aanbevolen voor TL2-extensies):** ThetisLink v2.0.1 werkt prima met stock Thetis v2.10.3.15 via TCI alleen — er is geen aparte CAT TCP verbinding nodig. De PA3GHM fork is een **optionele** vervanger die ThetisLink-specifieke TL2 `_ex` extensies toevoegt bovenop stock Thetis: uitgebreide IQ-bandbreedte tot 1536 kHz (vs de 384 kHz stock cap), `tci_caps_ex` capability-broadcast, server-side CTUN auto-recenter (`auto_recenter_ex`), filter-preset en per-RX DDC-rate push-notificaties, plus diversity auto-null met live cirkel-broadcast. Alle uitbreidingen zitten achter de **"ThetisLink extensions"** checkbox in Thetis en zijn standaard uit; met de vink uit blijft het TCI-extensiegedrag van stock v2.10.3.15 behouden (let op: de fork bevat wel een eigen build-tag, release-notes en About-metadata). Zie de Gebruikershandleiding (`User-Manual.md`) voor details.
 
 **Disclaimer:** Deze software bestuurt radiozenders. Gebruik op eigen risico. De auteur is niet verantwoordelijk voor schade aan apparatuur, storing of overtredingen van regelgeving als gevolg van het gebruik van deze software. Controleer alle veiligheidsfuncties (PTT timeout, vermogensgrenzen) voor het zenden.
 
@@ -16,7 +16,7 @@ ThetisLink is een remote bediening voor de ANAN 7000DLE SDR met Thetis. Audio, s
 |---------|-------------|
 | ThetisLink-Server.exe | ThetisLink Server - draait op de PC naast Thetis |
 | ThetisLink-Client.exe | ThetisLink Desktop Client - Windows |
-| ThetisLink-2.0.0.apk | ThetisLink Android Client - telefoon/tablet |
+| ThetisLink-2.0.1.apk | ThetisLink Android Client - telefoon/tablet |
 | thetislink-server.conf | Voorbeeldconfiguratie ThetisLink Server |
 | thetislink-client.conf | Voorbeeldconfiguratie ThetisLink Client |
 | Installatie.pdf | Deze handleiding (Nederlands) |
@@ -99,7 +99,7 @@ Setup -> Serial/Network/Midi CAT -> Network -> groep **TCI Server**:
 Bij de PA3GHM Thetis fork, op dezelfde tab:
 1. Vink **ThetisLink extensions** aan
 
-> ThetisLink v2.0.0 gebruikt uitsluitend TCI voor radio-besturing. De TCP/IP CAT-server in Thetis hoeft niet aan te staan voor ThetisLink — die is alleen nodig als je een apart loggings-programma of derde-partij CAT-client direct aan Thetis wilt koppelen.
+> ThetisLink v2.0.1 gebruikt uitsluitend TCI voor radio-besturing. De TCP/IP CAT-server in Thetis hoeft niet aan te staan voor ThetisLink — die is alleen nodig als je een apart loggings-programma of derde-partij CAT-client direct aan Thetis wilt koppelen.
 
 ---
 
@@ -190,18 +190,22 @@ Alle instellingen worden automatisch opgeslagen in `thetislink-server.conf` naas
 
 Kopieer `ThetisLink-Client.exe` naar een map op de Desktop Client-PC. Geen installatie nodig.
 
-### 3.2 Eerste keer starten
+### 3.2 Eerste keer starten — begeleide setup-wizard
 
-1. Start `ThetisLink-Client.exe`
-2. Selecteer je **microfoon** (Input) en **speaker/headset** (Output) bovenaan
-3. Vul het **ThetisLink Server-adres** in: `<server-IP>:4580` (bijv. `192.168.1.79:4580`)
-4. Voer het **wachtwoord** in (zie stap 2.6)
-5. Klik **Connect**
-6. Voer de **2FA code** in als TOTP is ingeschakeld op de ThetisLink Server (6 cijfers uit je authenticator app)
+Bij de allereerste start toont ThetisLink een 4-stappen **setup-wizard**. Volgende starts skippen de wizard automatisch en komen direct in de normale UI.
 
-Als ThetisLink Server en ThetisLink Desktop Client op dezelfde PC draaien: gebruik `127.0.0.1:4580`.
+1. **Vind de server.** Servers op dezelfde WiFi/LAN verschijnen automatisch in een "Found"-dropdown (mDNS / Bonjour). Kies de jouwe of typ het adres handmatig als `<server-IP>:4580` (bijv. `192.168.1.79:4580`).
+2. **Vul het wachtwoord in** (zie stap 2.6). Een "Show"-vinkje toont het wachtwoord in klare tekst.
+3. **2FA-code** — alleen wanneer de server het vraagt. Vul de 6-cijferige code uit je authenticator-app in.
+4. **Verbonden.** Klik *Done* om naar de normale UI te gaan.
 
-> Bij de eerste verbinding kan het aan beide zijden even duren voordat alles is opgestart - de ThetisLink Server moet de TCI-verbinding met Thetis opbouwen en alle externe apparaten initialiseren. Dit is eenmalig; bij volgende verbindingen gaat het direct.
+Bij een fout toont ThetisLink een specifieke melding (bv. "Wrong password", "Server name not found", "Thetis is not running on the server PC") en stuurt je terug naar de juiste stap. Rechtsboven kun je **Skip wizard** klikken om direct naar het handmatige connect-formulier te gaan.
+
+Als ThetisLink Server en Desktop Client op dezelfde PC draaien: gebruik `127.0.0.1:4580`.
+
+> Bij de eerste verbinding kan het aan beide zijden even duren voordat alles is opgestart — de Server moet de TCI-verbinding met Thetis opbouwen en alle externe apparaten initialiseren. Dit is eenmalig; bij volgende verbindingen gaat het direct.
+
+De wizard kun je altijd opnieuw starten via de **Wizard**-knop op de Server-tab.
 
 ### 3.3 Configuratie
 
@@ -211,6 +215,14 @@ Instellingen worden automatisch opgeslagen in `thetislink-client.conf` naast de 
 - Band memories
 - TX profielen
 - MIDI mappings
+- `language=en` of `language=nl` — UI-tekst voor connect-status en connect-fouten (default: en)
+- `successful_connects=N` — first-run wizard teller. De wizard verschijnt zodra dit `0` is of ontbreekt. Verwijder deze regel (of zet hem op `0`) om de wizard bij de volgende start te forceren.
+
+### 3.4 Server-tab — serverstatus in één oogopslag
+
+De Server-tab in de client toont live verbindingsstatus, audio-niveau-balken per kanaal, en een **Wizard**-knop (klein, rechtsboven in de Server-adres rij) om de setup-wizard opnieuw te starten zonder config te wissen.
+
+Als de server zelf op de Thetis-PC draait, heeft zijn venster twee tabs: **Status** (compact server-state paneel: bind-adres, Thetis TCI-link, actieve clients met RTT/loss/jitter, audio-routing chips, recente connect-pogingen, geconfigureerde apparaten) en **Logs**. Het Status-paneel is de snelste manier om support-vragen te beantwoorden zoals *"luistert de server?"* of *"is mijn connect-poging aangekomen?"* — een screenshot ervan dekt meestal 80% van de diagnose.
 
 ---
 
@@ -219,24 +231,23 @@ Instellingen worden automatisch opgeslagen in `thetislink-client.conf` naast de 
 ### 4.1 APK installeren
 
 **Via bestandsbeheer:**
-1. Kopieer `ThetisLink-2.0.0.apk` naar je telefoon (USB, e-mail, of cloud)
+1. Kopieer `ThetisLink-2.0.1.apk` naar je telefoon (USB, e-mail, of cloud)
 2. Open het APK-bestand op de telefoon
 3. Sta "Installeren van onbekende bronnen" toe als gevraagd
 4. Installeer
 
 **Via ADB** (met USB-debugging ingeschakeld):
 ```
-adb install ThetisLink-2.0.0.apk
+adb install ThetisLink-2.0.1.apk
 ```
 
-### 4.2 Verbinden
+### 4.2 Verbinden — begeleide setup-wizard
 
-1. Open ThetisLink
-2. Vul het **ThetisLink Server-adres** in: `<server-IP>:4580`
-3. Stel het **wachtwoord** in via Settings (tandwiel icoon)
-4. Tik **Connect**
-5. Voer de **2FA code** in als TOTP is ingeschakeld (6 cijfers uit je authenticator app)
-6. Sta microfoontoegang toe als gevraagd
+De Android-app toont bij de eerste start dezelfde 4-stappen **setup-wizard** (Vind server → Wachtwoord → 2FA → Verbonden). Op hetzelfde WiFi-netwerk wordt de Server automatisch gevonden via mDNS (Bonjour) en verschijnt in een *Choose discovered server*-dropdown — geen IP-typewerk nodig. De system back-button gaat naar de vorige wizard-stap; op stap 1 vraagt hij of je naar het handmatige formulier wilt overslaan.
+
+Volgende starts gaan direct naar de normale UI. Om de wizard later opnieuw te starten: tik op de **Wizard**-knop op het Radio-scherm (naast *Settings / MIDI / About*).
+
+Sta microfoontoegang toe als daarom wordt gevraagd bij de eerste start.
 
 ### 4.3 Bluetooth headset
 
@@ -262,6 +273,30 @@ Na een succesvolle verbinding is ThetisLink klaar voor gebruik. Zie de **Gebruik
 ---
 
 ## Netwerk
+
+### Discovery binnen lokaal netwerk (mDNS)
+
+Clients op dezelfde WiFi/LAN vinden de server automatisch via mDNS
+(Bonjour / Avahi) — geen IP-adres intypen nodig. De "Found:"-dropdown
+in de desktop-client en de "Choose discovered server"-lijst in de
+Android-app vullen zichzelf binnen ~1 seconde na het openen van het
+connect-scherm.
+
+Draai je **meerdere ThetisLink-servers** op hetzelfde netwerk? Zet dan
+een leesbare naam in `thetislink-server.conf` zodat de dropdown ze van
+elkaar onderscheidt:
+
+```
+friendly_name=Shack PC
+```
+
+Zonder `friendly_name` wordt de OS-hostname als label gebruikt.
+Handmatige IP-invoer blijft beschikbaar voor cross-subnet, VPN en
+internet-scenario's waar mDNS niet doorheen komt.
+
+De Android-app heeft de permissie `CHANGE_WIFI_MULTICAST_STATE` nodig
+voor mDNS-scanning. Dit is een *normal* Android-permissie die
+automatisch bij installatie wordt verleend — geen runtime-prompt.
 
 ### Bandbreedte
 

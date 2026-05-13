@@ -2,7 +2,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::time::Instant;
 
@@ -15,6 +15,71 @@ const SESSION_TIMEOUT_SECS: u64 = 15;
 const MAX_AUTH_FAILURES: u32 = 5;
 /// Block duration after too many failures
 const AUTH_BLOCK_SECS: u64 = 60;
+
+/// PATCH-2: ringbuffer-capacity for recent connect attempts shown in the
+/// server Status panel. 10 entries balances "recent context for support"
+/// against memory under brute-force traffic — see decision-log §6.
+pub const CONNECT_HISTORY_CAPACITY: usize = 10;
+
+/// Outcome of a single connect attempt — shown in the Status panel so the
+/// owner can answer "what does the server see?" in one screenshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectOutcome {
+    /// HMAC accepted, no 2FA required → session active.
+    Accepted,
+    /// HMAC accepted, 2FA challenge sent — awaiting TOTP code.
+    TotpRequired,
+    /// HMAC mismatched (wrong password or replay-old nonce).
+    WrongPassword,
+    /// HMAC ok, 2FA code rejected.
+    WrongTotp,
+    /// New client started an auth handshake (challenge sent).
+    /// Useful diagnostic ("is anything reaching the server?")
+    /// even when no AuthResponse follows.
+    ChallengeSent,
+}
+
+impl ConnectOutcome {
+    /// Short display label for the Status panel (English; UI is dev-tooling
+    /// for the owner, no i18n needed here).
+    pub fn label(self) -> &'static str {
+        match self {
+            ConnectOutcome::Accepted => "Accepted",
+            ConnectOutcome::TotpRequired => "2FA required",
+            ConnectOutcome::WrongPassword => "Wrong password",
+            ConnectOutcome::WrongTotp => "Wrong 2FA",
+            ConnectOutcome::ChallengeSent => "Challenge sent",
+        }
+    }
+
+    pub fn is_failure(self) -> bool {
+        matches!(self, ConnectOutcome::WrongPassword | ConnectOutcome::WrongTotp)
+    }
+}
+
+/// A single connect attempt record kept in the SessionManager ringbuffer.
+/// Carries both `Instant` (cheap relative-time calc) and a wall-clock
+/// timestamp (for "17:42:11" UI display) — owner-feedback / review request.
+#[derive(Debug, Clone)]
+pub struct ConnectAttempt {
+    pub instant: Instant,
+    pub wall_clock: chrono::DateTime<chrono::Local>,
+    pub remote_addr: SocketAddr,
+    pub outcome: ConnectOutcome,
+}
+
+/// Snapshot of an active client for Status-panel display.
+/// Owned-by-value so the UI can release the SessionManager lock immediately.
+#[derive(Debug, Clone)]
+pub struct ClientSnapshot {
+    pub addr: SocketAddr,
+    pub last_seen: Instant,
+    pub connected_since: Instant,
+    pub authenticated: bool,
+    pub rtt_ms: u16,
+    pub loss_percent: u8,
+    pub jitter_ms: u8,
+}
 
 /// Authentication state for a client
 #[derive(Debug)]
@@ -62,6 +127,10 @@ impl AuthFailureTracker {
 pub struct ClientSession {
     pub addr: SocketAddr,
     pub last_seen: Instant,
+    /// PATCH-2: timestamp when this `ClientSession` was first inserted
+    /// (matches the first packet observed from this address). Drives the
+    /// "connected for Xm Ys" column in the Status panel.
+    pub connected_since: Instant,
     pub auth_state: AuthState,
     pub last_heartbeat_seq: u32,
     pub rtt_ms: u16,
@@ -108,6 +177,9 @@ pub struct SessionManager {
     password: Option<String>,
     /// TOTP secret (None = 2FA disabled)
     totp_secret: Option<String>,
+    /// PATCH-2: ringbuffer of recent connect attempts for the Status panel.
+    /// Bounded at CONNECT_HISTORY_CAPACITY entries; oldest evicted on overflow.
+    connect_history: VecDeque<ConnectAttempt>,
 }
 
 impl SessionManager {
@@ -126,7 +198,48 @@ impl SessionManager {
             auth_failures: AuthFailureTracker::new(),
             password,
             totp_secret,
+            connect_history: VecDeque::with_capacity(CONNECT_HISTORY_CAPACITY),
         }
+    }
+
+    /// PATCH-2: append a connect-attempt to the bounded ringbuffer.
+    /// Oldest entry is evicted at CONNECT_HISTORY_CAPACITY so the buffer
+    /// stays bounded even under sustained brute-force traffic.
+    pub fn record_connect_attempt(&mut self, addr: SocketAddr, outcome: ConnectOutcome) {
+        if self.connect_history.len() == CONNECT_HISTORY_CAPACITY {
+            self.connect_history.pop_front();
+        }
+        self.connect_history.push_back(ConnectAttempt {
+            instant: Instant::now(),
+            wall_clock: chrono::Local::now(),
+            remote_addr: addr,
+            outcome,
+        });
+    }
+
+    /// PATCH-2: snapshot-clone of the connect-attempt ringbuffer for the
+    /// Status panel. UI doesn't hold the lock during render — it takes
+    /// the clone and releases the lock immediately.
+    pub fn recent_connect_attempts(&self) -> Vec<ConnectAttempt> {
+        self.connect_history.iter().cloned().collect()
+    }
+
+    /// PATCH-2: snapshot-clone of active client list for the Status panel.
+    /// Each entry is a `(addr, connected_since, last_seen, rtt_ms, loss_pct, jitter_ms)`
+    /// tuple — UI-friendly, no SessionManager-internal refs leaked.
+    pub fn active_clients_snapshot(&self) -> Vec<ClientSnapshot> {
+        self.clients
+            .values()
+            .map(|c| ClientSnapshot {
+                addr: c.addr,
+                last_seen: c.last_seen,
+                connected_since: c.connected_since,
+                authenticated: matches!(c.auth_state, AuthState::Authenticated),
+                rtt_ms: c.rtt_ms,
+                loss_percent: c.loss_percent,
+                jitter_ms: c.jitter_ms,
+            })
+            .collect()
     }
 
     /// Check if TOTP 2FA is enabled
@@ -159,10 +272,12 @@ impl SessionManager {
     /// Create a pending challenge for a new client. Returns the nonce.
     pub fn create_challenge(&mut self, addr: SocketAddr) -> [u8; 16] {
         let nonce = sdr_remote_core::auth::generate_nonce();
+        let now = Instant::now();
         self.clients.insert(addr, ClientSession {
             addr,
-            last_seen: Instant::now(),
-            auth_state: AuthState::PendingChallenge { nonce, sent_at: Instant::now() },
+            last_seen: now,
+            connected_since: now,
+            auth_state: AuthState::PendingChallenge { nonce, sent_at: now },
             last_heartbeat_seq: 0, rtt_ms: 0, loss_percent: 0, jitter_ms: 0,
             spectrum_enabled: false,
             spectrum_fps: sdr_remote_core::DEFAULT_SPECTRUM_FPS,
@@ -245,9 +360,11 @@ impl SessionManager {
                 AuthState::NoAuth
             };
             info!("New client connected: {}", addr);
+            let now = Instant::now();
             self.clients.insert(addr, ClientSession {
                 addr,
-                last_seen: Instant::now(),
+                last_seen: now,
+                connected_since: now,
                 auth_state,
                 last_heartbeat_seq: 0,
                 rtt_ms: 0,
@@ -416,6 +533,13 @@ impl SessionManager {
 
     pub fn client_audio_mode(&self, addr: SocketAddr) -> u8 {
         self.clients.get(&addr).map(|s| s.audio_mode).unwrap_or(255)
+    }
+
+    /// Per-client RX2 enable flag — defaults to `false` for unknown
+    /// addrs so a half-set-up client never gets RX2 audio it didn't
+    /// ask for.
+    pub fn client_rx2_enabled(&self, addr: SocketAddr) -> bool {
+        self.clients.get(&addr).map(|s| s.rx2_enabled).unwrap_or(false)
     }
 
     pub fn set_audio_mode(&mut self, addr: SocketAddr, mode: u8) {
@@ -610,9 +734,11 @@ mod tests {
     use super::*;
 
     fn mk_session(addr_str: &str, allow: bool, rx1_zoom: f32, rx2_zoom: f32, rx1_en: bool, rx2_en: bool) -> ClientSession {
+        let now = Instant::now();
         ClientSession {
             addr: addr_str.parse().unwrap(),
-            last_seen: Instant::now(),
+            last_seen: now,
+            connected_since: now,
             auth_state: AuthState::NoAuth,
             last_heartbeat_seq: 0, rtt_ms: 0, loss_percent: 0, jitter_ms: 0,
             spectrum_enabled: rx1_en,

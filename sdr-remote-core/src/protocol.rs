@@ -312,6 +312,13 @@ impl Capabilities {
     pub const SPECTRUM: u32 = 1 << 1;
     /// Support for RX2/VFO-B dual receiver
     pub const RX2: u32 = 1 << 2;
+    /// Server reports runtime state via the `state_flags` field in HeartbeatAck
+    /// (PATCH-1). Client MUST check this bit before trusting `state_flags`;
+    /// older servers (v2.0.0 release-tag and earlier) leave `state_flags` at
+    /// NONE which would otherwise be misread as "TCI down". When this bit is
+    /// clear in the negotiated capabilities, the client treats `state_flags`
+    /// as unknown / not-authoritative.
+    pub const REPORTS_STATE_FLAGS: u32 = 1 << 3;
 
     pub fn has(self, flag: u32) -> bool {
         self.0 & flag != 0
@@ -588,8 +595,44 @@ impl Heartbeat {
     }
 }
 
-/// HeartbeatAck: header(4) + echo_seq(4) + echo_time(4) + capabilities(4) = 16 bytes
-/// Backward compatible: 12 bytes without capabilities
+/// Server-state flags broadcast in HeartbeatAck. Independent from
+/// `Capabilities` (which describes feature negotiation, static); this
+/// describes runtime state (dynamic).
+///
+/// Added in v2.0.0-post (PATCH-1 client-connect-error-feedback) for
+/// the client to detect "TCI not reachable on server PC" without
+/// inferring from audio absence (false-positives on quiet bands).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerStateFlags(pub u32);
+
+impl ServerStateFlags {
+    pub const NONE: Self = Self(0);
+    /// Server's TCI WebSocket to Thetis is currently up.
+    /// When clear: TCI is down, retrying, or unreachable.
+    pub const TCI_CONNECTED: u32 = 1 << 0;
+    /// Thetis.exe process is currently running on the server PC.
+    /// Used by the client to give a smarter TciUnreachable hint:
+    /// - flag set + TCI_CONNECTED clear → "Thetis runs, check TCI server settings"
+    /// - flag clear → "Thetis is not running, press Start on the Thetis tab"
+    /// Only trustworthy when capabilities advertises REPORTS_STATE_FLAGS.
+    pub const THETIS_RUNNING: u32 = 1 << 1;
+    /// Server is in the middle of launching Thetis (orange "Start" button).
+    /// Set between user pressing Start and TCI connecting (or the 60s
+    /// launch timeout firing). Client should NOT show "TCI unreachable"
+    /// while this is set — it's a normal transient launch phase.
+    pub const THETIS_STARTING: u32 = 1 << 2;
+
+    pub fn has(self, flag: u32) -> bool {
+        self.0 & flag != 0
+    }
+
+    pub fn with(self, flag: u32) -> Self {
+        Self(self.0 | flag)
+    }
+}
+
+/// HeartbeatAck: header(4) + echo_seq(4) + echo_time(4) + capabilities(4) + state_flags(4) = 20 bytes
+/// Backward compatible: 12 bytes (just header+echo) or 16 bytes (+capabilities) accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeartbeatAck {
     pub flags: Flags,
@@ -597,13 +640,18 @@ pub struct HeartbeatAck {
     pub echo_time: u32,
     /// Server capabilities (negotiated: intersection of client + server caps)
     pub capabilities: Capabilities,
+    /// Server runtime-state flags (e.g. TCI_CONNECTED). Forward-compat:
+    /// older servers don't send this; client treats absent as `NONE`.
+    pub state_flags: ServerStateFlags,
 }
 
 impl HeartbeatAck {
-    /// Minimum size for backward compatibility (without capabilities)
+    /// Minimum size for backward compatibility (without capabilities or state_flags)
     pub const MIN_SIZE: usize = 12;
-    /// Full size including capabilities
-    pub const SIZE: usize = 16;
+    /// Size including capabilities (v0.x .. v2.0.0 release)
+    pub const SIZE_WITH_CAPS: usize = 16;
+    /// Full size including state_flags (v2.0.0-post PATCH-1)
+    pub const SIZE: usize = 20;
 
     pub fn serialize(&self, buf: &mut [u8; Self::SIZE]) {
         let header = Header::new(PacketType::HeartbeatAck, self.flags);
@@ -611,6 +659,7 @@ impl HeartbeatAck {
         buf[4..8].copy_from_slice(&self.echo_sequence.to_be_bytes());
         buf[8..12].copy_from_slice(&self.echo_time.to_be_bytes());
         buf[12..16].copy_from_slice(&self.capabilities.0.to_be_bytes());
+        buf[16..20].copy_from_slice(&self.state_flags.0.to_be_bytes());
     }
 
     pub fn deserialize(buf: &[u8]) -> Result<Self> {
@@ -622,10 +671,16 @@ impl HeartbeatAck {
             bail!("heartbeat ack too short: {} < {}", buf.len(), Self::MIN_SIZE);
         }
 
-        let capabilities = if buf.len() >= Self::SIZE {
+        let capabilities = if buf.len() >= Self::SIZE_WITH_CAPS {
             Capabilities(u32::from_be_bytes(buf[12..16].try_into().unwrap()))
         } else {
             Capabilities::NONE
+        };
+
+        let state_flags = if buf.len() >= Self::SIZE {
+            ServerStateFlags(u32::from_be_bytes(buf[16..20].try_into().unwrap()))
+        } else {
+            ServerStateFlags::NONE
         };
 
         Ok(Self {
@@ -633,6 +688,7 @@ impl HeartbeatAck {
             echo_sequence: u32::from_be_bytes(buf[4..8].try_into().unwrap()),
             echo_time: u32::from_be_bytes(buf[8..12].try_into().unwrap()),
             capabilities,
+            state_flags,
         })
     }
 }
@@ -1566,21 +1622,25 @@ mod tests {
             echo_sequence: 100,
             echo_time: 999_999,
             capabilities: Capabilities::NONE.with(Capabilities::WIDEBAND_AUDIO),
+            state_flags: ServerStateFlags::NONE.with(ServerStateFlags::TCI_CONNECTED),
         };
         let mut buf = [0u8; HeartbeatAck::SIZE];
         ack.serialize(&mut buf);
 
-        assert_eq!(buf.len(), 16);
+        // SIZE is now 20 bytes (was 16 before state_flags was added in PATCH-1)
+        assert_eq!(buf.len(), 20);
+        assert_eq!(HeartbeatAck::SIZE, 20);
 
         let decoded = HeartbeatAck::deserialize(&buf).unwrap();
         assert_eq!(decoded.echo_sequence, 100);
         assert_eq!(decoded.echo_time, 999_999);
         assert!(decoded.capabilities.has(Capabilities::WIDEBAND_AUDIO));
+        assert!(decoded.state_flags.has(ServerStateFlags::TCI_CONNECTED));
     }
 
     #[test]
-    fn heartbeat_ack_backward_compat() {
-        // Old 12-byte HeartbeatAck without capabilities
+    fn heartbeat_ack_backward_compat_12_byte() {
+        // Old 12-byte HeartbeatAck (pre-Capabilities, pre-state_flags)
         let mut buf = [0u8; 12];
         buf[0] = MAGIC;
         buf[1] = VERSION;
@@ -1592,6 +1652,29 @@ mod tests {
         assert_eq!(decoded.echo_sequence, 55);
         assert_eq!(decoded.echo_time, 12345);
         assert_eq!(decoded.capabilities, Capabilities::NONE);
+        assert_eq!(decoded.state_flags, ServerStateFlags::NONE);
+    }
+
+    #[test]
+    fn heartbeat_ack_intermediate_compat_16_byte() {
+        // Intermediate 16-byte HeartbeatAck (capabilities present, state_flags absent —
+        // this is what a v2.0.0 release-tag server sends, before PATCH-1).
+        // The decoder must accept it and fill state_flags with NONE.
+        let mut buf = [0u8; 16];
+        buf[0] = MAGIC;
+        buf[1] = VERSION;
+        buf[2] = PacketType::HeartbeatAck as u8;
+        buf[3] = 0;
+        buf[4..8].copy_from_slice(&77u32.to_be_bytes());
+        buf[8..12].copy_from_slice(&54321u32.to_be_bytes());
+        buf[12..16].copy_from_slice(&Capabilities::WIDEBAND_AUDIO.to_be_bytes());
+        let decoded = HeartbeatAck::deserialize(&buf).unwrap();
+        assert_eq!(decoded.echo_sequence, 77);
+        assert_eq!(decoded.echo_time, 54321);
+        assert!(decoded.capabilities.has(Capabilities::WIDEBAND_AUDIO));
+        // Key invariant: when state_flags absent, default to NONE — caller must
+        // NOT assume "no TCI_CONNECTED bit = TCI down" (compatibility-regression check).
+        assert_eq!(decoded.state_flags, ServerStateFlags::NONE);
     }
 
     #[test]
@@ -1630,6 +1713,7 @@ mod tests {
             echo_sequence: 1,
             echo_time: 0,
             capabilities: Capabilities::NONE,
+            state_flags: ServerStateFlags::NONE,
         };
         let mut buf = [0u8; HeartbeatAck::SIZE];
         ack.serialize(&mut buf);

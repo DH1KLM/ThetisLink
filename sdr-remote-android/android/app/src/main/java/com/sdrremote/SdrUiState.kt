@@ -19,6 +19,11 @@ data class SdrUiState(
     val audioError: Boolean = false,
     val authRejected: Boolean = false,
     val totpRequired: Boolean = false,
+    // PATCH-1: pre-rendered connect-status text from Rust i18n.rs
+    val connectStatusHeadline: String = "",
+    val connectStatusAction: String = "",
+    val connectStatusIsError: Boolean = false,
+    val connectStatusIsAwaitingTotp: Boolean = false,
     val rttMs: Int = 0,
     val jitterMs: Float = 0f,
     val bufferDepth: Int = 0,

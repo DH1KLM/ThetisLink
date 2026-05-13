@@ -102,6 +102,19 @@ pub(crate) struct ClientConfig {
     /// True → zoom-min 1x toegestaan, smear bij tunen <1.2× zoom.
     /// Server enforced strictest over alle clients (zolang één client false → server klemt op 2x).
     pub(crate) allow_zoom_below_2x: bool,
+
+    /// PATCH-1: UI-language for connect-status / connect-error strings.
+    /// Accepts "en" (default) or "nl". Any other value falls back to "en".
+    /// TODO(future): auto-detect from OS locale.
+    pub(crate) language: String,
+
+    /// PATCH-4: count of successful connects to a real server. Used to
+    /// detect "first-run" without relying on file-absence (more robust
+    /// for fresh installs that already touched the config). Wizard
+    /// shows on `0`; bumped to `1` (and persisted) on the first
+    /// `ConnectStatus::Connected` transition. Migration-safe: missing
+    /// in legacy configs ⇒ default 0 ⇒ wizard runs once on upgrade.
+    pub(crate) successful_connects: u32,
 }
 
 impl Default for ClientConfig {
@@ -157,6 +170,8 @@ impl Default for ClientConfig {
             catsync_url: String::new(),
             catsync_favorites: Vec::new(),
             allow_zoom_below_2x: false,
+            language: "en".to_string(),
+            successful_connects: 0,
         }
     }
 }
@@ -444,6 +459,14 @@ pub(crate) fn load_config() -> ClientConfig {
         } else if let Some(val) = line.strip_prefix("allow_zoom_below_2x=") {
             config.allow_zoom_below_2x = val.trim() == "true";
             has_keys = true;
+        } else if let Some(val) = line.strip_prefix("language=") {
+            let v = val.trim().to_lowercase();
+            config.language = if v == "nl" { "nl".to_string() } else { "en".to_string() };
+            has_keys = true;
+        } else if let Some(val) = line.strip_prefix("successful_connects=") {
+            // PATCH-4: parse as u32 with default 0 on malformed input.
+            config.successful_connects = val.trim().parse::<u32>().unwrap_or(0);
+            has_keys = true;
         } else if let Some(val) = line.strip_prefix("catsync_enabled=") {
             config.catsync_enabled = val.trim() == "true";
             has_keys = true;
@@ -619,11 +642,12 @@ pub(crate) fn save_config(
         for (i, mapping) in midi_mappings.iter().enumerate() {
             content.push_str(&format!("midi_map_{}={}\n", i, mapping.to_config()));
         }
-        // Preserve ptt_toggle + midi_ptt_toggle + allow_zoom_below_2x from existing config
+        // Preserve ptt_toggle + midi_ptt_toggle + allow_zoom_below_2x + successful_connects from existing config
         if let Ok(existing) = std::fs::read_to_string(&path) {
             for line in existing.lines() {
                 if line.starts_with("ptt_toggle=") || line.starts_with("yaesu_ptt_toggle=") || line.starts_with("midi_ptt_toggle=")
-                    || line.starts_with("allow_zoom_below_2x=") {
+                    || line.starts_with("allow_zoom_below_2x=")
+                    || line.starts_with("successful_connects=") {
                     content.push_str(line);
                     content.push('\n');
                 }
@@ -648,6 +672,61 @@ pub(crate) fn save_allow_zoom_below_2x(allow: bool) {
         .lines()
         .map(|l| {
             if l.starts_with("allow_zoom_below_2x=") {
+                found = true;
+                new_line.clone()
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+    if !found {
+        updated_lines.push(new_line);
+    }
+    let _ = std::fs::write(path, updated_lines.join("\n") + "\n");
+}
+
+/// PATCH-4: detect first-run for the connection wizard. Returns true when:
+///  - the config file is absent, OR
+///  - it exists but `successful_connects == 0` (default for fresh installs
+///    *and* for legacy configs upgrading to this version).
+/// File-read errors are treated as first-run because we cannot prove the
+/// user has connected before.
+pub(crate) fn is_first_run() -> bool {
+    let config = load_config();
+    config.successful_connects == 0
+}
+
+/// PATCH-4: bump `successful_connects` to (at least) 1 on the first
+/// `ConnectStatus::Connected` transition. Read-modify-write so other
+/// fields are not touched. No-op if the value is already > 0 — keeps
+/// the wizard from re-arming if the user clears their server field
+/// mid-session.
+pub(crate) fn mark_successful_connect() {
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let path = exe.with_file_name(CONFIG_FILE);
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    // Parse current value (if any). Default 0 covers both "missing key"
+    // and "malformed value".
+    let mut current: u32 = 0;
+    for line in existing.lines() {
+        if let Some(v) = line.strip_prefix("successful_connects=") {
+            current = v.trim().parse::<u32>().unwrap_or(0);
+            break;
+        }
+    }
+    if current >= 1 {
+        return;
+    }
+    let new_value = current.saturating_add(1).max(1);
+    let new_line = format!("successful_connects={}", new_value);
+    let mut found = false;
+    let mut updated_lines: Vec<String> = existing
+        .lines()
+        .map(|l| {
+            if l.starts_with("successful_connects=") {
                 found = true;
                 new_line.clone()
             } else {

@@ -2,7 +2,9 @@
 
 mod amplitec;
 mod audio_loops;
+mod audio_stats;
 mod config;
+mod mdns;
 mod ctun_recenter;
 mod dxcluster;
 mod macros;
@@ -381,6 +383,7 @@ fn main() -> Result<()> {
             password: defaults.password,
             totp_secret: defaults.totp_secret,
             totp_enabled: defaults.totp_enabled,
+            friendly_name: defaults.friendly_name,
         };
         info!("Starting with tci={:?}", config.tci_addr);
         let rt = tokio::runtime::Runtime::new()?;
@@ -420,7 +423,7 @@ fn main() -> Result<()> {
                 (None, None)
             };
 
-            let server = run_server_async(config, shutdown_rx, None, tuner_arc, spe_arc, None, None, None, cat_cmd_rx, None, None, None, None, None);
+            let server = run_server_async(config, shutdown_rx, None, tuner_arc, spe_arc, None, None, None, cat_cmd_rx, None, None, None, None, None, None);
             tokio::select! {
                 result = server => {
                     if let Err(e) = result {
@@ -518,14 +521,29 @@ pub async fn run_server_async(
     vfo_freq_shared: Option<Arc<AtomicU64>>,
     vfo_b_freq_shared: Option<Arc<AtomicU64>>,
     yaesu_prebuilt: Option<Arc<yaesu::YaesuRadio>>,
+    // PATCH-2: shared lock-free state for the Status panel. CLI mode
+    // passes `None`; GUI mode passes pre-allocated probes.
+    status_panel_state: Option<crate::audio_stats::StatusPanelShared>,
 ) -> Result<()> {
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", DEFAULT_PORT).parse()?;
     info!("ThetisLink Server v{} starting up...", sdr_remote_core::version_string());
     info!("PA3GHM — Remote control for Thetis SDR + Yaesu FT-991A");
     info!("Licensed under GPL-2.0-or-later — source: https://github.com/cjenschede/ThetisLink");
 
+    // PATCH-2: derive Status-panel state from the optional incoming bundle
+    // (GUI mode) or construct a one-shot bundle for CLI mode so the rest of
+    // run_server_async can always operate on real Arc<>s.
+    let status_panel_state = status_panel_state
+        .unwrap_or_else(audio_stats::StatusPanelShared::new);
+    let audio_stats = status_panel_state.audio.clone();
+    let tci_probe = status_panel_state.tci.clone();
+    let server_start = status_panel_state.server_start;
+
     // Session manager
     let session = Arc::new(Mutex::new(SessionManager::new(config.password.clone(), config.totp_secret.clone())));
+    // PATCH-2: publish to the Status-panel slot so the UI can read it.
+    // CLI mode also publishes — harmless even though no UI reads from it.
+    let _ = status_panel_state.session_slot.set(session.clone());
 
     // PTT controller (TL2 v2: TCI-only). Default to localhost if no addr configured.
     let tci_addr_str = config.tci_addr.clone().unwrap_or_else(|| "127.0.0.1:40001".to_string());
@@ -709,10 +727,28 @@ pub async fn run_server_async(
         vfo_freq_shared,
         vfo_b_freq_shared,
         yaesu_prebuilt,
+        audio_stats.clone(),
+        tci_probe.clone(),
+        server_start,
+        status_panel_state.bind_status.clone(),
     )
     .await?;
 
     info!("Server ready, waiting for connections...");
+
+    // PATCH-3: advertise on the local network so clients can find us
+    // without typing an IP. mDNS failure is non-fatal — manual entry
+    // remains the always-on fallback in the clients.
+    let mdns_advertiser = match mdns::MdnsAdvertiser::start(
+        sdr_remote_core::DEFAULT_PORT,
+        config.friendly_name.as_deref(),
+    ) {
+        Ok(adv) => Some(adv),
+        Err(e) => {
+            log::warn!("mDNS advertise failed (non-fatal): {}", e);
+            None
+        }
+    };
 
     // Run until shutdown signal
     let mut shutdown = shutdown_rx;
@@ -729,6 +765,12 @@ pub async fn run_server_async(
 
     // Ensure PTT is released on shutdown
     ptt.lock().await.release().await;
+
+    // PATCH-3: deregister the mDNS service so clients see the server
+    // disappear instead of relying on TTL expiry.
+    if let Some(adv) = mdns_advertiser {
+        adv.shutdown();
+    }
 
     Ok(())
 }

@@ -13,10 +13,15 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -30,6 +35,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.sdrremote.nsd.MdnsDiscovery
 
 @Composable
 fun ConnectionPanel(
@@ -39,7 +45,14 @@ fun ConnectionPanel(
     paForwardW: Int = 0,
     paMaxW: Int = 0,
     paName: String = "",
-    totpRequired: Boolean = false,
+    // PATCH-1: connect-status text rendered in Rust via i18n.rs; Kotlin/Compose
+    // just displays. headline = main user-visible line, action = optional hint
+    // ("" when no hint). is_error = render red, otherwise neutral. is_awaiting_totp
+    // = show 2FA input row.
+    connectStatusHeadline: String = "",
+    connectStatusAction: String = "",
+    connectStatusIsError: Boolean = false,
+    connectStatusIsAwaitingTotp: Boolean = false,
     onConnect: (String, String) -> Unit,
     onDisconnect: () -> Unit,
     onSendTotp: (String) -> Unit = {},
@@ -47,6 +60,19 @@ fun ConnectionPanel(
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("thetislink", android.content.Context.MODE_PRIVATE) }
     var serverInput by rememberSaveable { mutableStateOf(prefs.getString("server_addr", "192.168.1.79:4580") ?: "192.168.1.79:4580") }
+
+    // PATCH-3: NSD-based mDNS discovery — only runs while ConnectionPanel
+    // is in the composition AND the user is not yet connected. Multicast
+    // lock is acquired in start() and released in stop(); leaving the
+    // panel (compose dispose) tears the discovery down so the radio stack
+    // doesn't keep the multicast lock held all session long.
+    val mdns = remember { MdnsDiscovery(context) }
+    DisposableEffect(connected) {
+        if (!connected) mdns.start()
+        onDispose { mdns.stop() }
+    }
+    val discoveredServers by mdns.servers.collectAsState()
+    var discoveryMenuOpen by remember { mutableStateOf(false) }
 
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -72,12 +98,16 @@ fun ConnectionPanel(
             }
         } else {
             val pw = prefs.getString("password", "") ?: ""
+            // PATCH-1 smoke-test fix (2026-05-12): disable Connect while mid-auth.
+            // AwaitingTotp = user must press Verify; pressing Connect again would
+            // regress engine to "Connecting" and the server's PendingTotp session
+            // would never recover.
             Button(
                 onClick = {
                     prefs.edit().putString("server_addr", serverInput).apply()
                     onConnect(serverInput, pw)
                 },
-                enabled = pw.isNotBlank(),
+                enabled = pw.isNotBlank() && !connectStatusIsAwaitingTotp,
             ) {
                 Text("Connect")
             }
@@ -87,8 +117,44 @@ fun ConnectionPanel(
         }
     }
 
-    // TOTP 2FA input row
-    if (totpRequired) {
+    // PATCH-3: dropdown with mDNS-discovered servers. Empty list = nothing
+    // to render; user still has the manual IP field above as the always-on
+    // fallback. List appears progressively as scans resolve, so we don't
+    // gate Connect on it.
+    if (!connected && discoveredServers.isNotEmpty()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text("Found:", fontSize = 12.sp)
+            Box {
+                TextButton(onClick = { discoveryMenuOpen = true }) {
+                    Text("Choose discovered server (${discoveredServers.size})")
+                }
+                DropdownMenu(
+                    expanded = discoveryMenuOpen,
+                    onDismissRequest = { discoveryMenuOpen = false },
+                ) {
+                    discoveredServers.forEach { srv ->
+                        DropdownMenuItem(
+                            text = { Text(srv.displayLabel()) },
+                            onClick = {
+                                serverInput = srv.addrPort
+                                discoveryMenuOpen = false
+                            },
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    // PATCH-1: connect-status display.
+    // - AwaitingTotp: show 2FA input row + the headline ("Enter 2FA code") and action hint
+    // - Failed: show headline in red + action hint as small grey text
+    // - Other (Disconnected/Connecting/Connected): no extra row here; status row below shows colored badge
+    if (connectStatusIsAwaitingTotp) {
         var totpInput by remember { mutableStateOf("") }
         Row(
             modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
@@ -98,7 +164,7 @@ fun ConnectionPanel(
             OutlinedTextField(
                 value = totpInput,
                 onValueChange = { if (it.length <= 6 && it.all { c -> c.isDigit() }) totpInput = it },
-                label = { Text("2FA Code") },
+                label = { Text(if (connectStatusHeadline.isNotEmpty()) connectStatusHeadline else "2FA Code") },
                 singleLine = true,
                 modifier = Modifier.weight(1f),
             )
@@ -108,6 +174,30 @@ fun ConnectionPanel(
             ) {
                 Text("Verify")
             }
+        }
+        if (connectStatusAction.isNotEmpty()) {
+            Text(
+                text = connectStatusAction,
+                color = Color(0xFF989898),
+                fontSize = 11.sp,
+                modifier = Modifier.padding(top = 2.dp, start = 4.dp),
+            )
+        }
+    } else if (connectStatusIsError && connectStatusHeadline.isNotEmpty()) {
+        Text(
+            text = connectStatusHeadline,
+            color = Color(0xFFDC2828),
+            fontSize = 14.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.padding(top = 4.dp, start = 4.dp),
+        )
+        if (connectStatusAction.isNotEmpty()) {
+            Text(
+                text = connectStatusAction,
+                color = Color(0xFF989898),
+                fontSize = 11.sp,
+                modifier = Modifier.padding(top = 2.dp, start = 4.dp),
+            )
         }
     }
 

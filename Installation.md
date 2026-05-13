@@ -1,10 +1,10 @@
-# ThetisLink v2.0.0 - Installation Guide
+# ThetisLink v2.0.1 - Installation Guide
 
 ThetisLink is a remote control application for the ANAN 7000DLE SDR with Thetis. Audio, spectrum, PTT and full radio control over the network via TCI WebSocket.
 
 **Compatibility:** ThetisLink talks only to **Thetis** (via TCI WebSocket) and not directly to the SDR hardware. It therefore works with any SDR device supported by **Thetis v2.10.3.15** (official release by ramdor) — both HPSDR Protocol 1 (Hermes, Angelia, Orion) and HPSDR Protocol 2 (ANAN-7000DLE, ANAN-8000DLE, ANAN-G2, Hermes-Lite 2, etc.). Optional: Yaesu FT-991A as a second radio (via COM port).
 
-**PA3GHM Thetis fork (optional, recommended for TL2 extensions):** ThetisLink v2.0.0 works fine with stock Thetis v2.10.3.15 over TCI alone — no separate CAT TCP connection is required. The PA3GHM fork is an **optional** drop-in replacement that adds ThetisLink-specific TL2 `_ex` extensions on top of stock Thetis: extended IQ bandwidth up to 1536 kHz (vs the 384 kHz stock cap), `tci_caps_ex` capability broadcast, server-side CTUN auto-recenter (`auto_recenter_ex`), filter-preset and per-RX DDC-rate push notifications, and diversity auto-null with live circle broadcast. All extensions sit behind the **"ThetisLink extensions"** checkbox in Thetis and are disabled by default; with the checkbox unchecked the TCI extension behaviour is preserved (stock v2.10.3.15 — note the fork still carries its own build tag, release notes and About metadata). See the User Manual (`User-Manual-EN.md`) for details.
+**PA3GHM Thetis fork (optional, recommended for TL2 extensions):** ThetisLink v2.0.1 works fine with stock Thetis v2.10.3.15 over TCI alone — no separate CAT TCP connection is required. The PA3GHM fork is an **optional** drop-in replacement that adds ThetisLink-specific TL2 `_ex` extensions on top of stock Thetis: extended IQ bandwidth up to 1536 kHz (vs the 384 kHz stock cap), `tci_caps_ex` capability broadcast, server-side CTUN auto-recenter (`auto_recenter_ex`), filter-preset and per-RX DDC-rate push notifications, and diversity auto-null with live circle broadcast. All extensions sit behind the **"ThetisLink extensions"** checkbox in Thetis and are disabled by default; with the checkbox unchecked the TCI extension behaviour is preserved (stock v2.10.3.15 — note the fork still carries its own build tag, release notes and About metadata). See the User Manual (`User-Manual-EN.md`) for details.
 
 **Disclaimer:** This software controls radio transmitters. Use at your own risk. The author is not responsible for damage to equipment, interference or violations of regulations resulting from the use of this software. Verify all safety features (PTT timeout, power limits) before transmitting.
 
@@ -16,7 +16,7 @@ ThetisLink is a remote control application for the ANAN 7000DLE SDR with Thetis.
 |------|-------------|
 | ThetisLink-Server.exe | ThetisLink Server - runs on the PC alongside Thetis |
 | ThetisLink-Client.exe | ThetisLink Desktop Client - Windows |
-| ThetisLink-2.0.0.apk | ThetisLink Android Client - phone/tablet |
+| ThetisLink-2.0.1.apk | ThetisLink Android Client - phone/tablet |
 | thetislink-server.conf | Example ThetisLink Server configuration |
 | thetislink-client.conf | Example ThetisLink Client configuration |
 | Installation.pdf | Installation guide (English, this document) |
@@ -99,7 +99,7 @@ Setup -> Serial/Network/Midi CAT -> Network -> **TCI Server** group:
 With the PA3GHM Thetis fork, on the same tab:
 1. Check **ThetisLink extensions**
 
-> ThetisLink v2.0.0 uses TCI exclusively for radio control. The TCP/IP CAT server in Thetis does not need to be enabled for ThetisLink — it is only required if you want to connect a separate logging program or third-party CAT client to Thetis directly.
+> ThetisLink v2.0.1 uses TCI exclusively for radio control. The TCP/IP CAT server in Thetis does not need to be enabled for ThetisLink — it is only required if you want to connect a separate logging program or third-party CAT client to Thetis directly.
 
 ---
 
@@ -190,18 +190,22 @@ All settings are automatically saved in `thetislink-server.conf` next to the exe
 
 Copy `ThetisLink-Client.exe` to a folder on the Desktop Client PC. No installation required.
 
-### 3.2 First launch
+### 3.2 First launch — guided setup wizard
 
-1. Start `ThetisLink-Client.exe`
-2. Select your **microphone** (Input) and **speaker/headset** (Output) at the top
-3. Enter the **ThetisLink Server address**: `<server-IP>:4580` (e.g. `192.168.1.79:4580`)
-4. Enter the **password** (see step 2.6)
-5. Click **Connect**
-6. Enter the **2FA code** if TOTP is enabled on the ThetisLink Server (6 digits from your authenticator app)
+On the very first start, ThetisLink shows a 4-step **setup wizard**. Subsequent starts skip the wizard automatically and bring you straight to the regular UI.
 
-If the ThetisLink Server and ThetisLink Desktop Client are running on the same PC: use `127.0.0.1:4580`.
+1. **Find the server.** Servers on the same WiFi/LAN appear automatically in a "Found" dropdown (mDNS / Bonjour discovery). Pick yours, or type the address manually as `<server-IP>:4580` (e.g. `192.168.1.79:4580`).
+2. **Enter the password** (see step 2.6). A "Show" checkbox toggles plain-text visibility.
+3. **2FA code** — only when the server requires it. Enter the 6-digit code from your authenticator app.
+4. **Connected.** Click *Done* to land on the regular UI.
 
-> On the first connection it may take a moment on both sides before everything is ready - the ThetisLink Server needs to establish the TCI connection with Thetis and initialize all external devices. This is a one-time delay; subsequent connections are immediate.
+If a step fails, ThetisLink shows a specific error (e.g. "Wrong password", "Server name not found", "Thetis is not running on the server PC") and sends you back to the right step. You can also click **Skip wizard** in the top-right to jump straight to the manual connect form.
+
+If the ThetisLink Server and Desktop Client run on the same PC: use `127.0.0.1:4580`.
+
+> On the first connection it may take a moment on both sides before everything is ready — the Server needs to establish the TCI connection with Thetis and initialise all external devices. This is a one-time delay; subsequent connections are immediate.
+
+The wizard can be re-launched any time via the **Wizard** button on the Server tab.
 
 ### 3.3 Configuration
 
@@ -211,6 +215,14 @@ Settings are automatically saved in `thetislink-client.conf` next to the exe:
 - Band memories
 - TX profiles
 - MIDI mappings
+- `language=en` or `language=nl` — UI text for connect-status and connect-error messages (default: en)
+- `successful_connects=N` — first-run wizard counter. Wizard is shown when this is `0` or missing. Delete this line (or set it to `0`) to force the wizard on next launch.
+
+### 3.4 Server tab — server status at a glance
+
+The Server tab in the client shows live connection state, audio level bars per channel, and a **Re-run setup wizard** (small "Wizard" button, top-right of the Server-address row). Use it to reconfigure without wiping config.
+
+When the server itself runs on the Thetis PC, its window has two tabs: **Status** (compact server-state panel: bind address, Thetis TCI link, active clients with RTT/loss/jitter, audio routing chips, recent connect attempts, configured devices) and **Logs**. The Status panel is the fastest way to answer support questions like *"is the server listening?"* or *"did my connect attempt arrive?"* — a screenshot of it usually covers 80% of the diagnosis.
 
 ---
 
@@ -219,24 +231,23 @@ Settings are automatically saved in `thetislink-client.conf` next to the exe:
 ### 4.1 Installing the APK
 
 **Via file manager:**
-1. Copy `ThetisLink-2.0.0.apk` to your phone (USB, email, or cloud)
+1. Copy `ThetisLink-2.0.1.apk` to your phone (USB, email, or cloud)
 2. Open the APK file on the phone
 3. Allow "Install from unknown sources" if prompted
 4. Install
 
 **Via ADB** (with USB debugging enabled):
 ```
-adb install ThetisLink-2.0.0.apk
+adb install ThetisLink-2.0.1.apk
 ```
 
-### 4.2 Connecting
+### 4.2 Connecting — guided setup wizard
 
-1. Open ThetisLink
-2. Enter the **ThetisLink Server address**: `<server-IP>:4580`
-3. Set the **password** via Settings (gear icon)
-4. Tap **Connect**
-5. Enter the **2FA code** if TOTP is enabled (6 digits from your authenticator app)
-6. Allow microphone access if prompted
+The Android app shows the same 4-step **setup wizard** on first launch (Find server → Password → 2FA → Connected). On the same WiFi the Server is auto-discovered via mDNS (Bonjour) and appears in a *Choose discovered server* dropdown — no IP typing needed. The system back-button moves to the previous wizard step; on step 1 it asks to skip to the manual form.
+
+Subsequent launches go straight to the regular UI. To re-run the wizard later, tap the **Wizard** button on the Radio screen (next to *Settings / MIDI / About*).
+
+Allow microphone access when prompted on first launch.
 
 ### 4.3 Bluetooth headset
 
@@ -262,6 +273,29 @@ After a successful connection, ThetisLink is ready to use. See the **User Manual
 ---
 
 ## Network
+
+### Local-network discovery (mDNS)
+
+Clients on the same WiFi/LAN automatically find the server via mDNS
+(Bonjour / Avahi) — no IP address typing required. The "Found:" dropdown
+in the desktop client and the "Choose discovered server" list in the
+Android app populate within ~1 second of opening the connect screen.
+
+If you run **multiple ThetisLink servers** on the same network, set a
+human-readable label in `thetislink-server.conf` so the dropdown
+distinguishes them:
+
+```
+friendly_name=Shack PC
+```
+
+Without `friendly_name` the OS hostname is used as the label. Manual IP
+entry remains available for cross-subnet, VPN, and internet scenarios
+where mDNS does not reach.
+
+The Android app requires the `CHANGE_WIFI_MULTICAST_STATE` permission
+for mDNS scanning. This is a *normal* Android permission, granted
+automatically at install — no runtime prompt.
 
 ### Bandwidth
 

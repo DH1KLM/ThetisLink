@@ -378,6 +378,12 @@ impl PttController {
         self.tci.is_connected()
     }
 
+    /// Public accessor for HeartbeatAck `TCI_CONNECTED` flag.
+    /// (PATCH-1 client-connect-error-feedback)
+    pub fn tci_connected(&self) -> bool {
+        self.tci.is_connected()
+    }
+
     async fn radio_send(&mut self, cmd: &str) {
         self.tci.send(cmd).await
     }
@@ -578,6 +584,13 @@ impl PttController {
 
     pub fn thetis_starting(&self) -> bool {
         self.pending_power_on
+    }
+
+    /// Cheap process-table scan: is Thetis.exe currently running on this PC?
+    /// Used by the heartbeat-ack handler to broadcast THETIS_RUNNING so the
+    /// client can give a smarter "TCI unreachable" hint.
+    pub fn thetis_process_running(&self) -> bool {
+        is_process_running("Thetis.exe")
     }
 
     pub async fn set_tx_profile(&mut self, idx: u8) {

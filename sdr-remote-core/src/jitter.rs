@@ -283,8 +283,15 @@ mod tests {
 
     fn make_frame(seq: u32) -> BufferedFrame {
         BufferedFrame {
+            // Wire protocol uses milliseconds for `timestamp`
+            // (`start.elapsed().as_millis()` on the server side, see
+            // `audio_loops.rs`). Each frame represents 20 ms of audio,
+            // so timestamp delta between consecutive frames is 20 — not
+            // 160 (the sample count). Using samples here previously
+            // injected a 140 ms phantom jitter into RFC-3550 estimator
+            // and made every test push min_depth up to max_depth.
             sequence: seq,
-            timestamp: seq * 160, // 160 samples per 20ms frame at 8kHz
+            timestamp: seq * 20,
             opus_data: vec![seq as u8; 32],
             ptt: false,
         }

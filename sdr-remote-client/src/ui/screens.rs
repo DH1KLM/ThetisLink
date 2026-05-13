@@ -1429,7 +1429,12 @@ impl SdrRemoteApp {
         let ms = if self.connected { 33 } else { 500 };
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(ms));
 
-        // Server address + password
+        // Server address + password, plus a right-anchored "Re-run setup
+        // wizard" button. Right-to-left layout keeps the wizard button
+        // glued to the right edge regardless of window width and never
+        // pushes the address/password fields off-screen on narrow windows
+        // — PATCH-4 follow-up: the previous bottom-of-screen placement
+        // disappeared off the visible viewport on short windows.
         ui.horizontal(|ui| {
             ui.label("Server:");
             let enabled = !self.connected;
@@ -1437,24 +1442,143 @@ impl SdrRemoteApp {
             ui.label("Password:");
             ui.add_enabled(enabled, egui::TextEdit::singleline(&mut self.password_input)
                 .desired_width(100.0).password(true).hint_text("(required)"));
-        });
-        if self.state_rx.borrow().auth_rejected {
-            ui.colored_label(Color32::from_rgb(220, 40, 40), "Authentication failed - wrong password");
-        } else if self.state_rx.borrow().totp_required {
-            ui.horizontal(|ui| {
-                ui.label("2FA Code:");
-                let re = ui.add(egui::TextEdit::singleline(&mut self.totp_input)
-                    .desired_width(80.0).hint_text("6 digits"));
-                if (re.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                    || ui.button("Verify").clicked())
-                    && self.totp_input.len() == 6
-                {
-                    let _ = self.cmd_tx.send(sdr_remote_logic::commands::Command::SendTotpCode(self.totp_input.clone()));
-                    self.totp_input.clear();
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let tip = if self.ui_language == "nl" {
+                    "Setup-wizard opnieuw starten"
+                } else {
+                    "Re-run setup wizard"
+                };
+                if ui.small_button("Wizard").on_hover_text(tip).clicked() {
+                    self.wizard_state = Some(super::wizard::WizardState::new(
+                        self.server_input.clone(),
+                        self.password_input.clone(),
+                    ));
                 }
             });
-        } else if !self.connected && self.password_input.is_empty() {
-            ui.colored_label(Color32::from_rgb(255, 165, 0), "Password is required to connect");
+        });
+
+        // PATCH-3: mDNS-discovered servers shown progressively as they
+        // arrive. The browse runs in a background thread; the UI just
+        // snapshots the latest list each frame. Empty list (no mDNS yet
+        // or no servers on this subnet) is the steady-state — the user
+        // can still type an IP above.
+        //
+        // Removal happens via mdns-sd's own `ServiceRemoved` event (TTL
+        // expiry or explicit goodbye) — we do NOT time-prune client-side
+        // because `ServiceResolved` only fires on first-resolve / change,
+        // so a stable server would otherwise get pruned ~30s after the
+        // initial scan even while it kept advertising. Refresh button
+        // below re-arms the browse for the user who wants to force a sweep.
+        if !self.connected {
+            if let Some(ref handle) = self.mdns_browse {
+                let servers = handle.snapshot();
+                ui.horizontal(|ui| {
+                    if !servers.is_empty() {
+                        ui.label("Found:");
+                        egui::ComboBox::from_id_salt("mdns_server_picker")
+                            .selected_text(format!("Choose discovered server ({})", servers.len()))
+                            .width(260.0)
+                            .show_ui(ui, |ui| {
+                                for srv in &servers {
+                                    if ui.selectable_label(false, srv.display_label()).clicked() {
+                                        self.server_input = srv.addr_port.clone();
+                                    }
+                                }
+                            });
+                    } else {
+                        ui.label(egui::RichText::new("Scanning local network…").size(11.0).color(egui::Color32::from_rgb(150, 150, 150)));
+                    }
+                    if ui.button("Refresh").clicked() {
+                        // Re-arm the browse: drop the current daemon (its
+                        // worker thread exits on receiver-close) and start
+                        // a fresh one. Forces a new query sweep and rebuilds
+                        // the snapshot list from scratch.
+                        self.mdns_browse = Some(crate::mdns::BrowseHandle::start());
+                    }
+                });
+            }
+        }
+        // PATCH-1: read connect_status from logic-state and render via
+        // i18n helper. Single source of truth — same NL/EN text as Android
+        // bridge. The legacy `auth_rejected` / `totp_required` booleans are
+        // still set for back-compat but new UI code uses connect_status.
+        let connect_status = self.state_rx.borrow().connect_status.clone();
+        use sdr_remote_logic::i18n::{connect_status_text, Lang};
+        use sdr_remote_logic::state::ConnectStatus;
+
+        // PATCH-1: language from client config (set via `language=nl|en` in
+        // thetislink-client.conf). Defaults to English when unset.
+        let lang = if self.ui_language == "nl" { Lang::Nl } else { Lang::En };
+
+        // PATCH-1 smoke-test fix (2026-05-12 #2): show the TOTP input + Verify
+        // button in BOTH AwaitingTotp AND Failed(WrongTotp) states. Without
+        // that, a user who types a wrong TOTP code has no way to retry: the
+        // TOTP input field disappears, and pressing the regular Connect
+        // button regresses the engine to "Connecting…" without a path back
+        // to AwaitingTotp.
+        let in_wrong_totp = matches!(
+            &connect_status,
+            ConnectStatus::Failed(sdr_remote_logic::state::ConnectError::WrongTotp)
+        );
+        // PATCH-1 smoke-test fix (2026-05-13): owner feedback — connect-status text
+        // was smaller than surrounding UI; should *stand out*. Headline now 18pt bold,
+        // action 14pt (body default, not `.small()`).
+        match &connect_status {
+            ConnectStatus::AwaitingTotp => {
+                let (headline, action) = connect_status_text(&connect_status, lang, sdr_remote_logic::i18n::Platform::Desktop);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(&headline).size(18.0).strong());
+                    let re = ui.add(egui::TextEdit::singleline(&mut self.totp_input)
+                        .desired_width(80.0).hint_text("6 digits"));
+                    if (re.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                        || ui.button("Verify").clicked())
+                        && self.totp_input.len() == 6
+                    {
+                        let _ = self.cmd_tx.send(sdr_remote_logic::commands::Command::SendTotpCode(self.totp_input.clone()));
+                        self.totp_input.clear();
+                    }
+                });
+                if let Some(a) = action {
+                    ui.label(egui::RichText::new(a).size(14.0));
+                }
+            }
+            ConnectStatus::Failed(_) if in_wrong_totp => {
+                // Wrong TOTP: keep the TOTP input + Verify button visible so
+                // the user can correct and retry without disconnecting.
+                let (headline, action) = connect_status_text(&connect_status, lang, sdr_remote_logic::i18n::Platform::Desktop);
+                ui.label(egui::RichText::new(&headline).size(18.0).strong().color(Color32::from_rgb(220, 40, 40)));
+                if let Some(a) = action {
+                    ui.label(egui::RichText::new(a).size(14.0));
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Retry:");
+                    let re = ui.add(egui::TextEdit::singleline(&mut self.totp_input)
+                        .desired_width(80.0).hint_text("6 digits"));
+                    if (re.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                        || ui.button("Verify").clicked())
+                        && self.totp_input.len() == 6
+                    {
+                        let _ = self.cmd_tx.send(sdr_remote_logic::commands::Command::SendTotpCode(self.totp_input.clone()));
+                        self.totp_input.clear();
+                    }
+                });
+            }
+            ConnectStatus::Failed(_) => {
+                let (headline, action) = connect_status_text(&connect_status, lang, sdr_remote_logic::i18n::Platform::Desktop);
+                ui.label(egui::RichText::new(&headline).size(18.0).strong().color(Color32::from_rgb(220, 40, 40)));
+                if let Some(a) = action {
+                    ui.label(egui::RichText::new(a).size(14.0));
+                }
+            }
+            ConnectStatus::Connecting => {
+                let (headline, _) = connect_status_text(&connect_status, lang, sdr_remote_logic::i18n::Platform::Desktop);
+                ui.label(egui::RichText::new(&headline).size(18.0).strong().color(Color32::from_rgb(180, 180, 60)));
+            }
+            ConnectStatus::Disconnected | ConnectStatus::Connected => {
+                if !self.connected && self.password_input.is_empty() {
+                    ui.colored_label(Color32::from_rgb(255, 165, 0), "Password is required to connect");
+                }
+            }
         }
 
         ui.separator();
@@ -1591,7 +1715,12 @@ impl SdrRemoteApp {
                 level_bar(ui, self.playback_level);
             });
         }
-        if self.rx2_enabled {
+        // Render the RX2 bar when either the local toggle is on OR audio
+        // is actually arriving. The OR-fallback turns the bar into a real
+        // data-flow indicator: any future regression in the server's
+        // per-client filter that lets CH2 through without the toggle
+        // would surface immediately instead of going unnoticed.
+        if self.rx2_enabled || self.playback_level_rx2 > 0.0 {
             ui.horizontal(|ui| {
                 ui.label("RX2:       ");
                 level_bar(ui, self.playback_level_rx2);
@@ -1736,6 +1865,7 @@ impl SdrRemoteApp {
                 }
             }
         });
+
     }
 
     pub(super) fn process_midi_events(&mut self) {

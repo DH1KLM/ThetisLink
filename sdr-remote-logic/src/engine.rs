@@ -197,6 +197,12 @@ impl ClientEngine {
         let mut server_addr: Option<String> = None;
         let mut auth_password: Option<String> = None;
         let mut _auth_completed = false;
+        // PATCH-1: track when Connect was issued + whether we've ever seen
+        // any reply from the server, so we can surface NoUdpResponse after
+        // a timeout, and distinguish "never heard anything" from "got bad bytes".
+        let mut connect_started_at: Option<Instant> = None;
+        let mut connect_timeout_secs: u32 = 5;
+        let mut connect_any_reply_seen: bool = false;
         let mut yaesu_mem_data_clear_at: Option<Instant> = None;
         let mut tx_sequence: u32 = 0;
         let mut hb_sequence: u32 = 0;
@@ -293,9 +299,118 @@ impl ClientEngine {
             while let Ok(cmd) = self.cmd_rx.try_recv() {
                 match cmd {
                     Command::Connect(addr, pw) => {
-                        server_addr = Some(addr);
-                        auth_password = pw;
-                        _auth_completed = false;
+                        // PATCH-1 smoke-test follow-up (2026-05-12): if we are already in
+                        // a forward-progress connect-state (AwaitingTotp or Connected) and
+                        // the user clicks Connect again with the SAME server+password, do
+                        // not regress the status — the server's session is still alive
+                        // server-side and a Connecting-status would never recover (server
+                        // won't re-issue AuthChallenge for an existing session). The user
+                        // must explicitly Disconnect first if they want to start over.
+                        let same_target = server_addr.as_deref() == Some(addr.as_str())
+                            && auth_password == pw;
+                        let already_progressing = matches!(
+                            state.connect_status,
+                            crate::state::ConnectStatus::AwaitingTotp
+                                | crate::state::ConnectStatus::Connected
+                        );
+                        if same_target && already_progressing {
+                            // Keep current state; no-op connect.
+                            continue;
+                        }
+
+                        // PATCH-1 smoke-test follow-up (2026-05-12 #2): if we have an
+                        // existing server-side session (had passed through any state
+                        // beyond Disconnected, including Failed), send a Disconnect
+                        // packet to the previous address before starting a new connect.
+                        // Otherwise the server's session would stay in a half-auth
+                        // state (PendingTotp or similar) and never re-issue an
+                        // AuthChallenge for the new attempt.
+                        let needs_session_reset = !matches!(
+                            state.connect_status,
+                            crate::state::ConnectStatus::Disconnected
+                        );
+                        if needs_session_reset {
+                            if let Some(ref old_addr) = server_addr {
+                                let mut buf = [0u8; DisconnectPacket::SIZE];
+                                DisconnectPacket::serialize(&mut buf);
+                                let _ = socket.send_to(&buf, old_addr.as_str()).await;
+                                // Brief settle delay so the server processes the
+                                // disconnect before the new heartbeat arrives.
+                                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            }
+                        }
+
+                        // PATCH-1 review finding (B1, part 1): up-front DNS / parse check.
+                        // If the address is a plain "IP:port" it parses synchronously — no DNS
+                        // needed. If it has a hostname, try lookup_host once. Either failure
+                        // mode produces a specific ConnectError so the UI can show a precise
+                        // message instead of a generic "Disconnected".
+                        let resolved_ok = if addr.parse::<std::net::SocketAddr>().is_ok() {
+                            true
+                        } else {
+                            // Async DNS lookup with a tight timeout — don't block the
+                            // command-processing loop forever on a slow resolver.
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                tokio::net::lookup_host(addr.as_str()),
+                            )
+                            .await
+                            {
+                                Ok(Ok(mut iter)) => iter.next().is_some(),
+                                Ok(Err(io_err)) => {
+                                    state.connect_status =
+                                        crate::state::ConnectStatus::Failed(
+                                            crate::state::ConnectError::DnsResolutionFailed {
+                                                host: addr.clone(),
+                                                io_kind: io_err.kind(),
+                                                message: format!("{}", io_err),
+                                            },
+                                        );
+                                    false
+                                }
+                                Err(_) => {
+                                    // Timeout on the lookup_host call.
+                                    state.connect_status =
+                                        crate::state::ConnectStatus::Failed(
+                                            crate::state::ConnectError::DnsResolutionFailed {
+                                                host: addr.clone(),
+                                                io_kind: std::io::ErrorKind::TimedOut,
+                                                message: "DNS lookup timed out".to_string(),
+                                            },
+                                        );
+                                    false
+                                }
+                            }
+                        };
+
+                        if resolved_ok {
+                            server_addr = Some(addr);
+                            auth_password = pw;
+                            _auth_completed = false;
+                            connect_started_at = Some(Instant::now());
+                            connect_any_reply_seen = false;
+                            // PATCH-1: signal "Connecting" so the UI can show progress.
+                            // Specific failure modes (NoUdpResponse via timeout, MalformedResponse
+                            // via parser, ProtocolVersionMismatch via magic+version check) are
+                            // surfaced from the network paths below.
+                            state.connect_status =
+                                crate::state::ConnectStatus::Connecting;
+                            // Owner-smoke-test fix (2026-05-13): broadcast immediately so the
+                            // UI clears the previous Failed(WrongPassword/...) banner the
+                            // moment Connect is pressed — without this the user keeps seeing
+                            // "Wrong password" for several seconds until the next packet
+                            // event triggers a state-broadcast.
+                            let _ = self.state_tx.send(state.clone());
+                        } else {
+                            // DNS-resolution already set the Failed status above; leave the
+                            // password unset so a retry forces a fresh attempt.
+                            server_addr = None;
+                            auth_password = None;
+                            connect_started_at = None;
+                            // Same reasoning as above — the DNS-fail Failed state must
+                            // also be broadcast immediately.
+                            let _ = self.state_tx.send(state.clone());
+                        }
                     }
                     Command::SendTotpCode(code) => {
                         if let Some(ref addr) = server_addr {
@@ -330,6 +445,7 @@ impl ClientEngine {
                         rx2_volume_synced = false;
                         state.rx_af_gain = 0;
                         state.connected = false;
+                        state.connect_status = crate::state::ConnectStatus::Disconnected;
                         state.rtt_ms = 0;
                         state.jitter_ms = 0.0;
                         state.buffer_depth = 0;
@@ -1284,6 +1400,73 @@ impl ClientEngine {
                             last_hb_ack_time = Some(Instant::now());
 
                             state.rtt_ms = last_hb_ack_rtt;
+
+                            // PATCH-1 review finding (B3): only trust state_flags
+                            // when the server explicitly advertises REPORTS_STATE_FLAGS.
+                            // Old servers (pre-PATCH-1, e.g. v2.0.0 release tag) leave
+                            // both capabilities and state_flags at NONE — interpreting
+                            // an absent flag as "TCI down" would false-positive against
+                            // a perfectly-working old server.
+                            let server_reports_state_flags = ack.capabilities.has(
+                                sdr_remote_core::protocol::Capabilities::REPORTS_STATE_FLAGS,
+                            );
+                            if server_reports_state_flags {
+                                let tci_up = ack.state_flags.has(
+                                    sdr_remote_core::protocol::ServerStateFlags::TCI_CONNECTED,
+                                );
+                                let thetis_proc_running = ack.state_flags.has(
+                                    sdr_remote_core::protocol::ServerStateFlags::THETIS_RUNNING,
+                                );
+                                // PATCH-1 owner-feedback (2026-05-13): suppress TciUnreachable
+                                // while the server is in the launch phase (orange Start button).
+                                // Showing "TCI not reachable" during the normal 60s startup
+                                // grace period is wrong — the launch is still in progress.
+                                let thetis_starting_now = ack.state_flags.has(
+                                    sdr_remote_core::protocol::ServerStateFlags::THETIS_STARTING,
+                                );
+                                if matches!(
+                                    state.connect_status,
+                                    crate::state::ConnectStatus::Connected
+                                ) {
+                                    if !tci_up && !thetis_starting_now {
+                                        if let Some(ref addr) = server_addr {
+                                            state.connect_status =
+                                                crate::state::ConnectStatus::Failed(
+                                                    crate::state::ConnectError::TciUnreachable {
+                                                        server_addr: addr.clone(),
+                                                        server_reported_detail: None,
+                                                        thetis_process_running: Some(thetis_proc_running),
+                                                    },
+                                                );
+                                        }
+                                    }
+                                } else if matches!(
+                                    state.connect_status,
+                                    crate::state::ConnectStatus::Failed(
+                                        crate::state::ConnectError::TciUnreachable { .. }
+                                    )
+                                ) {
+                                    // Recover to Connected if TCI is up OR Thetis is in the
+                                    // middle of launching (transient — wait for the launch
+                                    // to either succeed or timeout before complaining).
+                                    if tci_up || thetis_starting_now {
+                                        state.connect_status =
+                                            crate::state::ConnectStatus::Connected;
+                                    } else {
+                                        // Still TciUnreachable; refresh the thetis_process_running
+                                        // hint so the UI text follows the latest server state.
+                                        if let crate::state::ConnectStatus::Failed(
+                                            crate::state::ConnectError::TciUnreachable {
+                                                thetis_process_running: ref mut tpr,
+                                                ..
+                                            },
+                                        ) = state.connect_status
+                                        {
+                                            *tpr = Some(thetis_proc_running);
+                                        }
+                                    }
+                                }
+                            }
                             if let Some(ref addr) = server_addr {
                                 if !was_connected {
                                     info!("Connected to server (rtt={}ms, ring={})", rtt, audio.playback_buffer_level());
@@ -1899,25 +2082,45 @@ impl ClientEngine {
                             } else {
                                 warn!("Auth challenge received but no password configured");
                                 state.auth_rejected = true;
+                                state.connect_status = crate::state::ConnectStatus::Failed(
+                                    crate::state::ConnectError::WrongPassword,
+                                );
                             }
                         }
                         Ok(Packet::AuthResult(result)) => {
+                            // PATCH-1: phase-based classification of AUTH_REJECTED.
+                            // - If we hadn't yet been told "TOTP required" → reject = WrongPassword
+                            // - If we had been told TOTP required and just submitted a code → reject = WrongTotp
+                            // `state.totp_required` at this moment functions as the phase indicator.
+                            let was_in_totp_phase = state.totp_required;
                             match result {
                                 sdr_remote_core::protocol::AUTH_ACCEPTED => {
                                     info!("Auth accepted");
                                     _auth_completed = true;
                                     state.auth_rejected = false;
                                     state.totp_required = false;
+                                    state.connect_status = crate::state::ConnectStatus::Connected;
                                 }
                                 sdr_remote_core::protocol::AUTH_TOTP_REQUIRED => {
                                     info!("Password OK, TOTP required");
                                     state.auth_rejected = false;
                                     state.totp_required = true;
+                                    state.connect_status =
+                                        crate::state::ConnectStatus::AwaitingTotp;
                                 }
                                 _ => {
                                     warn!("Auth rejected");
                                     state.auth_rejected = true;
                                     _auth_completed = false;
+                                    state.connect_status = if was_in_totp_phase {
+                                        crate::state::ConnectStatus::Failed(
+                                            crate::state::ConnectError::WrongTotp,
+                                        )
+                                    } else {
+                                        crate::state::ConnectStatus::Failed(
+                                            crate::state::ConnectError::WrongPassword,
+                                        )
+                                    };
                                 }
                             }
                         }
@@ -1935,6 +2138,7 @@ impl ClientEngine {
                             rx2_volume_synced = false;
                             state.rx_af_gain = 0;
                             state.connected = false;
+                            state.connect_status = crate::state::ConnectStatus::Disconnected;
                             state.rtt_ms = 0;
                             state.jitter_ms = 0.0;
                             state.buffer_depth = 0;
@@ -1945,9 +2149,47 @@ impl ClientEngine {
                             state.full_spectrum_sequence = 0;
                         }
                         Err(e) => {
+                            // PATCH-1 review finding (B1, parts 2 + 3):
+                            // distinguish protocol-version mismatch from generic
+                            // malformed bytes, but only during the connect phase —
+                            // during a normal session we just log and keep running
+                            // (single bad packet is not fatal).
+                            let is_connecting = matches!(
+                                state.connect_status,
+                                crate::state::ConnectStatus::Connecting
+                            );
+                            if is_connecting {
+                                let server_addr_str =
+                                    server_addr.clone().unwrap_or_default();
+                                if data.len() >= 2
+                                    && data[0] == sdr_remote_core::protocol::MAGIC
+                                    && data[1] != sdr_remote_core::protocol::VERSION
+                                {
+                                    state.connect_status =
+                                        crate::state::ConnectStatus::Failed(
+                                            crate::state::ConnectError::ProtocolVersionMismatch {
+                                                server_version: data[1],
+                                                client_version:
+                                                    sdr_remote_core::protocol::VERSION,
+                                            },
+                                        );
+                                } else {
+                                    state.connect_status =
+                                        crate::state::ConnectStatus::Failed(
+                                            crate::state::ConnectError::MalformedResponse {
+                                                addr: server_addr_str,
+                                                detail: format!("{}", e),
+                                            },
+                                        );
+                                }
+                            }
                             warn!("Invalid packet ({}B): {}", len, e);
                         }
                     }
+
+                    // PATCH-1: any reply (even a bad one) means the server-port replied —
+                    // useful for distinguishing "wrong bytes" from "no reply at all".
+                    connect_any_reply_seen = true;
 
                     let _ = self.state_tx.send(state.clone());
                 }
@@ -2431,6 +2673,33 @@ impl ClientEngine {
                         hb.serialize(&mut buf);
                         let _ = socket.send_to(&buf, addr.as_str()).await;
                         last_hb_sent = Instant::now();
+
+                        // PATCH-1 review finding (B1, part 4): NoUdpResponse
+                        // watchdog. If we've been "Connecting" for longer than the
+                        // timeout and have never seen any reply from the server,
+                        // surface a precise error instead of leaving the UI in an
+                        // indefinite "Connecting…" state.
+                        if matches!(
+                            state.connect_status,
+                            crate::state::ConnectStatus::Connecting
+                        ) && !connect_any_reply_seen
+                        {
+                            if let Some(started) = connect_started_at {
+                                if started.elapsed()
+                                    >= std::time::Duration::from_secs(
+                                        connect_timeout_secs as u64,
+                                    )
+                                {
+                                    state.connect_status =
+                                        crate::state::ConnectStatus::Failed(
+                                            crate::state::ConnectError::NoUdpResponse {
+                                                addr: addr.clone(),
+                                                timeout_secs: connect_timeout_secs,
+                                            },
+                                        );
+                                }
+                            }
+                        }
                     }
 
                     if ptt != last_ptt {

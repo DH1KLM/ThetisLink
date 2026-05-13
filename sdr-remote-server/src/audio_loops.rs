@@ -69,6 +69,8 @@ pub async fn tci_multichannel_audio_loop(
     mut bin_r_audio_rx: Option<tokio::sync::mpsc::Receiver<Vec<f32>>>,
     shutdown: &mut watch::Receiver<bool>,
     start: Instant,
+    audio_stats: Arc<crate::audio_stats::AudioActivityStats>,
+    server_start: Instant,
 ) -> Result<()> {
     let tci_rate = 48000u32;
     let tci_frame_samples = (tci_rate * 20 / 1000) as usize; // 960
@@ -181,6 +183,7 @@ pub async fn tci_multichannel_audio_loop(
                 if rx1_i16.len() >= FRAME_SAMPLES {
                     if let Ok(opus) = enc_rx1.encode(&rx1_i16[..FRAME_SAMPLES]) {
                         channels.push((0, opus)); // CH_RX1
+                        audio_stats.rx1.tick(server_start);
                     }
                 }
 
@@ -204,6 +207,7 @@ pub async fn tci_multichannel_audio_loop(
                     if i16s.len() >= FRAME_SAMPLES {
                         if let Ok(opus) = enc_rx2.encode(&i16s[..FRAME_SAMPLES]) {
                             channels.push((2, opus)); // CH_RX2
+                            audio_stats.rx2.tick(server_start);
                         }
                     }
                 }
@@ -219,25 +223,42 @@ pub async fn tci_multichannel_audio_loop(
                 // Send per-client filtered multi-channel packets
                 if !channels.is_empty() {
                     let timestamp = start.elapsed().as_millis() as u32;
-                    // Read per-client modes under short lock, then release
-                    let client_modes: Vec<(std::net::SocketAddr, u8)> = {
+                    // Read per-client modes + rx2_enabled flag under short
+                    // lock, then release. `rx2_enabled` gates CH2 even when
+                    // `audio_mode` would otherwise allow it — the desktop
+                    // client UI's "RX2 enabled" toggle must mute the
+                    // upstream RX2 stream entirely, not just the local
+                    // playback (bandwidth bug uncovered 2026-05-13).
+                    let client_modes: Vec<(std::net::SocketAddr, u8, bool)> = {
                         let sess = session.lock().await;
-                        addrs.iter().map(|&a| (a, sess.client_audio_mode(a))).collect()
+                        addrs
+                            .iter()
+                            .map(|&a| (a, sess.client_audio_mode(a), sess.client_rx2_enabled(a)))
+                            .collect()
                     };
 
-                    for (addr, mode) in &client_modes {
-                        // Filter channels based on client's audio mode
+                    for (addr, mode, rx2_enabled) in &client_modes {
+                        // Filter channels based on client's audio mode.
+                        // Then drop CH2 (RX2) for clients that have RX2
+                        // turned off — those bytes would otherwise reach
+                        // the client and be silently mixed into mono
+                        // output (or burn data on metered links).
                         // mode 255 (default/Android): CH0 only
-                        // mode 0 (Mono): CH0 + CH2
-                        // mode 1 (BIN): CH0 + CH1 + CH2
-                        // mode 2 (Split): CH0 + CH2
+                        // mode 0 (Mono): CH0 + CH2  (gated by rx2_enabled)
+                        // mode 1 (BIN): CH0 + CH1 + CH2  (CH2 gated)
+                        // mode 2 (Split): CH0 + CH2  (CH2 gated)
                         let client_chs: Vec<(u8, Vec<u8>)> = channels.iter()
-                            .filter(|(ch_id, _)| match *mode {
-                                255 => *ch_id == 0,                    // Android: RX1 only
-                                0 => *ch_id == 0 || *ch_id == 2,      // Mono: RX1 + RX2
-                                1 => true,                             // BIN: all
-                                2 => *ch_id == 0 || *ch_id == 2,      // Split: RX1 + RX2
-                                _ => *ch_id == 0,
+                            .filter(|(ch_id, _)| {
+                                let allowed = match *mode {
+                                    255 => *ch_id == 0,                    // Android: RX1 only
+                                    0 => *ch_id == 0 || *ch_id == 2,      // Mono: RX1 + RX2
+                                    1 => true,                             // BIN: all
+                                    2 => *ch_id == 0 || *ch_id == 2,      // Split: RX1 + RX2
+                                    _ => *ch_id == 0,
+                                };
+                                if !allowed { return false; }
+                                if *ch_id == 2 && !rx2_enabled { return false; }
+                                true
                             })
                             .cloned()
                             .collect();
@@ -274,6 +295,8 @@ pub async fn yaesu_audio_loop(
     sample_rate: u32,
     shutdown: &mut watch::Receiver<bool>,
     start: Instant,
+    audio_stats: Arc<crate::audio_stats::AudioActivityStats>,
+    server_start: Instant,
 ) -> Result<()> {
     let frame_samples = (sample_rate * 20 / 1000) as usize;
 
@@ -362,6 +385,7 @@ pub async fn yaesu_audio_loop(
                     for &addr in &addrs {
                         let _ = socket.send_to(&send_buf, addr).await;
                     }
+                    audio_stats.yaesu_rx.tick(server_start);
                 }
             }
             _ = shutdown.changed() => break,
