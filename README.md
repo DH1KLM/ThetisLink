@@ -1,8 +1,8 @@
 # ThetisLink
 
-> **Current release: [v2.0.1](https://github.com/cjenschede/ThetisLink/releases/tag/v2.0.1)** —
+> **Current release: [v2.0.2](https://github.com/cjenschede/ThetisLink/releases/tag/v2.0.2)** —
 > single TCI WebSocket transport, wire-protocol VERSION = 2 (breaking change
-> from v0.x). Download `ThetisLink-2.0.1.zip` from the
+> from v0.x). Download `ThetisLink-2.0.2.zip` from the
 > [Releases page](https://github.com/cjenschede/ThetisLink/releases) — the ZIP
 > contains both Windows binaries, the Android APK, all six PDF manuals,
 > `LICENSE` and `SHA256SUMS.txt`. SBOM and third-party license artefacts are
@@ -43,7 +43,7 @@ ThetisLink talks to the radio through Thetis. It targets **Thetis v2.10.3.15**
 (the latest official release by ramdor) and works with stock Thetis out of the
 box. Optionally use the [PA3GHM Thetis fork](https://github.com/cjenschede/Thetis/tree/thetislink-tl2)
 (branch `thetislink-tl2`) for the additional `_ex` TCI extensions used by
-ThetisLink v2.0.1 (capability broadcast, per-RX filter preset, diversity
+ThetisLink v2.0.2 (capability broadcast, per-RX filter preset, diversity
 control suite, server-side DDC recenter, relaxed IQ-stream rate cap). All
 extensions are gated behind the **ThetisLink extensions** checkbox in Setup
 > Network > IQ Stream; with the checkbox unchecked the fork behaves like

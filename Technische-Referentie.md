@@ -4,7 +4,7 @@
 
 ThetisLink is een systeem voor het op afstand bedienen van een ANAN 7000DLE + Thetis SDR-ontvanger en een Yaesu FT-991A transceiver via een netwerkverbinding. Het biedt bidirectionele real-time audio streaming, PTT-bediening, DDC spectrum/waterfall display, volledige RX2/VFO-B ondersteuning, diversity, Yaesu memory channel management en radio settings editor over UDP met Opus codec.
 
-**Versie:** v2.0.1 (gedeeld versienummer in `sdr-remote-core::VERSION`)
+**Versie:** v2.0.2 (gedeeld versienummer in `sdr-remote-core::VERSION`)
 **Ontwikkeltaal:** Rust + Kotlin (Android UI)
 **Doelplatform:** Windows 10/11, macOS (Intel/Apple Silicon), Android 8+ (arm64)
 **Ontwerpprioriteit:** latency > bandbreedte > features
@@ -26,9 +26,13 @@ Alle uitbreidingen zitten achter de **"ThetisLink extensions"** checkbox in Setu
 De standaard IQ sample rate is 384 kHz. Met ThetisLink extensions kan de gebruiker kiezen uit: 48, 96, 192, 384, 768 of **1536 kHz** — selecteerbaar per receiver via de DDC sample rate dropdown in de client.
 
 **Repos:**
-- ThetisLink: [cjenschede/ThetisLink](https://github.com/cjenschede/ThetisLink) (publieke release repo, tag `v2.0.1`)
+- ThetisLink: [cjenschede/ThetisLink](https://github.com/cjenschede/ThetisLink) (publieke release repo, tag `v2.0.2`)
 - Thetis fork: [cjenschede/Thetis](https://github.com/cjenschede/Thetis) (branch `thetislink-tl2`)
 - Origineel Thetis: [ramdor/Thetis](https://github.com/ramdor/Thetis)
+
+### v2.0.2 highlights
+
+Hotfix release. `TciConnection::handle_notification` logde elke `DiversityPhaseEx`, `DiversityGainEx` en `DiversityGainMultiEx` notification op INFO. Thetis pusht deze elke diversity-tick (~10-20 Hz) ongeacht of de waarde verandert, waardoor de server-log honderdduizenden identieke regels per sessie verzamelde (~650k voor een meer-uren run). De drie notification-handlers vergelijken nu de inkomende waarde met de gecachte; alleen bij een echte edge wordt INFO geëmit — onveranderde pushes gaan naar debug (onderdrukt op default log-level). State-propagatie, broadcasts en wire-protocol identiek; pure logging-niveau fix. Volledig interoperabel met v2.0.0 / v2.0.1.
 
 ### v2.0.1 highlights
 
@@ -66,7 +70,7 @@ De v2.0.0 release is een grote stap ten opzichte van de v0.x-lijn. Belangrijkste
 
 ## 2. Architectuur
 
-ThetisLink v2.0.1 gebruikt één enkele TCI WebSocket verbinding naar Thetis voor audio, IQ en alle radio-commando's. Met de PA3GHM fork breiden de aanvullende `_ex` commando's het oppervlak uit (CTUN auto-recenter, diversity, per-RX DDC sample rate). Tegen zowel stock v2.10.3.15 als de fork is geen parallelle CAT-verbinding meer nodig.
+ThetisLink v2.0.2 gebruikt één enkele TCI WebSocket verbinding naar Thetis voor audio, IQ en alle radio-commando's. Met de PA3GHM fork breiden de aanvullende `_ex` commando's het oppervlak uit (CTUN auto-recenter, diversity, per-RX DDC sample rate). Tegen zowel stock v2.10.3.15 als de fork is geen parallelle CAT-verbinding meer nodig.
 
 ```mermaid
 flowchart LR
@@ -712,7 +716,7 @@ TCI (Transceiver Control Interface) is een WebSocket-gebaseerd protocol ingebouw
 
 ### Stock vs fork TCI sub-protocol
 
-ThetisLink v2.0.1 praat TCI met zowel **stock Thetis v2.10.3.15** als de **PA3GHM fork (TL2-1)**. Het basisprotocol is identiek — maar de fork voegt een `_ex` extensielaag toe die ThetisLink gebruikt wanneer beschikbaar.
+ThetisLink v2.0.2 praat TCI met zowel **stock Thetis v2.10.3.15** als de **PA3GHM fork (TL2-1)**. Het basisprotocol is identiek — maar de fork voegt een `_ex` extensielaag toe die ThetisLink gebruikt wanneer beschikbaar.
 
 **Capability-negotiation:** bij verbinden vraagt de client `tci_caps_ex;` op. Met de fork (en de "ThetisLink extensions" Setup-checkbox aan) antwoordt Thetis met een lijst van ondersteunde `_ex` capabilities (`auto_recenter_ex`, `rx_filter_preset_ex`, `ddc_sample_rate_ex`, `diversity_ex`, ...). Stock Thetis implementeert `tci_caps_ex` niet en het verzoek timet uit → ThetisLink valt terug op stock-mode gedrag.
 
@@ -820,7 +824,7 @@ TCI binary header: 16 x u32 = 64 bytes. Stream type op offset 24, sample format 
 
 Eerdere ThetisLink versies (≤ v1.x) gebruikten een parallelle TCP CAT-verbinding naast TCI voor commando's die TCI niet ondersteunde. **ThetisLink v2.0.0 heeft het CAT-pad volledig verwijderd** — alle radio-besturing loopt via de enkele TCI WebSocket uit §9. De ZZ-commando lijst hieronder blijft staan als Thetis-CAT-referentie voor gebruikers die externe CAT-clients (logging-software, N1MM, etc.) direct aan de Thetis CAT-server koppelen (Thetis Setup → Serial/Network/Midi CAT → Network → TCP/IP CAT Server).
 
-| ZZ commando | TCI-tegenhanger gebruikt door ThetisLink v2.0.1 |
+| ZZ commando | TCI-tegenhanger gebruikt door ThetisLink v2.0.2 |
 |-------------|-------------------------------------------------|
 | `ZZLA` / `ZZLB` (RX1/RX2 AF volume) | `volume` / `rx_volume:1,...` |
 | `ZZBY` (shutdown) | `run_cat_ex:ZZBY;` (alleen server-initiated) |
@@ -837,7 +841,7 @@ Eerdere ThetisLink versies (≤ v1.x) gebruikten een parallelle TCP CAT-verbindi
 | `ZZFL`/`ZZFH` / `ZZFS`/`ZZFR` (filter low/high) | `rx_filter_band:0/1,low,high;` |
 | `ZZVS2` (VFO swap) | `vfo_swap_ex;` (stock-supported, geen cap geadverteerd) |
 
-De enige CAT-achtige escape-hatch in v2.0.1 is `run_cat_ex:<ZZ-cmd>;` over TCI: dit is een TCI-only relay die Thetis vraagt een ZZ-commando uit te voeren op de eigen interne CAT-parser (response komt terug via TCI). Door de server gebruikt voor specifieke operaties zoals `ZZCN0/ZZCN1` (CTUN auto-recenter) en `ZZBY` (Thetis shutdown).
+De enige CAT-achtige escape-hatch in v2.0.2 is `run_cat_ex:<ZZ-cmd>;` over TCI: dit is een TCI-only relay die Thetis vraagt een ZZ-commando uit te voeren op de eigen interne CAT-parser (response komt terug via TCI). Door de server gebruikt voor specifieke operaties zoals `ZZCN0/ZZCN1` (CTUN auto-recenter) en `ZZBY` (Thetis shutdown).
 
 ---
 

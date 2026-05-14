@@ -1,4 +1,4 @@
-﻿# ThetisLink v2.0.1 — Gebruikershandleiding
+﻿# ThetisLink v2.0.2 — Gebruikershandleiding
 
 ## Inhoudsopgave
 
@@ -47,7 +47,7 @@ ThetisLink wordt gedistribueerd als een zip bestand met de volgende inhoud:
 |---------|-------------|
 | `ThetisLink-Server.exe` | Server executable (Windows) |
 | `ThetisLink-Client.exe` | Desktop client executable |
-| `ThetisLink-2.0.1.apk` | Android client app |
+| `ThetisLink-2.0.2.apk` | Android client app |
 | `Installatie.pdf` | Installatiehandleiding (Nederlands) |
 | `User-Manual.pdf` | Gebruikershandleiding (Nederlands, dit document) |
 | `Technische-Referentie.pdf` | Technische referentie (Nederlands) |
@@ -91,7 +91,7 @@ flowchart TB
     Server <--> Yaesu[Yaesu FT-991A<br>COM + USB Audio]
 ```
 
-Alle audio (RX/TX), IQ spectrum data en besturing gaan via één enkele TCI WebSocket verbinding. ThetisLink v2.0.1 gebruikt geen aparte CAT TCP verbinding — TCI dekt alle benodigde commando's, zowel met stock Thetis v2.10.3.15 als met de PA3GHM fork. Geen VB-Cable of andere drivers nodig.
+Alle audio (RX/TX), IQ spectrum data en besturing gaan via één enkele TCI WebSocket verbinding. ThetisLink v2.0.2 gebruikt geen aparte CAT TCP verbinding — TCI dekt alle benodigde commando's, zowel met stock Thetis v2.10.3.15 als met de PA3GHM fork. Geen VB-Cable of andere drivers nodig.
 
 ---
 
@@ -598,7 +598,8 @@ Als het spectrum (lijn) en de waterval niet synchroon lopen bij het pannen, hers
 
 | Versie | Hoogtepunten |
 |---|---|
-| **2.0.1** | **Connect-ervaring release:** first-run 4-stappen setup-wizard (Vind server → Wachtwoord → 2FA → Verbonden), mDNS local-network discovery (auto-vind servers op hetzelfde WiFi/LAN), 9 gedifferentieerde connect-states met platform-bewuste NL/EN hints, server Status-paneel (bind-adres, TCI-status, actieve clients met RTT/loss/jitter, audio-routing chips, recente connect-pogingen), slimme TciUnreachable hint (weet of Thetis draait, opstart of gestopt is), server-side RX2 audio-filter fix (geen fantoom CH2-stream meer als RX2 uit staat), Setup-wizard opnieuw starten knop. Wire-protocol ongewijzigd (VERSION = 2) — volledig interoperabel met 2.0.0. |
+| **2.0.2** | **Log-spam hotfix:** server-side `DiversityPhaseEx`, `DiversityGainEx` en `DiversityGainMultiEx` notifications loggen nu alleen INFO bij echte value-change. Thetis pusht deze elke diversity-tick (~10-20 Hz), waardoor het server-log per sessie honderdduizenden regels telde. Functioneel gedrag en wire-protocol ongewijzigd — volledig interoperabel met v2.0.0 / v2.0.1. |
+| 2.0.1 | **Connect-ervaring release:** first-run 4-stappen setup-wizard (Vind server → Wachtwoord → 2FA → Verbonden), mDNS local-network discovery (auto-vind servers op hetzelfde WiFi/LAN), 9 gedifferentieerde connect-states met platform-bewuste NL/EN hints, server Status-paneel (bind-adres, TCI-status, actieve clients met RTT/loss/jitter, audio-routing chips, recente connect-pogingen), slimme TciUnreachable hint (weet of Thetis draait, opstart of gestopt is), server-side RX2 audio-filter fix (geen fantoom CH2-stream meer als RX2 uit staat), Setup-wizard opnieuw starten knop. Wire-protocol ongewijzigd (VERSION = 2) — volledig interoperabel met 2.0.0. |
 | 2.0.0 | **TL2 release:** Yaesu auto-DFM PTT-toggle (FM ↔ DATA-FM met memory-restore), server-side CTUN auto-recenter, live diversity null-circle broadcast (Smart/Ultra), filter-preset push (F1..VAR2/NONE), per-RX DDC sample rate (48..1536 kHz), `tci_caps_ex` capability broadcast, DX cluster click-to-tune, SWR display in TX meter, CW keyer + macros over TCI, single-TCI-only architectuur (geen aparte CAT meer), wire-protocol VERSION = 2 |
 | 1.0.0 | Eerste publieke release op `cjenschede/ThetisLink` |
 | 0.5.0 | Yaesu FT-991A ondersteuning, Bluetooth headset (Android), diversity ontvangst fix, TCI besturingselementen, RF2K-S reset, PTT modi, DX Cluster |

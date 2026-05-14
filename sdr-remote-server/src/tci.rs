@@ -1092,13 +1092,33 @@ impl TciConnection {
                 info!("TCI: Diversity source = {}", source);
             }
             TciNotification::DiversityGainEx { receiver, gain } => {
-                if receiver == 0 { self.diversity_gain_rx1 = gain; }
-                else { self.diversity_gain_rx2 = gain; }
-                info!("TCI: Diversity gain RX{} = {}", receiver + 1, gain);
+                // Thetis pushes this on every diversity tick (~10-20 Hz),
+                // not just on change. Only log INFO on a real edge to keep
+                // the log usable; intermediate same-value pushes go to
+                // debug (suppressed at the default log level).
+                let changed = if receiver == 0 {
+                    let prev = self.diversity_gain_rx1;
+                    self.diversity_gain_rx1 = gain;
+                    prev != gain
+                } else {
+                    let prev = self.diversity_gain_rx2;
+                    self.diversity_gain_rx2 = gain;
+                    prev != gain
+                };
+                if changed {
+                    info!("TCI: Diversity gain RX{} = {}", receiver + 1, gain);
+                } else {
+                    log::debug!("TCI: Diversity gain RX{} = {} (unchanged)", receiver + 1, gain);
+                }
             }
             TciNotification::DiversityGainMultiEx { multi } => {
+                let prev = self.diversity_gain_multi;
                 self.diversity_gain_multi = multi;
-                info!("TCI: Diversity GainMulti = {} (= {:.2}x)", multi, (multi as f32) / 100.0);
+                if prev != multi {
+                    info!("TCI: Diversity GainMulti = {} (= {:.2}x)", multi, (multi as f32) / 100.0);
+                } else {
+                    log::debug!("TCI: Diversity GainMulti = {} (unchanged)", multi);
+                }
             }
             TciNotification::DdcSampleRateEx { receiver, rate_hz } => {
                 // TL2-1 fork per-RX echo. Overrides whatever the global iq_samplerate
@@ -1109,8 +1129,13 @@ impl TciConnection {
                 info!("TCI: ddc_sample_rate_ex RX{} = {} Hz", receiver + 1, rate_hz);
             }
             TciNotification::DiversityPhaseEx { phase } => {
+                let prev = self.diversity_phase;
                 self.diversity_phase = phase;
-                info!("TCI: Diversity phase = {}", phase);
+                if prev != phase {
+                    info!("TCI: Diversity phase = {}", phase);
+                } else {
+                    log::debug!("TCI: Diversity phase = {} (unchanged)", phase);
+                }
             }
             TciNotification::RxAudio { .. } | TciNotification::IqStream { .. } => {
                 // These are routed directly to their channels by the reader task
