@@ -99,6 +99,10 @@ pub struct StatusPanelShared {
     /// pre-bind default ("0.0.0.0:4580 starting…"), so a bind-fail is not
     /// papered over with a green-looking address line.
     pub bind_status: Arc<std::sync::OnceLock<BindStatus>>,
+    /// Live `Tuners` collection — published once after `Tuners::new` so the
+    /// Status panel can render per-tuner rows (Live yellow voltage,
+    /// threshold + hysteresis sliders) without needing a separate channel.
+    pub tuners_slot: Arc<std::sync::OnceLock<Arc<crate::tuner::Tuners>>>,
 }
 
 /// Outcome of the UDP bind attempt — surfaced in the Status panel.
@@ -116,6 +120,7 @@ impl StatusPanelShared {
             session_slot: Arc::new(std::sync::OnceLock::new()),
             server_start: Instant::now(),
             bind_status: Arc::new(std::sync::OnceLock::new()),
+            tuners_slot: Arc::new(std::sync::OnceLock::new()),
         }
     }
 }

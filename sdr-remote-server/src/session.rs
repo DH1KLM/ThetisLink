@@ -37,23 +37,36 @@ pub enum ConnectOutcome {
     /// Useful diagnostic ("is anything reaching the server?")
     /// even when no AuthResponse follows.
     ChallengeSent,
+    /// Magic byte matched but the wire-protocol version did not — typically
+    /// an outdated client (e.g. v2.0.2 APK against a build-58+ server).
+    /// Without this entry the rejection is logged only and the owner cannot
+    /// see in the Status panel that an old client is trying to reconnect.
+    ProtocolVersionMismatch { client_version: u8 },
 }
 
 impl ConnectOutcome {
     /// Short display label for the Status panel (English; UI is dev-tooling
     /// for the owner, no i18n needed here).
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> String {
         match self {
-            ConnectOutcome::Accepted => "Accepted",
-            ConnectOutcome::TotpRequired => "2FA required",
-            ConnectOutcome::WrongPassword => "Wrong password",
-            ConnectOutcome::WrongTotp => "Wrong 2FA",
-            ConnectOutcome::ChallengeSent => "Challenge sent",
+            ConnectOutcome::Accepted => "Accepted".into(),
+            ConnectOutcome::TotpRequired => "2FA required".into(),
+            ConnectOutcome::WrongPassword => "Wrong password".into(),
+            ConnectOutcome::WrongTotp => "Wrong 2FA".into(),
+            ConnectOutcome::ChallengeSent => "Challenge sent".into(),
+            ConnectOutcome::ProtocolVersionMismatch { client_version } => {
+                format!("Wrong protocol (client v{})", client_version)
+            }
         }
     }
 
     pub fn is_failure(self) -> bool {
-        matches!(self, ConnectOutcome::WrongPassword | ConnectOutcome::WrongTotp)
+        matches!(
+            self,
+            ConnectOutcome::WrongPassword
+                | ConnectOutcome::WrongTotp
+                | ConnectOutcome::ProtocolVersionMismatch { .. }
+        )
     }
 }
 
@@ -154,6 +167,9 @@ pub struct ClientSession {
     /// false=default (smear-vrij gegarandeerd, zoom-min 2x). true=opt-in (zoom 1x toegestaan).
     /// Server enforces strictest: zolang één client false heeft, server-zoom-min = 2x.
     pub allow_zoom_below_2x: bool,
+    /// S-meter source-subscription bitmap (see `ControlId::SmeterSources` doc).
+    /// Default 0x22 = RX1 Avg + RX2 Avg — matches pre-multi-source behaviour.
+    pub smeter_sources: u16,
 }
 
 /// Result of touching a session
@@ -289,6 +305,7 @@ impl SessionManager {
             rx2_spectrum_max_bins: sdr_remote_core::DEFAULT_SPECTRUM_BINS as u16,
             vfo_sync: false, yaesu_enabled: false, audio_mode: 255,
             allow_zoom_below_2x: false,
+            smeter_sources: 0x22,
         });
         info!("Auth challenge sent to {}", addr);
         nonce
@@ -385,6 +402,7 @@ impl SessionManager {
                 yaesu_enabled: false,
                 audio_mode: 255, // default: CH0 only until client sends AudioMode
                 allow_zoom_below_2x: false,
+                smeter_sources: 0x22,
             });
             TouchResult::NewClient
         }
@@ -529,6 +547,19 @@ impl SessionManager {
         if let Some(session) = self.clients.get_mut(&addr) {
             session.yaesu_enabled = enabled;
         }
+    }
+
+    /// Set the S-meter source-subscription bitmap for a client.
+    /// See `ControlId::SmeterSources` for bit layout.
+    pub fn set_smeter_sources(&mut self, addr: SocketAddr, mask: u16) {
+        if let Some(session) = self.clients.get_mut(&addr) {
+            session.smeter_sources = mask;
+        }
+    }
+
+    /// Get a client's S-meter source-subscription bitmap (0x22 if unknown).
+    pub fn smeter_sources(&self, addr: SocketAddr) -> u16 {
+        self.clients.get(&addr).map(|s| s.smeter_sources).unwrap_or(0x22)
     }
 
     pub fn client_audio_mode(&self, addr: SocketAddr) -> u8 {
@@ -753,6 +784,7 @@ mod tests {
             rx2_spectrum_max_bins: 256,
             vfo_sync: false, yaesu_enabled: false, audio_mode: 255,
             allow_zoom_below_2x: allow,
+            smeter_sources: 0x22,
         }
     }
 

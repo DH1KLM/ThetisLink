@@ -57,7 +57,7 @@ fun SpectrumPlot(
     filterHighHz: Int,
     refDb: Float,
     rangeDb: Float,
-    smeter: Int,
+    smeter: Float,
     transmitting: Boolean,
     otherTx: Boolean,
     dxSpots: List<DxSpotInfo> = emptyList(),
@@ -327,15 +327,16 @@ fun SpectrumPlot(
             }
         }
 
-        // ── S-meter overlay (top-right) ─────────────────────────────────────
+        // ── S-meter overlay (top-right) — `smeter` is dBm in RX, watts in TX
         val meterText = if (otherTx) {
-            "TX: ${smeter / 10}W"
+            "TX: ${smeter.toInt()}W"
         } else if (transmitting) {
-            "TX: ${smeter / 10}W"
-        } else if (smeter <= 108) {
-            "S${smeter / 12}"
+            "TX: ${smeter.toInt()}W"
+        } else if (smeter <= -73f) {
+            val sUnit = ((smeter + 127f) / 6f).toInt().coerceIn(0, 9)
+            "S$sUnit"
         } else {
-            val dbOver = ((smeter - 108f) * 60f / 152f).toInt()
+            val dbOver = (smeter + 73f).toInt().coerceAtLeast(0)
             "S9+${dbOver}dB"
         }
         val meterPaint = Paint().apply {

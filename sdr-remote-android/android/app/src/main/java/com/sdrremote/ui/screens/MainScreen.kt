@@ -169,6 +169,8 @@ fun MainScreen(viewModel: SdrViewModel = viewModel()) {
     // TL2-1 ctun-auto-recenter setup-vink "Allow zoom below 2x".
     // Default uit (zoom-min 2x; smear-vrij gegarandeerd via auto-recenter feature).
     val allowZoomBelow2xState = rememberSaveable { mutableStateOf(prefs.getBoolean("allow_zoom_below_2x", false)) }
+    // S-meter source: 0=Sig, 1=Avg (default), 2=MaxBin. Same choice for RX1+RX2.
+    val smeterSourceState = rememberSaveable { mutableStateOf(prefs.getInt("smeter_source", 1)) }
     val waterfallRingBuffer = remember { com.sdrremote.ui.components.WaterfallRingBuffer(100) }
 
     // TL2-1 ctun-auto-recenter: push allow_zoom_below_2x state naar server bij elke
@@ -177,6 +179,16 @@ fun MainScreen(viewModel: SdrViewModel = viewModel()) {
     LaunchedEffect(state.connected) {
         if (state.connected) {
             viewModel.setControl(0x63, if (allowZoomBelow2xState.value) 1 else 0)
+            // Push S-meter source subscription too — server's per-client session
+            // resets to default 0x22 (Avg) on every new session, so we restore
+            // the user's saved choice after auth completes.
+            val mask = when (smeterSourceState.value) {
+                0 -> 0x11
+                1 -> 0x22
+                2 -> 0x44
+                else -> 0x22
+            }
+            viewModel.setControl(0x64, mask)
         }
     }
 
@@ -193,7 +205,7 @@ fun MainScreen(viewModel: SdrViewModel = viewModel()) {
     }
 
     // Auto ref level
-    var autoRefEnabled by rememberSaveable { mutableStateOf(prefs.getBoolean("auto_ref_enabled", false)) }
+    var autoRefEnabled by rememberSaveable { mutableStateOf(prefs.getBoolean("auto_ref_enabled", true)) }
     var autoRefValue by remember { mutableFloatStateOf(spectrumRefState.floatValue) }
     var autoRefFrames by remember { mutableIntStateOf(0) }
     var autoRefInitialized by remember { mutableStateOf(false) }
@@ -476,6 +488,18 @@ fun MainScreen(viewModel: SdrViewModel = viewModel()) {
             onAudioModeChange = { viewModel.setAudioMode(com.sdrremote.service.AudioRouting.Mode.entries[it]) },
             txProfileNames = state.txProfileNames,
             onTxProfileChange = { viewModel.setControl(0x03, it) },
+            smeterSource = smeterSourceState.value,
+            onSmeterSourceChange = { src ->
+                smeterSourceState.value = src
+                prefs.edit().putInt("smeter_source", src).apply()
+                val mask = when (src) {
+                    0 -> 0x11
+                    1 -> 0x22
+                    2 -> 0x44
+                    else -> 0x22
+                }
+                viewModel.setControl(0x64, mask)
+            },
             onReboot = { viewModel.serverReboot() },
             onShutdown = { viewModel.serverShutdown() },
             onDismiss = { showSettings = false },
@@ -562,20 +586,11 @@ fun MainScreen(viewModel: SdrViewModel = viewModel()) {
         )
     }
 
-    // Tuner: track the frequency at which the last successful tune was done
-    var tunerTuneFreq by remember { mutableLongStateOf(0L) }
-    var lastTunerState by remember { mutableStateOf(0) }
-    // Record tune frequency on real tune (TUNING → DONE_OK/DONE_ASSUMED) or first
-    // done-state after connect (tunerTuneFreq still 0). Ignores the fake
-    // IDLE → done-state transitions from the server's stale override.
-    val tunerState = state.tunerState
-    LaunchedEffect(tunerState) {
-        val isDone = tunerState == 2 || tunerState == 5
-        if (isDone && (lastTunerState == 1 || tunerTuneFreq == 0L)) {
-            tunerTuneFreq = state.frequencyHz
-        }
-        lastTunerState = tunerState
-    }
+    // Tuner stale-detection is handled SERVER-side per Amplitec position now;
+    // the previously-tracked `tunerTuneFreq` here only updated on TUNING→
+    // DONE_OK transitions and so kept comparing against the wrong tuner's
+    // freq across an Amplitec switch. The button colour below reads the
+    // server-broadcast tunerState directly.
 
     var showDevices by rememberSaveable { mutableStateOf(false) }
     var deviceSubTab by rememberSaveable { mutableIntStateOf(0) }
@@ -1083,27 +1098,22 @@ fun MainScreen(viewModel: SdrViewModel = viewModel()) {
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    // Tune button (visible when tuner available on JC-4s antenna, hidden in Yaesu mode)
+                    // Tune button (visible when tuner available on the active
+                    // antenna, hidden in Yaesu mode). Server-side stale-check
+                    // applies \u2014 state == IDLE already covers "out of tune range".
                     if (state.tunerCanTune && state.tunerConnected && !yaesuActive) {
-                        val freqDelta = if (tunerTuneFreq > 0 && state.frequencyHz > 0) {
-                            abs(state.frequencyHz - tunerTuneFreq)
-                        } else {
-                            Long.MAX_VALUE // Never tuned = always stale
+                        val tuneColor = when (state.tunerState) {
+                            1 -> Color(0xFF3C78DC) // Tuning = blue
+                            2 -> Color(0xFF32B432) // Done OK = green
+                            5 -> Color(0xFF78A028) // Done assumed = olive green
+                            3, 4 -> Color(0xFFDCA028) // Timeout/Aborted = orange
+                            else -> Color(0xFF505050) // Idle = grey
                         }
-                        val stale = freqDelta > 25_000 // >25kHz = needs retune
-
-                        val tuneColor = when {
-                            state.tunerState == 1 -> Color(0xFF3C78DC) // Tuning = blue
-                            state.tunerState == 2 && !stale -> Color(0xFF32B432) // Done OK + in range = green
-                            state.tunerState == 5 && !stale -> Color(0xFF78A028) // Done assumed + in range = olive green
-                            state.tunerState == 3 || state.tunerState == 4 -> Color(0xFFDCA028) // Timeout/Aborted = orange
-                            else -> Color(0xFF505050) // Idle or stale = grey
-                        }
-                        val tuneText = when {
-                            state.tunerState == 1 -> "Tune..."
-                            state.tunerState == 2 && !stale -> "Tune \u2713"
-                            state.tunerState == 5 && !stale -> "Tune ~"
-                            state.tunerState == 3 || state.tunerState == 4 -> "Tune \u2717"
+                        val tuneText = when (state.tunerState) {
+                            1 -> "Tune..."
+                            2 -> "Tune \u2713"
+                            5 -> "Tune ~"
+                            3, 4 -> "Tune \u2717"
                             else -> "Tune"
                         }
 

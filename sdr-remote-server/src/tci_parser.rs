@@ -41,7 +41,21 @@ pub enum TciNotification {
     Trx { receiver: u32, active: bool },
     Drive { receiver: u32, value: u8 },
     RxFilterBand { receiver: u32, low: i32, high: i32 },
-    RxChannelSensors { receiver: u32, channel: u32, dbm: f32 },
+    /// S9-frequency threshold push from the Thetis fork (MHz). VFO frequencies
+    /// at or above this value switch the S-meter scale to S9 = -93 dBm. Stock
+    /// Thetis / extensions-off never push this; the server falls back to the
+    /// IARU Region 1 convention (50 MHz) in that case.
+    S9FrequencyEx { mhz: f64 },
+    RxChannelSensors {
+        receiver: u32,
+        channel: u32,
+        /// Avg dBm (true-mean detector) — always present; legacy non-`_ex` pushes only this slot.
+        dbm: f32,
+        /// Sig dBm (peak-hold detector). `Some` only for `_ex` format.
+        dbm_sig: Option<f32>,
+        /// MaxBin dBm (single highest FFT bin). `Some` only for _ex format.
+        dbm_peakbin: Option<f32>,
+    },
     TxSensors { _receiver: u32, _mic_dbm: f32, power_w: f32, _peak_w: f32, swr: f32 },
     Start,
     Stop,
@@ -258,6 +272,13 @@ pub fn parse_tci_text(cmd: &str) -> Option<TciNotification> {
                 None
             }
         }
+        "s9_frequency_ex" => {
+            // Format: `s9_frequency_ex:<mhz>;` — Thetis pushes its
+            // user-configurable S9-frequency threshold (default 30 MHz).
+            if args.is_empty() { return None; }
+            let mhz: f64 = args[0].trim().parse().ok()?;
+            Some(TciNotification::S9FrequencyEx { mhz })
+        }
         "rx_channel_sensors" => {
             // Ignore legacy format when _ex is available (avoids instant values overriding avg)
             if HAS_SENSORS_EX.load(std::sync::atomic::Ordering::Relaxed) {
@@ -266,25 +287,40 @@ pub fn parse_tci_text(cmd: &str) -> Option<TciNotification> {
                 let receiver = args[0].trim().parse().ok()?;
                 let channel = args[1].trim().parse().ok()?;
                 let dbm = args[2].trim().parse().ok()?;
-                Some(TciNotification::RxChannelSensors { receiver, channel, dbm })
+                Some(TciNotification::RxChannelSensors {
+                    receiver,
+                    channel,
+                    dbm,
+                    dbm_sig: None,
+                    dbm_peakbin: None,
+                })
             } else {
                 None
             }
         }
         "rx_channel_sensors_ex" => {
             // Extended format: rx_channel_sensors_ex:rx,chan,dBm,avgdBm,peakBinDbm
-            // Use avgdBm (field 3) = time-domain RMS averaged power over the
-            // passband — integrates noise + signal, so the S-meter reads a
-            // representative signal level. peakBinDbm (field 4) is the single
-            // highest FFT bin and under-reports broadband noise levels.
+            // - dBm (field 2)         = "Sig" source (peak-hold detector)
+            // - avgdBm (field 3)      = "Avg" source (true-mean detector)
+            // - peakBinDbm (field 4)  = single highest FFT bin in passband
+            // All three are pushed at every sensor tick; the server keeps all three
+            // cached so a client can pick its preferred source via SmeterSource.
             if !HAS_SENSORS_EX.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                info!("TCI: rx_channel_sensors_ex active (using avgdBm for S-meter)");
+                info!("TCI: rx_channel_sensors_ex active (all 3 sources cached)");
             }
             if args.len() >= 5 {
                 let receiver = args[0].trim().parse().ok()?;
                 let channel = args[1].trim().parse().ok()?;
+                let sig_dbm: f32 = args[2].trim().parse().ok()?;
                 let avg_dbm: f32 = args[3].trim().parse().ok()?;
-                Some(TciNotification::RxChannelSensors { receiver, channel, dbm: avg_dbm })
+                let peak_bin_dbm: f32 = args[4].trim().parse().ok()?;
+                Some(TciNotification::RxChannelSensors {
+                    receiver,
+                    channel,
+                    dbm: avg_dbm,
+                    dbm_sig: Some(sig_dbm),
+                    dbm_peakbin: Some(peak_bin_dbm),
+                })
             } else {
                 None
             }
@@ -294,7 +330,13 @@ pub fn parse_tci_text(cmd: &str) -> Option<TciNotification> {
             if args.len() >= 2 {
                 let receiver = args[0].trim().parse().ok()?;
                 let dbm = args[1].trim().parse().ok()?;
-                Some(TciNotification::RxChannelSensors { receiver, channel: 0, dbm })
+                Some(TciNotification::RxChannelSensors {
+                    receiver,
+                    channel: 0,
+                    dbm,
+                    dbm_sig: None,
+                    dbm_peakbin: None,
+                })
             } else {
                 None
             }

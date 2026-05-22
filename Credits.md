@@ -40,6 +40,7 @@ Based on the Thetis SDR lineage (FlexRadio PowerSDR → OpenHPSDR Thetis). Upstr
 | bytemuck | Safe transmute for audio buffers | MIT / Apache-2.0 / Zlib |
 | hmac / sha2 / rand | Authentication (HMAC-SHA256) | MIT / Apache-2.0 |
 | wry | WebView (embedded WebSDR) | MIT / Apache-2.0 |
+| mcp2221-hal | Adafruit MCP2221A USB-HID bridge (StockCorner JC-4s / JC-3s tuners) — vendored, used under MIT terms | MIT / Apache-2.0 |
 
 ### Android (Kotlin)
 
@@ -65,7 +66,7 @@ Based on the Thetis SDR lineage (FlexRadio PowerSDR → OpenHPSDR Thetis). Upstr
 | Yaesu FT-991A | Serial CAT + USB Audio |
 | RF2K-S Power Amplifier | HTTP API |
 | SPE Expert 1.3K-FA | Serial |
-| JC-4s Antenna Tuner | Serial (DTR signaling) |
+| StockCorner JC-4s / JC-3s Antenna Tuner (×2) | MCP2221A USB-HID |
 | UltraBeam RCU-06 | Serial |
 | Amplitec 6/2 Antenna Switch | Serial |
 | EA7HG Visual Rotor | UDP |

@@ -184,6 +184,23 @@ impl SdrRemoteApp {
             }
         });
 
+        // S-meter source selector — mirrors Thetis Multimeter Sig/Avg/MaxBin
+        // choice. Applies to both RX1 and RX2 (one shared display mode).
+        ui.horizontal(|ui| {
+            ui.label("S-meter:");
+            for (val, label, tooltip) in [
+                (0u8, "Sig", "WDSP RXA_S_PK — peak-hold with 100ms decay (fast bouncing)"),
+                (1u8, "Avg", "WDSP RXA_S_AV — symmetric RMS-avg over linear power (recommended)"),
+                (2u8, "MaxBin", "Single highest FFT bin in passband"),
+            ] {
+                if ui.selectable_label(self.smeter_source == val, label).on_hover_text(tooltip).clicked() {
+                    self.smeter_source = val;
+                    let _ = self.cmd_tx.send(Command::SetSmeterSource(val));
+                    crate::ui::config::save_smeter_source(val);
+                }
+            }
+        });
+
         ui.separator();
 
         // --- Thetis PTT mode ---
@@ -840,7 +857,7 @@ impl SdrRemoteApp {
                     ui.horizontal(|ui| {
                         if ui.add(egui::Button::new(RichText::new(&btn_text).color(Color32::WHITE))
                             .fill(btn_color)).clicked() {
-                            let smeter_dbm = display_to_dbm(self.smeter);
+                            let smeter_dbm = self.smeter;
                             self.diversity_auto_start_smeter = smeter_dbm;
                             self.diversity_auto_overall_best = 999.0;
                             self.diversity_auto_active = true;
@@ -889,14 +906,8 @@ impl SdrRemoteApp {
             });
         });
 
-        // Convert display S-meter (0-260) back to dBm
-        fn display_to_dbm(display: u16) -> f32 {
-            if display <= 108 {
-                (display as f32) * (48.0 / 108.0) - 121.0
-            } else {
-                (display as f32 - 108.0) * (60.0 / 152.0) - 73.0
-            }
-        }
+        // State.smeter is already dBm (in RX context, which is the only context
+        // diversity auto-null runs in). No conversion needed.
 
         // Auto-null state machine (runs each frame when active)
         if self.diversity_auto_active && (self.diversity_enabled || self.diversity_auto_result >= 4 || self.diversity_auto_eq_gain_db == f32::MAX || self.diversity_auto_smart) {
@@ -910,7 +921,7 @@ impl SdrRemoteApp {
             };
             let smart_waiting = self.diversity_auto_smart && self.diversity_sa_sub == 1;
             if smart_waiting || self.diversity_auto_last_set.elapsed().as_millis() >= settle_ms {
-                let smeter_dbm = display_to_dbm(self.smeter);
+                let smeter_dbm = self.smeter;
                 if smeter_dbm < self.diversity_auto_overall_best {
                     self.diversity_auto_overall_best = smeter_dbm;
                 }
@@ -971,8 +982,8 @@ impl SdrRemoteApp {
                         self.diversity_auto_last_set = Instant::now();
                     } else {
                         // Both receivers active — read S-meters
-                        let rx1_dbm = display_to_dbm(self.smeter);
-                        let rx2_dbm = display_to_dbm(self.rx2_smeter);
+                        let rx1_dbm = self.smeter;
+                        let rx2_dbm = self.rx2_smeter;
                         // Non-ref needs gain to match ref: gain = ref_dBm - nonref_dBm
                         let (ref_dbm, nonref_dbm) = if self.diversity_ref == 1 {
                             (rx1_dbm, rx2_dbm) // RX1 is ref, boost RX2
@@ -1139,7 +1150,7 @@ impl SdrRemoteApp {
                 } else if self.diversity_auto_slow && !self.diversity_auto_smart && self.diversity_auto_result == 1 && self.diversity_sa_iteration < 3 {
                     // Successive approximation mode (Slow)
                     use sdr_remote_core::protocol::ControlId;
-                    let smeter_dbm = display_to_dbm(self.smeter);
+                    let smeter_dbm = self.smeter;
                     if smeter_dbm < self.diversity_auto_overall_best {
                         self.diversity_auto_overall_best = smeter_dbm;
                     }

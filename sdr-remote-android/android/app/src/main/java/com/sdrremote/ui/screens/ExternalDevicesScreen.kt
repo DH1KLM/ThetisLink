@@ -1848,9 +1848,18 @@ private fun YaesuTab(
             }
         }
 
-        // Yaesu S-meter (same layout as Thetis)
+        // Yaesu S-meter (same layout as Thetis). The Yaesu CAT scale is a raw
+        // 0..255 display unit that historically lined up with the old 0..228
+        // ThetisLink scale; we re-use the inverse of `dbmToDisplay` so the
+        // widget can present it on the same dBm axis as Thetis without a
+        // second widget variant.
+        val yaesuDbm = if (state.yaesuSmeter <= 108) {
+            state.yaesuSmeter.toFloat() / 2f - 127f
+        } else {
+            (state.yaesuSmeter - 108).toFloat() * 0.5f - 73f
+        }
         com.sdrremote.ui.components.SmeterBar(
-            rawLevel = state.yaesuSmeter,
+            value = yaesuDbm,
             transmitting = state.yaesuTxActive,
             otherTx = false,
         )

@@ -1,10 +1,10 @@
-# ThetisLink v2.0.2 - Installation Guide
+# ThetisLink v2.0.3 - Installation Guide
 
 ThetisLink is a remote control application for the ANAN 7000DLE SDR with Thetis. Audio, spectrum, PTT and full radio control over the network via TCI WebSocket.
 
 **Compatibility:** ThetisLink talks only to **Thetis** (via TCI WebSocket) and not directly to the SDR hardware. It therefore works with any SDR device supported by **Thetis v2.10.3.15** (official release by ramdor) — both HPSDR Protocol 1 (Hermes, Angelia, Orion) and HPSDR Protocol 2 (ANAN-7000DLE, ANAN-8000DLE, ANAN-G2, Hermes-Lite 2, etc.). Optional: Yaesu FT-991A as a second radio (via COM port).
 
-**PA3GHM Thetis fork (optional, recommended for TL2 extensions):** ThetisLink v2.0.2 works fine with stock Thetis v2.10.3.15 over TCI alone — no separate CAT TCP connection is required. The PA3GHM fork is an **optional** drop-in replacement that adds ThetisLink-specific TL2 `_ex` extensions on top of stock Thetis: extended IQ bandwidth up to 1536 kHz (vs the 384 kHz stock cap), `tci_caps_ex` capability broadcast, server-side CTUN auto-recenter (`auto_recenter_ex`), filter-preset and per-RX DDC-rate push notifications, and diversity auto-null with live circle broadcast. All extensions sit behind the **"ThetisLink extensions"** checkbox in Thetis and are disabled by default; with the checkbox unchecked the TCI extension behaviour is preserved (stock v2.10.3.15 — note the fork still carries its own build tag, release notes and About metadata). See the User Manual (`User-Manual-EN.md`) for details.
+**PA3GHM Thetis fork (optional, recommended for TL2 extensions):** ThetisLink v2.0.3 works fine with stock Thetis v2.10.3.15 over TCI alone — no separate CAT TCP connection is required. The PA3GHM fork is an **optional** drop-in replacement that adds ThetisLink-specific TL2 `_ex` extensions on top of stock Thetis: extended IQ bandwidth up to 1536 kHz (vs the 384 kHz stock cap), `tci_caps_ex` capability broadcast, server-side CTUN auto-recenter (`auto_recenter_ex`), filter-preset and per-RX DDC-rate push notifications, and diversity auto-null with live circle broadcast. All extensions sit behind the **"ThetisLink extensions"** checkbox in Thetis and are disabled by default; with the checkbox unchecked the TCI extension behaviour is preserved (stock v2.10.3.15 — note the fork still carries its own build tag, release notes and About metadata). See the User Manual (`User-Manual-EN.md`) for details.
 
 **Disclaimer:** This software controls radio transmitters. Use at your own risk. The author is not responsible for damage to equipment, interference or violations of regulations resulting from the use of this software. Verify all safety features (PTT timeout, power limits) before transmitting.
 
@@ -16,9 +16,7 @@ ThetisLink is a remote control application for the ANAN 7000DLE SDR with Thetis.
 |------|-------------|
 | ThetisLink-Server.exe | ThetisLink Server - runs on the PC alongside Thetis |
 | ThetisLink-Client.exe | ThetisLink Desktop Client - Windows |
-| ThetisLink-2.0.2.apk | ThetisLink Android Client - phone/tablet |
-| thetislink-server.conf | Example ThetisLink Server configuration |
-| thetislink-client.conf | Example ThetisLink Client configuration |
+| ThetisLink-2.0.3.apk | ThetisLink Android Client - phone/tablet |
 | Installation.pdf | Installation guide (English, this document) |
 | User-Manual-EN.pdf | User manual (English) |
 | Technical-Reference.pdf | Technical reference (English) |
@@ -27,6 +25,8 @@ ThetisLink is a remote control application for the ANAN 7000DLE SDR with Thetis.
 | Technische-Referentie.pdf | Technische referentie (Nederlands) |
 | LICENSE | License |
 | SHA256SUMS.txt | Checksums for verification |
+
+> **Configuration files:** `thetislink-server.conf` and `thetislink-client.conf` are **not bundled**. They are created automatically with default values on the first start of the server and client (in the same folder as the exe). This is consistent with v2.0.2 — existing users retain their own settings.
 
 ---
 
@@ -99,7 +99,7 @@ Setup -> Serial/Network/Midi CAT -> Network -> **TCI Server** group:
 With the PA3GHM Thetis fork, on the same tab:
 1. Check **ThetisLink extensions**
 
-> ThetisLink v2.0.2 uses TCI exclusively for radio control. The TCP/IP CAT server in Thetis does not need to be enabled for ThetisLink — it is only required if you want to connect a separate logging program or third-party CAT client to Thetis directly.
+> ThetisLink v2.0.3 uses TCI exclusively for radio control. The TCP/IP CAT server in Thetis does not need to be enabled for ThetisLink — it is only required if you want to connect a separate logging program or third-party CAT client to Thetis directly.
 
 ---
 
@@ -128,14 +128,14 @@ In the ThetisLink Server GUI you can connect external devices. Each device has a
 | Device | Connection | Setting |
 |--------|-----------|---------|
 | Amplitec 6/2 antenna switch | Serial (USB) | COM port, 19200 baud |
-| JC-4s antenna tuner (*) | Serial (USB) | COM port (uses RTS/CTS lines) |
+| JC-4s / JC-3s antenna tuner (*) | USB-HID | Adafruit MCP2221A breakout (see below) |
 | SPE Expert 1.3K-FA PA | Serial (USB) | COM port, 115200 baud |
 | RF2K-S PA | HTTP REST | IP:port (e.g. `192.168.1.50:8080`) |
 | UltraBeam RCU-06 antenna controller | Serial (USB) | COM port |
 | EA7HG Visual Rotor | UDP | IP:port (e.g. `192.168.1.66:2570`) |
 | Yaesu FT-991A | Serial (USB) | COM port (see below) |
 
-> (*) The JC-4s antenna tuner does not have a standard serial interface. Control only works with a custom USB-serial extension that uses the RTS/CTS lines for tune/abort signals. This is not a standard product - contact for details.
+> (*) The StockCorner JC-4s and JC-3s tuners do not have a standard serial interface. From v2.0.3 each tuner is driven via an **Adafruit MCP2221A USB-to-HID breakout** with a transistor stage on the grey "start" wire and a 1 MΩ + 1 MΩ voltage divider on the yellow "tune-status" wire. Up to two tuners are supported in parallel; each board receives a unique USB serial number that you program from the server status panel. The full wiring and UI flow is documented in the User Manual (`User-Manual-EN.md`). This is not an off-the-shelf product — contact for details.
 
 #### Yaesu FT-991A USB driver
 
@@ -231,14 +231,14 @@ When the server itself runs on the Thetis PC, its window has two tabs: **Status*
 ### 4.1 Installing the APK
 
 **Via file manager:**
-1. Copy `ThetisLink-2.0.2.apk` to your phone (USB, email, or cloud)
+1. Copy `ThetisLink-2.0.3.apk` to your phone (USB, email, or cloud)
 2. Open the APK file on the phone
 3. Allow "Install from unknown sources" if prompted
 4. Install
 
 **Via ADB** (with USB debugging enabled):
 ```
-adb install ThetisLink-2.0.2.apk
+adb install ThetisLink-2.0.3.apk
 ```
 
 ### 4.2 Connecting — guided setup wizard

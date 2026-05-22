@@ -28,7 +28,7 @@ dictionary BridgeRadioState {
     u64 frequency_hz;
     u64 frequency_rx2_hz;
     u8 mode;
-    u16 smeter;
+    f32 smeter;
     boolean power_on;
     u8 tx_profile;
     u8 nr_level;

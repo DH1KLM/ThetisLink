@@ -6,7 +6,7 @@ pub mod jitter;
 pub mod protocol;
 
 /// ThetisLink version — shared by server and client
-pub const VERSION: &str = "2.0.2";
+pub const VERSION: &str = "2.0.3";
 
 /// Build number for dev builds — displayed alongside version for testing.
 /// Set to None for release builds (only show version).
@@ -60,13 +60,13 @@ pub const DEFAULT_SPECTRUM_BINS: usize = 8192;
 /// FFT size for DDC I/Q spectrum processing (262144 = Thetis-quality resolution at 1536 kHz)
 pub const DDC_FFT_SIZE: usize = 262_144;
 
-/// Compute FFT size for a given DDC sample rate, targeting ~12 FPS with 87.5% overlap.
+/// Compute FFT size for a given DDC sample rate, targeting ~25 FPS with 87.5% overlap.
 /// Returns a power-of-two FFT size (minimum 4096).
-/// 87.5% overlap gives Thetis-quality frequency resolution (~1.5 Hz/bin at 384kHz).
+/// At 384 kHz: 128K bins → ~23 FPS, ~3 Hz/bin.
 pub fn ddc_fft_size(sample_rate_hz: u32) -> usize {
-    // Hop size = fft_size / 8. For ~12 FPS: fft_size / 8 = sample_rate / 12
-    // → fft_size = sample_rate * 8 / 12 = sample_rate * 2 / 3.
-    let target = (sample_rate_hz as usize) * 2 / 3;
+    // Hop size = fft_size / 8. For ~25 FPS: fft_size / 8 = sample_rate / 25
+    // → fft_size = sample_rate * 8 / 25.
+    let target = (sample_rate_hz as usize) * 8 / 25;
     target.next_power_of_two().max(4096)
 }
 
@@ -83,13 +83,15 @@ pub const DEFAULT_SPECTRUM_FPS: u8 = 15;
 
 // ── Shared DSP utilities ────────────────────────────────────────────────
 
-/// Convert dBm to S-meter display value (0-260 scale).
-/// 0-108 = S0 to S9 (each S-unit = 12 raw units, -121 dBm = S0, -73 dBm = S9).
-/// 108-260 = S9+dB (60 dB range above S9).
+/// Client-side helper: map dBm to a 0-228 display unit for arc-position math.
+/// 0-108 = S0..S9 (12 raw units per S-unit = 6 dB/S, IARU Region 1).
+/// S0 = -127 dBm, S9 = -73 dBm (HF reference, 50 µV across 50 Ω).
+/// 108-228 = S9+dB zone, 2 raw units per dB — uniform with S1..S9.
+/// Not used on the wire any more; the server sends raw dBm × 10 in `SmeterPacket.level`.
 pub fn dbm_to_display(dbm: f32) -> u16 {
     if dbm <= -73.0 {
-        ((dbm + 121.0) * (108.0 / 48.0)).clamp(0.0, 108.0) as u16
+        ((dbm + 127.0) * 2.0).clamp(0.0, 108.0) as u16
     } else {
-        (108.0 + (dbm + 73.0) * (152.0 / 60.0)).clamp(108.0, 260.0) as u16
+        (108.0 + (dbm + 73.0) * 2.0).clamp(108.0, 228.0) as u16
     }
 }

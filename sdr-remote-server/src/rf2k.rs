@@ -452,11 +452,19 @@ fn rf2k_thread(
                 } // lock dropped here
 
                 // Drive observer: feed latest polled operate-mode and Thetis
-                // ZZPC (if shared). Logs transitions only; never sends anything.
+                // ZZPC (if shared). Logs transitions and, when Thetis fails
+                // to restore the pre-Operate drive on its own (typically
+                // after a host-restart that orphaned the in-memory snapshot),
+                // pushes the persisted saved drive back via ZZPC{val:03};.
                 if let Some(ref drive_arc) = thetis_drive_level {
                     let operate_now = status.lock().unwrap().operate;
                     let zzpc_now = drive_arc.load(Ordering::Relaxed);
                     drive_observer.tick(operate_now, zzpc_now);
+                    if let Some(v) = drive_observer.take_pending_restore() {
+                        if let Some(ref tx) = cat_tx {
+                            let _ = tx.blocking_send(format!("ZZPC{:03};", v));
+                        }
+                    }
                 }
 
                 if consecutive_failures > 0 {
@@ -1170,6 +1178,11 @@ impl DriveObserverCtx {
 pub(crate) enum DriveObserverLog {
     Info(String),
     Warn(String),
+    /// Signal to the caller that Thetis failed to restore the pre-Operate
+    /// drive on its own (timeout fired after Operate→Standby). Carries the
+    /// value to push back via CAT (`ZZPC{value:03};`). The caller is
+    /// expected to send it and log an Info line describing the action.
+    RestoreActionRequired(u8),
 }
 
 /// Pure state-transition function for the drive-restore observer.
@@ -1295,14 +1308,20 @@ pub(crate) fn next_drive_state(
         (OperateToStandby, Tick { now }) => {
             if let Some(start) = ctx.transition_start {
                 if now.duration_since(start) >= ctx.timeout {
-                    let saved = ctx.saved_drive.unwrap_or(0);
-                    return (
-                        Standby,
-                        Some(DriveObserverLog::Warn(format!(
-                            "RF2K drive: RESTORE FAILED \u{2014} saved={}% but Thetis ZZPC={}% (edge case captured)",
-                            saved, ctx.last_known_zzpc
-                        ))),
-                    );
+                    // If no snapshot is available (rare: first-ever
+                    // Operate-cycle after a fresh install, or a manual
+                    // config-reset) the safe action is NOT to push the
+                    // observer's default `0` — that would actively zero
+                    // Thetis' drive level. Just warn and stay in Standby.
+                    return match ctx.saved_drive {
+                        Some(v) => (Standby, Some(DriveObserverLog::RestoreActionRequired(v))),
+                        None => (
+                            Standby,
+                            Some(DriveObserverLog::Warn(
+                                "RF2K drive: no saved pre-Operate snapshot, cannot restore — skipping".to_string()
+                            )),
+                        ),
+                    };
                 }
             }
             (OperateToStandby, None)
@@ -1320,16 +1339,33 @@ struct DriveObserverState {
     /// `true` once we have seen the first poll so we do not emit spurious
     /// operate-transition events before the initial state is known.
     initialized: bool,
+    /// `Some(v)` when the observer has decided Thetis failed to restore the
+    /// pre-Operate drive on its own (timeout after Operate→Standby) and is
+    /// asking the caller to push ZZPC{v} via CAT. Cleared by the caller
+    /// after one successful send. Without this fallback the pre-Operate
+    /// drive is permanently lost after a host-restart that orphaned the
+    /// in-memory snapshot but left the PA in Operate.
+    pending_restore: Option<u8>,
 }
 
 impl DriveObserverState {
     fn new() -> Self {
+        // Load persisted pre-Operate drive from config so a TL2-server
+        // restart while the PA is in Operate still has the snapshot needed
+        // to restore on the next Standby transition.
+        let saved_from_disk = crate::config::load().rf2k_saved_drive;
+        let mut ctx = DriveObserverCtx::new(DRIVE_OBSERVER_TIMEOUT);
+        ctx.saved_drive = saved_from_disk;
+        if let Some(v) = saved_from_disk {
+            info!("RF2K drive: loaded persisted pre-Operate snapshot = {}%", v);
+        }
         Self {
             state: Rf2kDriveState::Standby,
-            ctx: DriveObserverCtx::new(DRIVE_OBSERVER_TIMEOUT),
+            ctx,
             prev_operate: false,
             prev_zzpc: 0,
             initialized: false,
+            pending_restore: None,
         }
     }
 
@@ -1351,6 +1387,9 @@ impl DriveObserverState {
                     self.ctx.transition_start = Some(Instant::now());
                     if let Rf2kDriveEvent::Rf2kOperateModeChanged { observed_zzpc, .. } = event {
                         self.ctx.saved_drive = Some(observed_zzpc);
+                        // Persist immediately so the snapshot survives a
+                        // host-restart while the PA stays in Operate.
+                        crate::config::save_saved_drive(2, Some(observed_zzpc));
                     }
                 }
                 (Rf2kDriveState::Operate, Rf2kDriveState::OperateToStandby) => {
@@ -1369,9 +1408,23 @@ impl DriveObserverState {
             match log {
                 DriveObserverLog::Info(s) => info!("{}", s),
                 DriveObserverLog::Warn(s) => warn!("{}", s),
+                DriveObserverLog::RestoreActionRequired(v) => {
+                    warn!(
+                        "RF2K drive: Thetis did not restore (last ZZPC={}%), pushing saved {}% via CAT",
+                        self.ctx.last_known_zzpc, v
+                    );
+                    self.pending_restore = Some(v);
+                }
             }
         }
         self.state = new_state;
+    }
+
+    /// Caller consumes any outstanding restore request. Returns the value to
+    /// push via CAT (`ZZPC{value:03};`); the field is cleared atomically so
+    /// the same restore is never sent twice.
+    fn take_pending_restore(&mut self) -> Option<u8> {
+        self.pending_restore.take()
     }
 
     /// Called once per poll tick. Compares latest polled values against the
@@ -1383,6 +1436,18 @@ impl DriveObserverState {
             self.ctx.last_known_zzpc = current_zzpc;
             self.state = if current_operate { Rf2kDriveState::Operate } else { Rf2kDriveState::Standby };
             self.initialized = true;
+            // Boot diagnostics: PA already in Operate at first poll AND no
+            // persisted pre-Operate snapshot to restore from. Next Standby
+            // transition will warn-and-skip (RestoreActionRequired::None
+            // branch) so owner knows why the drive stays at the current
+            // PA-drive level.
+            if current_operate && self.ctx.saved_drive.is_none() {
+                warn!(
+                    "RF2K drive: PA in Operate at startup but no pre-Operate snapshot available — \
+                     next Standby will skip restore (drive stays at {}%)",
+                    current_zzpc
+                );
+            }
             return;
         }
 
@@ -1551,12 +1616,10 @@ mod tests {
         );
         assert_eq!(s, Rf2kDriveState::Standby);
         match log {
-            Some(DriveObserverLog::Warn(msg)) => {
-                assert!(msg.contains("RESTORE FAILED"));
-                assert!(msg.contains("saved=100%"));
-                assert!(msg.contains("ZZPC=10%"));
+            Some(DriveObserverLog::RestoreActionRequired(v)) => {
+                assert_eq!(v, 100);
             }
-            _ => panic!("expected Warn RESTORE FAILED log"),
+            _ => panic!("expected RestoreActionRequired log"),
         }
     }
 

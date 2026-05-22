@@ -28,15 +28,11 @@ pub(super) fn render_tuner_panel(
         // Tune button
         let can_start = status.connected
             && (status.state == tuner::TUNER_IDLE
-                || status.state == tuner::TUNER_DONE_OK
-                || status.state == tuner::TUNER_DONE_ASSUMED);
-        let olive_green = Color32::from_rgb(120, 160, 40);
+                || status.state == tuner::TUNER_DONE_OK);
         let (tune_color, tune_text) = match status.state {
             tuner::TUNER_TUNING => (Color32::from_rgb(60, 120, 220), "Tune..."),
             tuner::TUNER_DONE_OK if !status.stale => (Color32::from_rgb(50, 180, 50), "Tune OK"),
             tuner::TUNER_DONE_OK => (Color32::from_rgb(80, 80, 80), "Tune"), // stale: VFO moved
-            tuner::TUNER_DONE_ASSUMED if !status.stale => (olive_green, "Tune ~"),
-            tuner::TUNER_DONE_ASSUMED => (Color32::from_rgb(80, 80, 80), "Tune"), // stale: VFO moved
             tuner::TUNER_TIMEOUT => (amber, "Tune X"),
             tuner::TUNER_ABORTED => (amber, "Tune X"),
             _ => (Color32::from_rgb(80, 80, 80), "Tune"),
@@ -61,9 +57,6 @@ pub(super) fn render_tuner_panel(
             }
             tuner::TUNER_DONE_OK => {
                 ui.colored_label(Color32::GREEN, "Done");
-            }
-            tuner::TUNER_DONE_ASSUMED => {
-                ui.colored_label(olive_green, "Done~");
             }
             tuner::TUNER_TIMEOUT => {
                 ui.colored_label(Color32::from_rgb(255, 80, 80), "Timeout");

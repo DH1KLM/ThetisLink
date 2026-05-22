@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+/// Sentinel for "no S-meter sample yet" — well below S0 (-127 dBm) so the
+/// widget clamps the needle to the bottom of the arc without ever looking
+/// like a real reading.
+pub const SMETER_NO_DATA_DBM: f32 = -200.0;
+
 /// A DX cluster spot for client-side display.
 #[derive(Clone, Debug)]
 pub struct DxSpotInfo {
@@ -139,7 +144,16 @@ pub struct RadioState {
     // Radio
     pub frequency_hz: u64,
     pub mode: u8,
-    pub smeter: u16,
+    /// RX1 S-meter — dBm during RX, watts during TX (disambiguated by
+    /// `other_tx` plus client-local PTT). `SMETER_NO_DATA_DBM` (-200.0) when
+    /// no sample has arrived yet, which the widget clamps to S0.
+    pub smeter: f32,
+    /// RX1 S-meter Sig source (peak-hold WDSP RXA_S_PK), dBm. Only populated
+    /// when the client has subscribed via SmeterSources bit 0; otherwise
+    /// stays at the no-data sentinel.
+    pub smeter_sig: f32,
+    /// RX1 S-meter MaxBin source (single highest FFT bin), dBm. SmeterSources bit 2.
+    pub smeter_peakbin: f32,
 
     // Thetis controls
     pub power_on: bool,
@@ -165,7 +179,12 @@ pub struct RadioState {
     pub vfo_sync: bool,
     pub frequency_rx2_hz: u64,
     pub mode_rx2: u8,
-    pub smeter_rx2: u16,
+    /// RX2 S-meter, dBm (RX-only — RX2 never transmits).
+    pub smeter_rx2: f32,
+    /// RX2 Sig source (SmeterSources bit 4), dBm.
+    pub smeter_rx2_sig: f32,
+    /// RX2 MaxBin source (SmeterSources bit 6), dBm.
+    pub smeter_rx2_peakbin: f32,
     pub rx2_af_gain: u8,
     pub rx2_nr_level: u8,
     pub rx2_anf_on: bool,
@@ -299,6 +318,9 @@ pub struct RadioState {
     pub ub_fw_minor: u8,
     pub ub_available: bool,
     pub ub_elements_mm: [u16; 6],
+    pub ub_operation: u8,
+    pub ub_freq_min_mhz: u16,
+    pub ub_freq_max_mhz: u16,
     // DX Cluster spots
     pub dx_spots: Vec<DxSpotInfo>,
 
@@ -387,7 +409,9 @@ impl Default for RadioState {
             yaesu_mic_level: 0.0,
             frequency_hz: 0,
             mode: 0,
-            smeter: 0,
+            smeter: SMETER_NO_DATA_DBM,
+            smeter_sig: SMETER_NO_DATA_DBM,
+            smeter_peakbin: SMETER_NO_DATA_DBM,
             power_on: false,
             tx_profile: 0,
             nr_level: 0,
@@ -409,7 +433,9 @@ impl Default for RadioState {
             vfo_sync: false,
             frequency_rx2_hz: 0,
             mode_rx2: 0,
-            smeter_rx2: 0,
+            smeter_rx2: SMETER_NO_DATA_DBM,
+            smeter_rx2_sig: SMETER_NO_DATA_DBM,
+            smeter_rx2_peakbin: SMETER_NO_DATA_DBM,
             rx2_af_gain: 0,
             rx2_nr_level: 0,
             rx2_anf_on: false,
@@ -526,6 +552,9 @@ impl Default for RadioState {
             ub_fw_minor: 0,
             ub_available: false,
             ub_elements_mm: [0; 6],
+            ub_operation: 0,
+            ub_freq_min_mhz: 0,
+            ub_freq_max_mhz: 0,
             dx_spots: Vec::new(),
             rotor_connected: false,
             rotor_angle_x10: 0,

@@ -50,6 +50,8 @@ fun SettingsDialog(
     onAudioModeChange: (Int) -> Unit,
     txProfileNames: List<String> = emptyList(),
     onTxProfileChange: (Int) -> Unit = {},
+    smeterSource: Int = 1,
+    onSmeterSourceChange: (Int) -> Unit = {},
     onReboot: () -> Unit,
     onShutdown: () -> Unit,
     onDismiss: () -> Unit,
@@ -141,6 +143,25 @@ fun SettingsDialog(
                     "Handsfree speaker mode"
                 }
                 Text(statusText, fontSize = 12.sp, color = if (headsetActive) Color(0xFF00C800) else Color.Gray)
+
+                // S-meter source — mirrors Thetis Multimeter Sig/Avg/MaxBin
+                // selection. Same setting for both RX1 and RX2.
+                Spacer(Modifier.height(12.dp))
+                HorizontalDivider()
+                Spacer(Modifier.height(8.dp))
+                Text("S-meter source:", fontSize = 14.sp)
+                Spacer(Modifier.height(4.dp))
+                SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                    val labels = listOf("Sig", "Avg", "MaxBin")
+                    labels.forEachIndexed { index, label ->
+                        SegmentedButton(
+                            selected = smeterSource == index,
+                            onClick = { onSmeterSourceChange(index) },
+                            shape = SegmentedButtonDefaults.itemShape(index = index, count = labels.size),
+                        ) { Text(label, fontSize = 12.sp) }
+                    }
+                }
+                Text("Avg matches Thetis Multimeter Avg (recommended)", fontSize = 11.sp, color = Color.Gray)
 
                 // Mic → TX Profile mapping (phone mic + BT headset)
                 if (txProfileNames.isNotEmpty()) {

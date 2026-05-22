@@ -26,6 +26,7 @@ import android.content.Context
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -71,7 +72,7 @@ private fun serializeMemories(memories: Array<Memory?>): String =
 @Composable
 fun FrequencyDisplay(
     frequencyHz: Long,
-    smeter: Int,
+    smeter: Float,
     mode: Int,
     transmitting: Boolean,
     otherTx: Boolean,
@@ -133,7 +134,7 @@ fun FrequencyDisplay(
         Spacer(Modifier.height(4.dp))
 
         // S-meter bar (3-zone: labels above + bar + labels below, with peak hold)
-        SmeterBar(rawLevel = smeter, transmitting = transmitting, otherTx = otherTx)
+        SmeterBar(value = smeter, transmitting = transmitting, otherTx = otherTx)
 
         Spacer(Modifier.height(8.dp))
 
@@ -242,25 +243,28 @@ fun FrequencyDisplay(
     }
 }
 
+/// `value` is dBm in RX mode and watts in TX mode, matching the wire format
+/// where `SmeterPacket.level` is signed deci-units (×10) of the same quantity.
 @Composable
-fun SmeterBar(rawLevel: Int, transmitting: Boolean = false, otherTx: Boolean = false) {
-    // Peak hold state: instant attack, 1-second decay
-    var peakLevel by remember { mutableIntStateOf(0) }
+fun SmeterBar(value: Float, transmitting: Boolean = false, otherTx: Boolean = false) {
+    // Peak hold state: instant attack, 1-second decay.  Default well below S0
+    // so the very first real sample wins.
+    var peakLevel by remember { mutableFloatStateOf(-200f) }
     var peakTimeMs by remember { mutableLongStateOf(0L) }
 
-    val now = remember(rawLevel) { System.currentTimeMillis() }
+    val now = remember(value) { System.currentTimeMillis() }
     if (!transmitting && !otherTx) {
-        if (rawLevel >= peakLevel) {
-            peakLevel = rawLevel
+        if (value >= peakLevel) {
+            peakLevel = value
             peakTimeMs = now
         } else if (now - peakTimeMs > 1000L) {
-            peakLevel = rawLevel
+            peakLevel = value
             peakTimeMs = now
         }
     }
     // Reset peak when switching to TX
     LaunchedEffect(transmitting, otherTx) {
-        if (transmitting || otherTx) { peakLevel = 0; peakTimeMs = 0L }
+        if (transmitting || otherTx) { peakLevel = -200f; peakTimeMs = 0L }
     }
 
     // 3-zone layout: labels above (10dp) + bar (14dp) + labels below (10dp) = 34dp
@@ -304,14 +308,14 @@ fun SmeterBar(rawLevel: Int, transmitting: Boolean = false, otherTx: Boolean = f
 
         if (otherTx) {
             // ── Other TX: orange bar ──
-            val watts = rawLevel / 10f
+            val watts = value
             val frac = (watts / 100f).coerceIn(0f, 1f)
             drawRect(Color(0xFFCC7700), topLeft = Offset(0f, barTop), size = Size(w * frac, barHeight))
             drawContext.canvas.nativeCanvas.drawText(
                 "TX in use  ${"%.0f".format(watts)} W", w / 2f, barTop + barHeight / 2f + 10f, centerFont)
         } else if (transmitting) {
             // ── TX power: red bar + watt ticks ──
-            val watts = rawLevel / 10f
+            val watts = value
             val frac = (watts / 100f).coerceIn(0f, 1f)
             drawRect(Color(0xFFDC1E1E), topLeft = Offset(0f, barTop), size = Size(w * frac, barHeight))
 
@@ -327,10 +331,12 @@ fun SmeterBar(rawLevel: Int, transmitting: Boolean = false, otherTx: Boolean = f
             drawContext.canvas.nativeCanvas.drawText(
                 "TX  ${"%.0f".format(watts)} W", w / 2f, barTop + barHeight / 2f + 10f, centerFont)
         } else {
-            // ── RX S-meter bar ──
-            val frac = (rawLevel / 260f).coerceIn(0f, 1f)
+            // ── RX S-meter bar ── `value` is dBm.
+            val dbm = value
+            val raw = dbmToDisplay(dbm)
+            val frac = (raw / 228f).coerceIn(0f, 1f)
             val fillWidth = w * frac
-            val s9Frac = 108f / 260f
+            val s9Frac = 108f / 228f
 
             // Green up to S9, red above
             if (frac <= s9Frac) {
@@ -342,15 +348,16 @@ fun SmeterBar(rawLevel: Int, transmitting: Boolean = false, otherTx: Boolean = f
             }
 
             // Peak hold needle (yellow, 2px)
-            if (peakLevel > rawLevel) {
-                val peakFrac = (peakLevel / 260f).coerceIn(0f, 1f)
+            if (peakLevel > dbm) {
+                val peakRaw = dbmToDisplay(peakLevel)
+                val peakFrac = (peakRaw / 228f).coerceIn(0f, 1f)
                 val peakX = w * peakFrac
                 drawLine(Color(0xFFFFFF00), Offset(peakX, barTop), Offset(peakX, barBottom), strokeWidth = 2f)
             }
 
             // S-unit ticks + labels above bar (S1-S9)
             for (s in 1..9) {
-                val x = w * (s * 12f / 260f)
+                val x = w * (s * 12f / 228f)
                 drawLine(Color.Gray, Offset(x, barTop), Offset(x, barTop + 4f * density), strokeWidth = 1f)
                 drawLine(Color.Gray, Offset(x, barBottom - 4f * density), Offset(x, barBottom), strokeWidth = 1f)
                 drawContext.canvas.nativeCanvas.drawText("$s", x, topLabelH - 2f, tickFont)
@@ -358,22 +365,34 @@ fun SmeterBar(rawLevel: Int, transmitting: Boolean = false, otherTx: Boolean = f
 
             // +dB ticks + labels below bar (+10 to +60)
             for (dbOver in 10..60 step 10) {
-                val raw = 108f + dbOver * (152f / 60f)
-                val x = w * (raw / 260f)
+                val tickRaw = 108f + dbOver * 2f
+                val x = w * (tickRaw / 228f)
                 drawLine(Color(0xFFC86464), Offset(x, barTop), Offset(x, barTop + 4f * density), strokeWidth = 1f)
                 drawLine(Color(0xFFC86464), Offset(x, barBottom - 4f * density), Offset(x, barBottom), strokeWidth = 1f)
                 drawContext.canvas.nativeCanvas.drawText("+$dbOver", x, size.height - 1f, redTickFont)
             }
 
-            // S-value text centered on bar
-            val sText = if (rawLevel <= 108) {
-                "S${rawLevel / 12}"
+            // S-value text centered on bar — derived directly from dBm.
+            val sText = if (dbm <= -73f) {
+                val sUnit = ((dbm + 127f) / 6f).toInt().coerceIn(0, 9)
+                "S$sUnit"
             } else {
-                val dbOver = ((rawLevel - 108f) * 60f / 152f).toInt()
+                val dbOver = (dbm + 73f).toInt().coerceAtLeast(0)
                 "S9+$dbOver dB"
             }
             drawContext.canvas.nativeCanvas.drawText(sText, w / 2f, barTop + barHeight / 2f + 10f, centerFont)
         }
+    }
+}
+
+/// Mirror of `sdr_remote_core::dbm_to_display` — maps dBm onto the 0..228
+/// visual range. S0=-127 dBm, S9=-73 dBm, 6 dB per S-unit, 2 raw units per dB
+/// throughout (S1..S9 and the S9+dB zone use the same scaling).
+private fun dbmToDisplay(dbm: Float): Float {
+    return if (dbm <= -73f) {
+        ((dbm + 127f) * 2f).coerceIn(0f, 108f)
+    } else {
+        (108f + (dbm + 73f) * 2f).coerceIn(108f, 228f)
     }
 }
 

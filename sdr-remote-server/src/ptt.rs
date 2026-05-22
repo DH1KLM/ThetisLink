@@ -475,8 +475,16 @@ impl PttController {
         self.tci.vfo_a_mode
     }
 
-    pub fn smeter_avg(&self) -> u16 {
+    pub fn smeter_avg(&self) -> f32 {
         self.tci.smeter_avg()
+    }
+
+    pub fn smeter_sig(&self) -> f32 {
+        self.tci.smeter_sig()
+    }
+
+    pub fn smeter_peakbin(&self) -> f32 {
+        self.tci.smeter_peakbin()
     }
 
     pub fn power_on(&self) -> bool {
@@ -623,8 +631,16 @@ impl PttController {
         self.tci.vfo_b_mode
     }
 
-    pub fn smeter_rx2_avg(&self) -> u16 {
+    pub fn smeter_rx2_avg(&self) -> f32 {
         self.tci.smeter_rx2_avg()
+    }
+
+    pub fn smeter_rx2_sig(&self) -> f32 {
+        self.tci.smeter_rx2_sig()
+    }
+
+    pub fn smeter_rx2_peakbin(&self) -> f32 {
+        self.tci.smeter_rx2_peakbin()
     }
 
     pub fn rx2_af_gain(&self) -> u8 {

@@ -70,6 +70,23 @@ pub(crate) struct ClientConfig {
     pub(crate) spectrum_max_bins: u16,
     pub(crate) spectrum_fft_size_k: u16,
     pub(crate) rx2_spectrum_fft_size_k: u16,
+    /// Total height (in egui-points) reserved for the spectrum + waterfall
+    /// area in the main Radio tab. Range 300-1200. When the value plus the
+    /// rest of the Radio content exceeds the window the page becomes
+    /// scrollable. Popouts keep using their full available height regardless
+    /// of this setting.
+    pub(crate) spectrum_total_h: f32,
+    /// Persisted geometry per popout viewport — `Some((x, y))` / `Some((w, h))`
+    /// is the last position / size the OS reported; `None` means use the
+    /// hard-coded default and let the OS pick the position.
+    pub(crate) spectrum_popout_pos: Option<(f32, f32)>,
+    pub(crate) spectrum_popout_size: Option<(f32, f32)>,
+    pub(crate) rx2_popout_pos: Option<(f32, f32)>,
+    pub(crate) rx2_popout_size: Option<(f32, f32)>,
+    pub(crate) popout_joined_pos: Option<(f32, f32)>,
+    pub(crate) popout_joined_size: Option<(f32, f32)>,
+    pub(crate) yaesu_popout_pos: Option<(f32, f32)>,
+    pub(crate) yaesu_popout_size: Option<(f32, f32)>,
     pub(crate) wf_contrast_per_band: HashMap<String, f32>,
     pub(crate) rx2_spectrum_ref_db: f32,
     pub(crate) rx2_spectrum_range_db: f32,
@@ -78,6 +95,15 @@ pub(crate) struct ClientConfig {
     pub(crate) rx2_enabled: bool,
     pub(crate) popout_joined: bool,
     pub(crate) popout_meter_analog: bool,
+    pub(crate) spectrum_popout: bool,
+    pub(crate) rx2_popout: bool,
+    pub(crate) main_window_pos: Option<(f32, f32)>,
+    pub(crate) ub_show_menu: bool,
+    pub(crate) collapse_diversity: bool,
+    pub(crate) collapse_yaesu_eq: bool,
+    pub(crate) collapse_yaesu_memories: bool,
+    pub(crate) collapse_yaesu_menu: bool,
+    pub(crate) yaesu_memories_h: f32,
     pub(crate) device_tab: u8,
     pub(crate) yaesu_enabled: bool,
     pub(crate) yaesu_volume: f32,
@@ -94,6 +120,9 @@ pub(crate) struct ClientConfig {
     pub(crate) ptt_toggle: bool,
     pub(crate) yaesu_ptt_toggle: bool,
     pub(crate) midi_ptt_toggle: bool,
+    /// S-meter source choice: 0=Sig, 1=Avg (default), 2=MaxBin.
+    /// Shared by RX1 and RX2 — same presentation method for both receivers.
+    pub(crate) smeter_source: u8,
     pub(crate) catsync_enabled: bool,
     pub(crate) catsync_url: String,
     pub(crate) catsync_favorites: Vec<(String, String)>,
@@ -137,15 +166,24 @@ impl Default for ClientConfig {
             spectrum_enabled: false,
             spectrum_ref_db: -20.0,
             spectrum_range_db: 100.0,
-            auto_ref_enabled: false,
+            auto_ref_enabled: true,
             waterfall_contrast: 1.2,
             spectrum_max_bins: sdr_remote_core::DEFAULT_SPECTRUM_BINS as u16,
             spectrum_fft_size_k: 0,  // 0 = auto (server default)
             rx2_spectrum_fft_size_k: 0,
+            spectrum_total_h: 500.0,
+            spectrum_popout_pos: None,
+            spectrum_popout_size: None,
+            rx2_popout_pos: None,
+            rx2_popout_size: None,
+            popout_joined_pos: None,
+            popout_joined_size: None,
+            yaesu_popout_pos: None,
+            yaesu_popout_size: None,
             wf_contrast_per_band: HashMap::new(),
             rx2_spectrum_ref_db: -20.0,
             rx2_spectrum_range_db: 100.0,
-            rx2_auto_ref_enabled: false,
+            rx2_auto_ref_enabled: true,
             rx2_waterfall_contrast: 1.2,
             rx2_enabled: false,
             popout_joined: false,
@@ -157,6 +195,15 @@ impl Default for ClientConfig {
             yaesu_popout: false,
             yaesu_mem_file: String::new(),
             popout_meter_analog: false,
+            spectrum_popout: false,
+            rx2_popout: false,
+            main_window_pos: None,
+            ub_show_menu: false,
+            collapse_diversity: false,
+            collapse_yaesu_eq: false,
+            collapse_yaesu_memories: false,
+            collapse_yaesu_menu: false,
+            yaesu_memories_h: 250.0,
             band_mem: HashMap::new(),
             window_w: 400.0,
             window_h: 500.0,
@@ -166,6 +213,7 @@ impl Default for ClientConfig {
             ptt_toggle: false,
             yaesu_ptt_toggle: false,
             midi_ptt_toggle: true, // MIDI defaults to toggle (existing behavior)
+            smeter_source: 1,      // Avg matches pre-multi-source server default
             catsync_enabled: false,
             catsync_url: String::new(),
             catsync_favorites: Vec::new(),
@@ -176,10 +224,25 @@ impl Default for ClientConfig {
     }
 }
 
+/// Parse a `f32,f32` pair (used for popout pos / size). Returns `None` on any
+/// parse error or malformed input — callers fall back to OS default placement.
+fn parse_f32_pair(val: &str) -> Option<(f32, f32)> {
+    let mut it = val.trim().split(',');
+    let a: f32 = it.next()?.trim().parse().ok()?;
+    let b: f32 = it.next()?.trim().parse().ok()?;
+    Some((a, b))
+}
+
 /// Load saved window size from config (for use before app creation).
 pub(crate) fn load_window_size() -> [f32; 2] {
     let config = load_config();
     [config.window_w, config.window_h]
+}
+
+/// Load saved main window position from config (for use before app creation).
+/// Returns None if no position has been saved yet.
+pub(crate) fn load_window_pos() -> Option<[f32; 2]> {
+    load_config().main_window_pos.map(|(x, y)| [x, y])
 }
 
 /// Load config from file next to the executable.
@@ -280,6 +343,35 @@ pub(crate) fn load_config() -> ClientConfig {
                 config.spectrum_fft_size_k = v;
             }
             has_keys = true;
+        } else if let Some(val) = line.strip_prefix("spectrum_total_h=") {
+            if let Ok(v) = val.trim().parse::<f32>() {
+                config.spectrum_total_h = v.clamp(300.0, 1200.0);
+            }
+            has_keys = true;
+        } else if let Some(val) = line.strip_prefix("spectrum_popout_pos=") {
+            config.spectrum_popout_pos = parse_f32_pair(val);
+            has_keys = true;
+        } else if let Some(val) = line.strip_prefix("spectrum_popout_size=") {
+            config.spectrum_popout_size = parse_f32_pair(val);
+            has_keys = true;
+        } else if let Some(val) = line.strip_prefix("rx2_popout_pos=") {
+            config.rx2_popout_pos = parse_f32_pair(val);
+            has_keys = true;
+        } else if let Some(val) = line.strip_prefix("rx2_popout_size=") {
+            config.rx2_popout_size = parse_f32_pair(val);
+            has_keys = true;
+        } else if let Some(val) = line.strip_prefix("popout_joined_pos=") {
+            config.popout_joined_pos = parse_f32_pair(val);
+            has_keys = true;
+        } else if let Some(val) = line.strip_prefix("popout_joined_size=") {
+            config.popout_joined_size = parse_f32_pair(val);
+            has_keys = true;
+        } else if let Some(val) = line.strip_prefix("yaesu_popout_pos=") {
+            config.yaesu_popout_pos = parse_f32_pair(val);
+            has_keys = true;
+        } else if let Some(val) = line.strip_prefix("yaesu_popout_size=") {
+            config.yaesu_popout_size = parse_f32_pair(val);
+            has_keys = true;
         } else if let Some(val) = line.strip_prefix("auto_ref_enabled=") {
             config.auto_ref_enabled = val.trim() == "true";
             has_keys = true;
@@ -326,6 +418,12 @@ pub(crate) fn load_config() -> ClientConfig {
                 config.window_h = v.clamp(200.0, 4000.0);
             }
             has_keys = true;
+        } else if let Some(val) = line.strip_prefix("main_window_pos=") {
+            config.main_window_pos = parse_f32_pair(val);
+        } else if let Some(val) = line.strip_prefix("spectrum_popout=") {
+            config.spectrum_popout = val.trim() == "true";
+        } else if let Some(val) = line.strip_prefix("rx2_popout=") {
+            config.rx2_popout = val.trim() == "true";
         } else if let Some(val) = line.strip_prefix("device_tab=") {
             if let Ok(v) = val.trim().parse::<u8>() { config.device_tab = v; }
         } else if let Some(val) = line.strip_prefix("yaesu_enabled=") {
@@ -365,6 +463,20 @@ pub(crate) fn load_config() -> ClientConfig {
             has_keys = true;
         } else if let Some(val) = line.strip_prefix("popout_meter_analog=") {
             config.popout_meter_analog = val.trim() == "true";
+        } else if let Some(val) = line.strip_prefix("ub_show_menu=") {
+            config.ub_show_menu = val.trim() == "true";
+        } else if let Some(val) = line.strip_prefix("collapse_diversity=") {
+            config.collapse_diversity = val.trim() == "true";
+        } else if let Some(val) = line.strip_prefix("collapse_yaesu_eq=") {
+            config.collapse_yaesu_eq = val.trim() == "true";
+        } else if let Some(val) = line.strip_prefix("collapse_yaesu_memories=") {
+            config.collapse_yaesu_memories = val.trim() == "true";
+        } else if let Some(val) = line.strip_prefix("collapse_yaesu_menu=") {
+            config.collapse_yaesu_menu = val.trim() == "true";
+        } else if let Some(val) = line.strip_prefix("yaesu_memories_h=") {
+            if let Ok(v) = val.trim().parse::<f32>() {
+                config.yaesu_memories_h = v.clamp(100.0, 800.0);
+            }
             has_keys = true;
         } else if let Some(val) = line.strip_prefix("vfo_a_volume=") {
             if let Ok(v) = val.trim().parse::<f32>() {
@@ -456,6 +568,11 @@ pub(crate) fn load_config() -> ClientConfig {
             config.yaesu_ptt_toggle = val.trim() == "true";
         } else if let Some(val) = line.strip_prefix("midi_ptt_toggle=") {
             config.midi_ptt_toggle = val.trim() == "true";
+        } else if let Some(val) = line.strip_prefix("smeter_source=") {
+            if let Ok(v) = val.trim().parse::<u8>() {
+                if v <= 2 { config.smeter_source = v; }
+            }
+            has_keys = true;
         } else if let Some(val) = line.strip_prefix("allow_zoom_below_2x=") {
             config.allow_zoom_below_2x = val.trim() == "true";
             has_keys = true;
@@ -527,6 +644,15 @@ pub(crate) fn save_config(
     spectrum_max_bins: u16,
     spectrum_fft_size_k: u16,
     rx2_spectrum_fft_size_k: u16,
+    spectrum_total_h: f32,
+    spectrum_popout_pos: Option<(f32, f32)>,
+    spectrum_popout_size: Option<(f32, f32)>,
+    rx2_popout_pos: Option<(f32, f32)>,
+    rx2_popout_size: Option<(f32, f32)>,
+    popout_joined_pos: Option<(f32, f32)>,
+    popout_joined_size: Option<(f32, f32)>,
+    yaesu_popout_pos_arg: Option<(f32, f32)>,
+    yaesu_popout_size_arg: Option<(f32, f32)>,
     wf_contrast_per_band: &HashMap<String, f32>,
     rx2_spectrum_ref_db: f32,
     rx2_spectrum_range_db: f32,
@@ -535,6 +661,15 @@ pub(crate) fn save_config(
     rx2_enabled: bool,
     popout_joined: bool,
     popout_meter_analog: bool,
+    spectrum_popout: bool,
+    rx2_popout: bool,
+    main_window_pos: Option<(f32, f32)>,
+    ub_show_menu: bool,
+    collapse_diversity: bool,
+    collapse_yaesu_eq: bool,
+    collapse_yaesu_memories: bool,
+    collapse_yaesu_menu: bool,
+    yaesu_memories_h: f32,
     device_tab: u8,
     yaesu_enabled: bool,
     yaesu_volume: f32,
@@ -572,6 +707,31 @@ pub(crate) fn save_config(
         content.push_str(&format!("spectrum_max_bins={}\n", spectrum_max_bins));
         content.push_str(&format!("spectrum_fft_size_k={}\n", spectrum_fft_size_k));
         content.push_str(&format!("rx2_spectrum_fft_size_k={}\n", rx2_spectrum_fft_size_k));
+        content.push_str(&format!("spectrum_total_h={:.0}\n", spectrum_total_h));
+        if let Some((x, y)) = spectrum_popout_pos {
+            content.push_str(&format!("spectrum_popout_pos={:.0},{:.0}\n", x, y));
+        }
+        if let Some((w, h)) = spectrum_popout_size {
+            content.push_str(&format!("spectrum_popout_size={:.0},{:.0}\n", w, h));
+        }
+        if let Some((x, y)) = rx2_popout_pos {
+            content.push_str(&format!("rx2_popout_pos={:.0},{:.0}\n", x, y));
+        }
+        if let Some((w, h)) = rx2_popout_size {
+            content.push_str(&format!("rx2_popout_size={:.0},{:.0}\n", w, h));
+        }
+        if let Some((x, y)) = popout_joined_pos {
+            content.push_str(&format!("popout_joined_pos={:.0},{:.0}\n", x, y));
+        }
+        if let Some((w, h)) = popout_joined_size {
+            content.push_str(&format!("popout_joined_size={:.0},{:.0}\n", w, h));
+        }
+        if let Some((x, y)) = yaesu_popout_pos_arg {
+            content.push_str(&format!("yaesu_popout_pos={:.0},{:.0}\n", x, y));
+        }
+        if let Some((w, h)) = yaesu_popout_size_arg {
+            content.push_str(&format!("yaesu_popout_size={:.0},{:.0}\n", w, h));
+        }
         content.push_str(&format!("waterfall_contrast={:.2}\n", waterfall_contrast));
         // Per-band WF contrast
         if !wf_contrast_per_band.is_empty() {
@@ -588,6 +748,17 @@ pub(crate) fn save_config(
         content.push_str(&format!("rx2_enabled={}\n", rx2_enabled));
         content.push_str(&format!("popout_joined={}\n", popout_joined));
         content.push_str(&format!("popout_meter_analog={}\n", popout_meter_analog));
+        content.push_str(&format!("spectrum_popout={}\n", spectrum_popout));
+        content.push_str(&format!("rx2_popout={}\n", rx2_popout));
+        if let Some((x, y)) = main_window_pos {
+            content.push_str(&format!("main_window_pos={:.0},{:.0}\n", x, y));
+        }
+        content.push_str(&format!("ub_show_menu={}\n", ub_show_menu));
+        content.push_str(&format!("collapse_diversity={}\n", collapse_diversity));
+        content.push_str(&format!("collapse_yaesu_eq={}\n", collapse_yaesu_eq));
+        content.push_str(&format!("collapse_yaesu_memories={}\n", collapse_yaesu_memories));
+        content.push_str(&format!("collapse_yaesu_menu={}\n", collapse_yaesu_menu));
+        content.push_str(&format!("yaesu_memories_h={:.0}\n", yaesu_memories_h));
         content.push_str(&format!("device_tab={}\n", device_tab));
         content.push_str(&format!("yaesu_enabled={}\n", yaesu_enabled));
         content.push_str(&format!("yaesu_volume={:.3}\n", yaesu_volume));
@@ -642,11 +813,12 @@ pub(crate) fn save_config(
         for (i, mapping) in midi_mappings.iter().enumerate() {
             content.push_str(&format!("midi_map_{}={}\n", i, mapping.to_config()));
         }
-        // Preserve ptt_toggle + midi_ptt_toggle + allow_zoom_below_2x + successful_connects from existing config
+        // Preserve ptt_toggle + midi_ptt_toggle + allow_zoom_below_2x + smeter_source + successful_connects from existing config
         if let Ok(existing) = std::fs::read_to_string(&path) {
             for line in existing.lines() {
                 if line.starts_with("ptt_toggle=") || line.starts_with("yaesu_ptt_toggle=") || line.starts_with("midi_ptt_toggle=")
                     || line.starts_with("allow_zoom_below_2x=")
+                    || line.starts_with("smeter_source=")
                     || line.starts_with("successful_connects=") {
                     content.push_str(line);
                     content.push('\n');
@@ -672,6 +844,35 @@ pub(crate) fn save_allow_zoom_below_2x(allow: bool) {
         .lines()
         .map(|l| {
             if l.starts_with("allow_zoom_below_2x=") {
+                found = true;
+                new_line.clone()
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+    if !found {
+        updated_lines.push(new_line);
+    }
+    let _ = std::fs::write(path, updated_lines.join("\n") + "\n");
+}
+
+/// Persist the S-meter source choice (0=Sig, 1=Avg, 2=MaxBin) to the config
+/// file as a single `smeter_source=N` line. Read-modify-write so other keys
+/// are untouched. Called whenever the user changes the source in the Thetis tab.
+pub(crate) fn save_smeter_source(source: u8) {
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let path = exe.with_file_name(CONFIG_FILE);
+    let new_line = format!("smeter_source={}", source);
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut found = false;
+    let mut updated_lines: Vec<String> = existing
+        .lines()
+        .map(|l| {
+            if l.starts_with("smeter_source=") {
                 found = true;
                 new_line.clone()
             } else {

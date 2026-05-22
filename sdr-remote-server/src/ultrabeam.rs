@@ -103,16 +103,18 @@ pub fn band_name(band: u8) -> &'static str {
     }
 }
 
-/// Build labels CSV for network broadcast (11 fields + elements).
-/// Format: fw_major,fw_minor,operation,frequency_khz,band,direction,off_state,motors_moving,motor_distance_mm,motor_completion,elements(;-sep)
+/// Build labels CSV for network broadcast.
+/// Format (v1, 11 fields): fw_major,fw_minor,operation,frequency_khz,band,direction,off_state,motors_moving,motor_distance_mm,motor_completion,elements(;-sep)
+/// Format (v2, 13 fields): + freq_min_mhz, freq_max_mhz (appended; older clients ignore trailing fields)
 pub fn status_labels_string(s: &UltraBeamStatus) -> String {
     let elems: Vec<String> = s.elements_mm.iter().map(|e| e.to_string()).collect();
     format!(
-        "{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{}",
         s.fw_major, s.fw_minor, s.operation, s.frequency_khz, s.band,
         s.direction, s.off_state as u8, s.motors_moving,
         s.motor_distance_mm, s.motor_completion,
         elems.join(";"),
+        s.freq_min_mhz, s.freq_max_mhz,
     )
 }
 

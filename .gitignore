@@ -1,23 +1,56 @@
-# Rust build output
 /target
-
-# Editor/OS files
+Cargo.lock
 *.swp
 *.swo
 *~
-.DS_Store
 
-# Build artifacts (built, not committed)
+# Build artifacts (niet in repo, hoort in GitHub Releases)
 *.exe
 *.apk
 *.so
+*.zip
+
+# Release procedure (niet publiek)
+Release.md
+RELEASE.md
+
+# Losse referentie/debug bestanden
+*.pdf
+*.cs
+*.c
+*.ps1
+*.scpt
+*.mp4
+*.png
+*.webp
+*.tab
+*.FT991A
+*.conf
+*.log
+tci_raw.txt
+deep-research-report.md
+android-arm64-toolchain.cmake
+
+# Directories
+richie/
+macos-cargo/
+.claude/
+release/
+
+# Platform-specific workspace variants
+Cargo-macos.toml
+
+# Local backups
+*.local-backup
+
+# Debug symbols
 *.pdb
 
-# Local logs and runtime state
-*.log
-*.conf
+# Icon/image source assets (follow existing *.png/*.webp convention)
+*.bmp
+*.ico
+release-v*/
 
-# Android build output
-sdr-remote-android/android/app/build/
-sdr-remote-android/android/.gradle/
-sdr-remote-android/android/local.properties
+# Stray build outputs / one-off helper scripts kept on disk but not in repo
+ThetisLink-Client
+extract_jio_pdf.py

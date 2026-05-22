@@ -64,9 +64,6 @@ pub struct ServerApp {
     last_switch_a: u8,
     last_switch_b: u8,
     // Tuner window
-    tuner_port: String,
-    tuner_enabled: bool,
-    tuner_assume_tuned: bool,
     tuner: Option<Arc<Jc4sTuner>>,
     show_tuner_window: bool,
     tuner_log: VecDeque<(String, String)>,
@@ -140,6 +137,18 @@ pub struct ServerApp {
     show_rotor_window: bool,
     rotor_window_pos: Option<[f32; 2]>,
     rotor_goto_input: String,
+    // Per-popout "init applied" flags — see mirror impl in
+    // sdr-remote-client mod.rs apply_popout_geometry for the rationale.
+    // Repeated `with_position()` calls every frame caused the windows to
+    // jitter when manually moved; we now only apply position on the first
+    // frame after the window opens, then let the OS keep it where the user
+    // left it.
+    tuner_window_init_applied: bool,
+    amplitec_window_init_applied: bool,
+    spe_window_init_applied: bool,
+    rf2k_window_init_applied: bool,
+    ultrabeam_window_init_applied: bool,
+    rotor_window_init_applied: bool,
     // DX Cluster
     dxcluster_server: String,
     dxcluster_callsign: String,
@@ -220,9 +229,6 @@ impl ServerApp {
             amplitec_log: VecDeque::new(),
             last_switch_a: 0,
             last_switch_b: 0,
-            tuner_port: config.tuner_port.unwrap_or_default(),
-            tuner_enabled: config.tuner_enabled,
-            tuner_assume_tuned: config.tuner_assume_tuned,
             tuner: None,
             show_tuner_window: config.show_tuner_window,
             tuner_log: VecDeque::new(),
@@ -272,8 +278,9 @@ impl ServerApp {
             ultrabeam_enabled: config.ultrabeam_enabled,
             ultrabeam: None,
             show_ultrabeam_window: config.show_ultrabeam_window,
+            // ultrabeam_show_menu initialized below — load from config
             ultrabeam_window_pos: config.ultrabeam_window_pos,
-            ultrabeam_show_menu: false,
+            ultrabeam_show_menu: config.ultrabeam_show_menu,
             ultrabeam_confirm_retract: false,
             ultrabeam_confirm_calibrate: false,
             ultrabeam_auto_track: false,
@@ -284,6 +291,12 @@ impl ServerApp {
             show_rotor_window: config.show_rotor_window,
             rotor_window_pos: config.rotor_window_pos,
             rotor_goto_input: String::new(),
+            tuner_window_init_applied: false,
+            amplitec_window_init_applied: false,
+            spe_window_init_applied: false,
+            rf2k_window_init_applied: false,
+            ultrabeam_window_init_applied: false,
+            rotor_window_init_applied: false,
             dxcluster_server: config.dxcluster_server.clone(),
             dxcluster_callsign: config.dxcluster_callsign.clone(),
             dxcluster_enabled: config.dxcluster_enabled,
@@ -316,7 +329,6 @@ impl ServerApp {
         let thetis = self.thetis_path.trim().to_string();
         let yaesu_port_str = self.yaesu_port.trim().to_string();
         let amp_port = self.amplitec_port.trim().to_string();
-        let tun_port = self.tuner_port.trim().to_string();
         let spe_port_str = self.spe_port.trim().to_string();
         let rf2k_addr_str = self.rf2k_addr.trim().to_string();
         let ub_port = self.ultrabeam_port.trim().to_string();
@@ -332,9 +344,6 @@ impl ServerApp {
             amplitec_enabled: self.amplitec_enabled,
             amplitec_labels: self.amplitec_labels.clone(),
             show_amplitec_window: self.show_amplitec_window,
-            tuner_port: if tun_port.is_empty() { None } else { Some(tun_port.clone()) },
-            tuner_enabled: self.tuner_enabled,
-            tuner_assume_tuned: self.tuner_assume_tuned,
             show_tuner_window: self.show_tuner_window,
             spe_port: if spe_port_str.is_empty() { None } else { Some(spe_port_str.clone()) },
             spe_enabled: self.spe_enabled,
@@ -364,6 +373,18 @@ impl ServerApp {
             rotor_window_size: self.rotor_window_size,
             autostart: self.autostart,
             active_pa: self.active_pa.load(Ordering::Relaxed),
+            // Preserve the persisted per-PA pre-Operate snapshot values; the
+            // RF2K observer is the only writer (see rf2k.rs save_saved_drive
+            // call). Reading them from `load()` here keeps `start_server()`
+            // from clobbering the snapshot back to None on every restart.
+            rf2k_saved_drive: crate::config::load().rf2k_saved_drive,
+            spe_saved_drive: crate::config::load().spe_saved_drive,
+            ultrabeam_show_menu: self.ultrabeam_show_menu,
+            mcp2221_section_expanded: crate::config::load().mcp2221_section_expanded,
+            // Preserve the multi-tuner schema across UI saves — until the
+            // settings UI exposes tuner1/tuner2 the values just round-trip
+            // through whatever was last loaded from disk.
+            tuners: crate::config::load().tuners,
             tci_addr: if self.tci_addr.trim().is_empty() { None } else { Some(self.tci_addr.trim().to_string()) },
             dxcluster_server: self.dxcluster_server.clone(),
             dxcluster_callsign: self.dxcluster_callsign.clone(),
@@ -453,28 +474,25 @@ impl ServerApp {
             None
         };
 
-        // Create JC-4s tuner (after SPE + RF2K, so it gets PA references for safe tune)
-        let tuner_arc = if !tun_port.is_empty() && self.tuner_enabled {
-            let port = tun_port.clone();
+        // Build StockCorner tuner collection (post-MCP2221A refactor). Each
+        // enabled `config.tuners` slot tries to open its MCP2221A board; we
+        // don't fail server-start when a board is unplugged (the tuner thread
+        // will retry on the next Tune press). The primary (first enabled)
+        // tuner is kept in `self.tuner` for the legacy single-tuner UI / macro
+        // paths; the full collection is passed downstream for per-position
+        // routing in network.rs.
+        let tuners_arc = {
+            let tuner_configs = config.tuners.clone();
             let spe_ref = spe_arc.clone();
             let rf2k_ref = rf2k_arc.clone();
-            let assume_tuned = self.tuner_assume_tuned;
-            match with_timeout(com_timeout, move || Jc4sTuner::new(&port, cat_tx, spe_ref, rf2k_ref, assume_tuned)) {
-                Ok(t) => {
-                    log::info!("JC-4s tuner connected on {}", tun_port);
-                    let arc_t = Arc::new(t);
-                    self.tuner = Some(arc_t.clone());
-                    Some(arc_t)
-                }
-                Err(e) => {
-                    log::warn!("JC-4s tuner init failed: {}", e);
-                    None
-                }
+            let collection = crate::tuner::Tuners::new(&tuner_configs, cat_tx, spe_ref, rf2k_ref);
+            let arc_collection = Arc::new(collection);
+            self.tuner = arc_collection.primary();
+            if !arc_collection.is_empty() {
+                log::info!("Tuners online: {} instance(s)", arc_collection.instances().len());
             }
-        } else {
-            None
+            Some(arc_collection)
         };
-
         // Create UltraBeam if configured
         if !ub_port.is_empty() && self.ultrabeam_enabled {
             let port = ub_port.clone();
@@ -514,7 +532,7 @@ impl ServerApp {
         let handle = std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
             rt.block_on(async {
-                if let Err(e) = crate::run_server_async(config, shutdown_rx, amplitec, tuner_arc, spe_arc, rf2k_arc, ultrabeam_for_net, rotor_for_net, Some(cat_rx), Some(drive_level_shared), Some(active_pa_shared), Some(vfo_freq_shared), Some(vfo_b_freq_shared), yaesu_for_net, Some(status_panel_state)).await {
+                if let Err(e) = crate::run_server_async(config, shutdown_rx, amplitec, tuners_arc, spe_arc, rf2k_arc, ultrabeam_for_net, rotor_for_net, Some(cat_rx), Some(drive_level_shared), Some(active_pa_shared), Some(vfo_freq_shared), Some(vfo_b_freq_shared), yaesu_for_net, Some(status_panel_state)).await {
                     log::error!("Server error: {}", e);
                 }
             });
@@ -643,27 +661,24 @@ impl eframe::App for ServerApp {
 
                     ui.add_space(8.0);
 
-                    ui.horizontal(|ui| {
-                        ui.checkbox(&mut self.tuner_enabled, "JC-4s Tuner");
-                        egui::ComboBox::from_id_salt("tuner_port")
-                            .selected_text(if self.tuner_port.is_empty() { "(Geen)" } else { &self.tuner_port })
-                            .width(200.0)
-                            .show_ui(ui, |ui| {
-                                if ui.selectable_label(self.tuner_port.is_empty(), "(Geen)").clicked() {
-                                    self.tuner_port.clear();
-                                }
-                                for port in &self.serial_ports {
-                                    if ui.selectable_label(*port == self.tuner_port, port).clicked() {
-                                        self.tuner_port = port.clone();
-                                    }
-                                }
-                            });
-                    });
-
-                    if !self.tuner_port.is_empty() {
-                        ui.checkbox(&mut self.tuner_assume_tuned, "CTS-puls compensatie (herstart vereist)");
-                        ui.checkbox(&mut self.show_tuner_window, "Tuner venster openen bij starten");
-                    }
+                    // JC-4s / JC-3s tuners — geen COM-poort meer. Elke tuner
+                    // wordt aangestuurd via een Adafruit MCP2221A USB-HID
+                    // breakout en per slot toegewezen in het server status-
+                    // paneel onder "MCP2221A tuner bridges". Hier alleen nog
+                    // het venster-openen-bij-start vinkje voor het Tuner-
+                    // popout-paneel van de primaire tuner.
+                    ui.label(
+                        egui::RichText::new("JC-4s / JC-3s tuners")
+                            .strong(),
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "Configureer per slot via het MCP2221A blok onderaan het status-paneel.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    ui.checkbox(&mut self.show_tuner_window, "Tuner venster openen bij starten");
 
                     ui.add_space(8.0);
 
@@ -886,6 +901,19 @@ impl eframe::App for ServerApp {
                         self.ultrabeam = None;
                         self.rotor = None;
                         self.status_panel_state = None;
+                        // Reset per-popout init_applied flags so the saved
+                        // position+size get re-applied on the next Save &
+                        // Start. Without this the viewport closes silently
+                        // (no close_requested event when we leave Running
+                        // mode) and the next reopen sees init_applied=true,
+                        // skipping with_position/with_inner_size, leaving
+                        // every popout at the OS default clump.
+                        self.tuner_window_init_applied = false;
+                        self.amplitec_window_init_applied = false;
+                        self.spe_window_init_applied = false;
+                        self.rf2k_window_init_applied = false;
+                        self.ultrabeam_window_init_applied = false;
+                        self.rotor_window_init_applied = false;
                         self.mode = Mode::Settings;
                     }
 
@@ -905,7 +933,6 @@ impl eframe::App for ServerApp {
                     let msg = match status.state {
                         crate::tuner::TUNER_TUNING => "Tune gestart".to_string(),
                         crate::tuner::TUNER_DONE_OK => "Tune compleet".to_string(),
-                        crate::tuner::TUNER_DONE_ASSUMED => "Tune OK (assumed)".to_string(),
                         crate::tuner::TUNER_TIMEOUT => "Tune timeout (30s)".to_string(),
                         crate::tuner::TUNER_ABORTED => "Tune afgebroken".to_string(),
                         crate::tuner::TUNER_IDLE if self.last_tuner_state != 0 => "Status reset naar Idle".to_string(),
@@ -924,11 +951,24 @@ impl eframe::App for ServerApp {
 
                 let tuner_default_h = if self.show_tuner_log { 380.0 } else { 180.0 };
                 let tuner_sz = self.tuner_window_size.unwrap_or([660.0, tuner_default_h]);
+                // Popout title follows the primary tuner's label (e.g.
+                // "Tuner1 (JC-4s loop)") so the window doesn't lie about the
+                // model when slot 0 is a JC-3s, and matches what the status
+                // panel shows. Falls back to a generic label when no live
+                // tuner is bound.
+                let tuner_title = tuner_for_window.label().to_string();
                 let mut tuner_vb = ViewportBuilder::default()
-                    .with_title("JC-4s Antenna Tuner")
-                    .with_inner_size(tuner_sz);
-                if let Some(pos) = self.tuner_window_pos {
-                    tuner_vb = tuner_vb.with_position(egui::pos2(pos[0], pos[1]));
+                    .with_title(if tuner_title.is_empty() {
+                        "StockCorner Tuner".to_string()
+                    } else {
+                        tuner_title
+                    });
+                if !self.tuner_window_init_applied {
+                    tuner_vb = tuner_vb.with_inner_size(tuner_sz);
+                    if let Some(pos) = self.tuner_window_pos {
+                        tuner_vb = tuner_vb.with_position(egui::pos2(pos[0], pos[1]));
+                    }
+                    self.tuner_window_init_applied = true;
                 }
                 let mut tuner_closed = false;
                 ctx.show_viewport_immediate(
@@ -944,6 +984,7 @@ impl eframe::App for ServerApp {
                         }
                         if ctx.input(|i| i.viewport().close_requested()) {
                             self.show_tuner_window = false;
+                            self.tuner_window_init_applied = false;
                             tuner_closed = true;
                             return;
                         }
@@ -1028,14 +1069,16 @@ impl eframe::App for ServerApp {
                         return;
                     }
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        render_macro_editor(
-                            ui,
-                            &mut self.macro_slots,
-                            &mut self.editor_slot,
-                            &mut self.editor_label,
-                            &mut self.editor_actions,
-                            &mut self.show_macro_editor,
-                        );
+                        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                            render_macro_editor(
+                                ui,
+                                &mut self.macro_slots,
+                                &mut self.editor_slot,
+                                &mut self.editor_label,
+                                &mut self.editor_actions,
+                                &mut self.show_macro_editor,
+                            );
+                        });
                     });
                 },
             );
@@ -1069,10 +1112,13 @@ impl eframe::App for ServerApp {
                 let amp_default_h = if self.show_amplitec_log { 330.0 } else { 175.0 };
                 let amp_sz = self.amplitec_window_size.unwrap_or([420.0, amp_default_h]);
                 let mut amp_vb = ViewportBuilder::default()
-                    .with_title("Amplitec 6/2 Antenna Switch")
-                    .with_inner_size(amp_sz);
-                if let Some(pos) = self.amplitec_window_pos {
-                    amp_vb = amp_vb.with_position(egui::pos2(pos[0], pos[1]));
+                    .with_title("Amplitec 6/2 Antenna Switch");
+                if !self.amplitec_window_init_applied {
+                    amp_vb = amp_vb.with_inner_size(amp_sz);
+                    if let Some(pos) = self.amplitec_window_pos {
+                        amp_vb = amp_vb.with_position(egui::pos2(pos[0], pos[1]));
+                    }
+                    self.amplitec_window_init_applied = true;
                 }
                 let mut amplitec_closed = false;
                 ctx.show_viewport_immediate(
@@ -1087,6 +1133,7 @@ impl eframe::App for ServerApp {
                         }
                         if ctx.input(|i| i.viewport().close_requested()) {
                             self.show_amplitec_window = false;
+                            self.amplitec_window_init_applied = false;
                             amplitec_closed = true;
                             return;
                         }
@@ -1148,10 +1195,13 @@ impl eframe::App for ServerApp {
                 let spe_sz = self.spe_window_size.unwrap_or([460.0, spe_default_h]);
                 let mut spe_vb = ViewportBuilder::default()
                     .with_title("SPE Expert 1.3K-FA")
-                    .with_inner_size(spe_sz)
                     .with_resizable(true);
-                if let Some(pos) = self.spe_window_pos {
-                    spe_vb = spe_vb.with_position(egui::pos2(pos[0], pos[1]));
+                if !self.spe_window_init_applied {
+                    spe_vb = spe_vb.with_inner_size(spe_sz);
+                    if let Some(pos) = self.spe_window_pos {
+                        spe_vb = spe_vb.with_position(egui::pos2(pos[0], pos[1]));
+                    }
+                    self.spe_window_init_applied = true;
                 }
                 let mut spe_closed = false;
                 ctx.show_viewport_immediate(
@@ -1166,6 +1216,7 @@ impl eframe::App for ServerApp {
                         }
                         if ctx.input(|i| i.viewport().close_requested()) {
                             self.show_spe_window = false;
+                            self.spe_window_init_applied = false;
                             spe_closed = true;
                             return;
                         }
@@ -1193,10 +1244,13 @@ impl eframe::App for ServerApp {
                 let rf2k_sz = self.rf2k_window_size.unwrap_or([480.0, 520.0]);
                 let mut rf2k_vb = ViewportBuilder::default()
                     .with_title("RF2K-S Power Amplifier")
-                    .with_inner_size(rf2k_sz)
                     .with_resizable(true);
-                if let Some(pos) = self.rf2k_window_pos {
-                    rf2k_vb = rf2k_vb.with_position(egui::pos2(pos[0], pos[1]));
+                if !self.rf2k_window_init_applied {
+                    rf2k_vb = rf2k_vb.with_inner_size(rf2k_sz);
+                    if let Some(pos) = self.rf2k_window_pos {
+                        rf2k_vb = rf2k_vb.with_position(egui::pos2(pos[0], pos[1]));
+                    }
+                    self.rf2k_window_init_applied = true;
                 }
                 let mut rf2k_closed = false;
                 ctx.show_viewport_immediate(
@@ -1211,6 +1265,7 @@ impl eframe::App for ServerApp {
                         }
                         if ctx.input(|i| i.viewport().close_requested()) {
                             self.show_rf2k_window = false;
+                            self.rf2k_window_init_applied = false;
                             rf2k_closed = true;
                             return;
                         }
@@ -1249,10 +1304,13 @@ impl eframe::App for ServerApp {
                 let ub_sz = self.ultrabeam_window_size.unwrap_or([440.0, ub_default_h]);
                 let mut ub_vb = ViewportBuilder::default()
                     .with_title("UltraBeam RCU-06")
-                    .with_inner_size(ub_sz)
                     .with_resizable(true);
-                if let Some(pos) = self.ultrabeam_window_pos {
-                    ub_vb = ub_vb.with_position(egui::pos2(pos[0], pos[1]));
+                if !self.ultrabeam_window_init_applied {
+                    ub_vb = ub_vb.with_inner_size(ub_sz);
+                    if let Some(pos) = self.ultrabeam_window_pos {
+                        ub_vb = ub_vb.with_position(egui::pos2(pos[0], pos[1]));
+                    }
+                    self.ultrabeam_window_init_applied = true;
                 }
                 let mut ub_closed = false;
                 ctx.show_viewport_immediate(
@@ -1267,12 +1325,14 @@ impl eframe::App for ServerApp {
                         }
                         if ctx.input(|i| i.viewport().close_requested()) {
                             self.show_ultrabeam_window = false;
+                            self.ultrabeam_window_init_applied = false;
                             ub_closed = true;
                             return;
                         }
                         egui::CentralPanel::default().show(ctx, |ui| {
                             egui::ScrollArea::vertical().show(ui, |ui| {
                                 let amp_status = self.amplitec.as_ref().map(|a| a.status());
+                                let prev_show_menu = self.ultrabeam_show_menu;
                                 render_ultrabeam_panel(ui, &ub_for_window, &status,
                                     &mut self.ultrabeam_show_menu,
                                     &mut self.ultrabeam_confirm_retract,
@@ -1283,6 +1343,9 @@ impl eframe::App for ServerApp {
                                     &self.vfo_b_freq_shared,
                                     &amp_status,
                                     &self.amplitec_labels);
+                                if self.ultrabeam_show_menu != prev_show_menu {
+                                    crate::config::save_ultrabeam_show_menu(self.ultrabeam_show_menu);
+                                }
                             });
                         });
                         ctx.request_repaint_after(Duration::from_millis(200));
@@ -1303,10 +1366,13 @@ impl eframe::App for ServerApp {
                 let rotor_sz = self.rotor_window_size.unwrap_or([340.0, 320.0]);
                 let mut rotor_vb = ViewportBuilder::default()
                     .with_title("EA7HG Visual Rotor")
-                    .with_inner_size(rotor_sz)
                     .with_resizable(true);
-                if let Some(pos) = self.rotor_window_pos {
-                    rotor_vb = rotor_vb.with_position(egui::pos2(pos[0], pos[1]));
+                if !self.rotor_window_init_applied {
+                    rotor_vb = rotor_vb.with_inner_size(rotor_sz);
+                    if let Some(pos) = self.rotor_window_pos {
+                        rotor_vb = rotor_vb.with_position(egui::pos2(pos[0], pos[1]));
+                    }
+                    self.rotor_window_init_applied = true;
                 }
                 let mut rotor_closed = false;
                 ctx.show_viewport_immediate(
@@ -1321,11 +1387,14 @@ impl eframe::App for ServerApp {
                         }
                         if ctx.input(|i| i.viewport().close_requested()) {
                             self.show_rotor_window = false;
+                            self.rotor_window_init_applied = false;
                             rotor_closed = true;
                             return;
                         }
                         egui::CentralPanel::default().show(ctx, |ui| {
-                            render_rotor_panel(ui, &rotor_for_window, &status, &mut self.rotor_goto_input);
+                            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                                render_rotor_panel(ui, &rotor_for_window, &status, &mut self.rotor_goto_input);
+                            });
                         });
                         ctx.request_repaint_after(Duration::from_millis(200));
                     },
@@ -1372,7 +1441,7 @@ impl eframe::App for ServerApp {
                                 ("Yaesu FT-991A", "Serial CAT + USB Audio"),
                                 ("RF2K-S PA", "HTTP API"),
                                 ("SPE Expert 1.3K-FA", "Serial"),
-                                ("JC-4s Tuner", "Serial (DTR)"),
+                                ("StockCorner JC-4s / JC-3s Tuner (×2)", "MCP2221A USB-HID"),
                                 ("UltraBeam RCU-06", "Serial"),
                                 ("Amplitec 6/2", "Serial"),
                                 ("EA7HG Visual Rotor", "UDP"),

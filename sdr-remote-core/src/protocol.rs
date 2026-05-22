@@ -13,7 +13,16 @@ pub const MAGIC: u8 = 0xAA;
 /// ControlId range, new auth path. v1-clients cannot interoperate with v2-
 /// servers and vice versa; mismatch surfaces as `unsupported version` at
 /// header-deserialize time (early, explicit failure).
-pub const VERSION: u8 = 2;
+///
+/// **Breaking change v2 → v3 (build 58 bundle):** `SmeterPacket.level`
+/// reinterpreted from unsigned 0-260 display-units to signed deci-units
+/// (dBm × 10 in RX, watts × 10 in TX). Wire size unchanged (2 bytes BE),
+/// but a v2-peer reading a v3-packet (or vice versa) would clamp/overflow
+/// silently and corrupt the S-meter. Bumping VERSION forces explicit
+/// "unsupported version" rejection at handshake / first packet, so mixed
+/// deploys fail loudly instead of producing garbage readings. Server,
+/// desktop client and Android must all upgrade in lockstep.
+pub const VERSION: u8 = 3;
 
 /// Packet type identifiers
 #[derive(Debug, Clone, Copy, PartialEq, Eq, TryFromPrimitive)]
@@ -61,6 +70,18 @@ pub enum PacketType {
     AudioBinR = 0x1A,
     /// Multi-channel audio: 1-4 mono Opus frames bundled in one packet
     AudioMultiCh = 0x1B,
+    /// RX1 S-meter Sig source (server → client, same SmeterPacket format).
+    /// Emitted when client subscribes via SmeterSources bit 0. Carries WDSP
+    /// RXA_S_PK (peak-hold with 100ms decay) — Multimeter "Sig" mode.
+    SmeterSig = 0x1C,
+    /// RX1 S-meter MaxBin source (server → client, same SmeterPacket format).
+    /// Emitted when client subscribes via SmeterSources bit 2. Carries the
+    /// highest single FFT bin in the passband — Multimeter "Max Bin" mode.
+    SmeterMaxBin = 0x1D,
+    /// RX2 S-meter Sig source (server → client). Bit 4 in SmeterSources.
+    SmeterRx2Sig = 0x1E,
+    /// RX2 S-meter MaxBin source (server → client). Bit 6 in SmeterSources.
+    SmeterRx2MaxBin = 0x1F,
     /// Yaesu memory data (server → client, tab-separated text)
     YaesuMemoryData = 0x19,
     /// Authentication challenge (server → client, 16-byte nonce)
@@ -289,6 +310,20 @@ pub enum ControlId {
     /// TL2-1 server enforces strictest setting over all connected clients (zoom-min 2×
     /// zolang één client vink-uit heeft). Used by `auto_recenter_ex` feature.
     AllowZoomBelow2x = 0x63,
+
+    /// Per-client S-meter source-subscription bitmap. Each bit toggles emission
+    /// of one S-meter packet type by the server. Default (no control sent):
+    /// `0x22` = RX1 Avg + RX2 Avg, matches pre-multi-source behaviour.
+    ///
+    /// Bitmap layout (u16):
+    ///   bit 0  = RX1 Sig    → PacketType::SmeterSig         (WDSP RXA_S_PK)
+    ///   bit 1  = RX1 Avg    → PacketType::Smeter            (WDSP RXA_S_AV)
+    ///   bit 2  = RX1 MaxBin → PacketType::SmeterMaxBin      (single peak FFT bin)
+    ///   bit 4  = RX2 Sig    → PacketType::SmeterRx2Sig
+    ///   bit 5  = RX2 Avg    → PacketType::SmeterRx2         (existing)
+    ///   bit 6  = RX2 MaxBin → PacketType::SmeterRx2MaxBin
+    /// All other bits reserved.
+    SmeterSources = 0x64,
 }
 
 impl ControlId {
@@ -817,10 +852,14 @@ impl ModePacket {
 }
 
 /// S-meter packet: header(4) + level(2) = 6 bytes
-/// Server→client only. Level is raw ZZSM value (0-260).
+/// Server→client only. Level is signed deci-units:
+///  - `Flags::PTT` clear (RX): dBm × 10 (typically negative, e.g. -730 = -73 dBm = S9).
+///  - `Flags::PTT` set (TX): watts × 10 (positive, e.g. 1000 = 100.0 W FWD).
+/// The client owns all display-scale math; the wire format carries the raw
+/// physical quantity so changes to the visual scale never break wire compat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SmeterPacket {
-    pub level: u16,
+    pub level: i16,
     pub flags: Flags,
 }
 
@@ -839,13 +878,21 @@ impl SmeterPacket {
 
     pub fn deserialize(buf: &[u8]) -> Result<Self> {
         let header = Header::deserialize(buf)?;
-        if header.packet_type != PacketType::Smeter && header.packet_type != PacketType::SmeterRx2 {
-            bail!("expected Smeter/SmeterRx2 packet, got {:?}", header.packet_type);
+        if !matches!(
+            header.packet_type,
+            PacketType::Smeter
+                | PacketType::SmeterRx2
+                | PacketType::SmeterSig
+                | PacketType::SmeterMaxBin
+                | PacketType::SmeterRx2Sig
+                | PacketType::SmeterRx2MaxBin
+        ) {
+            bail!("expected Smeter packet, got {:?}", header.packet_type);
         }
         if buf.len() < Self::SIZE {
             bail!("smeter packet too short: {} < {}", buf.len(), Self::SIZE);
         }
-        let level = u16::from_be_bytes(buf[4..6].try_into().unwrap());
+        let level = i16::from_be_bytes(buf[4..6].try_into().unwrap());
         Ok(Self { level, flags: header.flags })
     }
 }
@@ -1155,6 +1202,7 @@ pub const CMD_RF2K_SET_DRIVE_CONT: u8 = 0x42;
 pub const CMD_UB_RETRACT: u8 = 0x01;
 pub const CMD_UB_SET_FREQ: u8 = 0x02;  // data[0..1]=khz_le, data[2]=direction
 pub const CMD_UB_READ_ELEMENTS: u8 = 0x03;
+pub const CMD_UB_MODIFY_ELEMENT: u8 = 0x04;  // data[0]=index, data[1..2]=length_mm_le
 
 /// Rotor command IDs (client → server via EquipmentCommand)
 pub const CMD_ROTOR_GOTO: u8 = 0x01;    // data[0..1] = angle_x10 LE (0-3600)
@@ -1426,6 +1474,10 @@ pub enum Packet {
     FrequencyRx2(FrequencyPacket),
     ModeRx2(ModePacket),
     SmeterRx2(SmeterPacket),
+    SmeterSig(SmeterPacket),
+    SmeterMaxBin(SmeterPacket),
+    SmeterRx2Sig(SmeterPacket),
+    SmeterRx2MaxBin(SmeterPacket),
     SpectrumRx2(SpectrumPacket),
     FullSpectrumRx2(SpectrumPacket),
     Spot(SpotPacket),
@@ -1461,6 +1513,10 @@ impl Packet {
             PacketType::Frequency => Ok(Packet::Frequency(FrequencyPacket::deserialize(buf)?)),
             PacketType::Mode => Ok(Packet::Mode(ModePacket::deserialize(buf)?)),
             PacketType::Smeter => Ok(Packet::Smeter(SmeterPacket::deserialize(buf)?)),
+            PacketType::SmeterSig => Ok(Packet::SmeterSig(SmeterPacket::deserialize(buf)?)),
+            PacketType::SmeterMaxBin => Ok(Packet::SmeterMaxBin(SmeterPacket::deserialize(buf)?)),
+            PacketType::SmeterRx2Sig => Ok(Packet::SmeterRx2Sig(SmeterPacket::deserialize(buf)?)),
+            PacketType::SmeterRx2MaxBin => Ok(Packet::SmeterRx2MaxBin(SmeterPacket::deserialize(buf)?)),
             PacketType::Spectrum => Ok(Packet::Spectrum(SpectrumPacket::deserialize(buf)?)),
             PacketType::FullSpectrum => Ok(Packet::FullSpectrum(SpectrumPacket::deserialize(buf)?)),
             PacketType::EquipmentStatus => Ok(Packet::EquipmentStatus(EquipmentStatusPacket::deserialize(buf)?)),

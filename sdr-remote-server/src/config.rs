@@ -2,6 +2,87 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Mutex;
+
+/// Cosmetic alias for a StockCorner tuner — JC-3s and JC-4s share the same
+/// MCP2221A-driven control protocol; the model name is only used for display.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TunerModel {
+    /// StockCorner JC-4s (default).
+    Jc4s,
+    /// StockCorner JC-3s.
+    Jc3s,
+}
+
+impl TunerModel {
+    /// Human-readable label for UI and logs.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Jc4s => "JC-4s",
+            Self::Jc3s => "JC-3s",
+        }
+    }
+    /// Config-file token (lowercase, hyphenated).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Jc4s => "jc-4s",
+            Self::Jc3s => "jc-3s",
+        }
+    }
+    /// Parse a config-file token; unknown strings fall back to `Jc4s`.
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_lowercase().as_str() {
+            "jc-3s" | "jc3s" => Self::Jc3s,
+            _ => Self::Jc4s,
+        }
+    }
+}
+
+/// Per-slot tuner configuration. Two of these live in [`ServerConfig::tuners`].
+#[derive(Clone, Debug)]
+pub struct TunerConfig {
+    /// Enable this tuner slot at server start.
+    pub enabled: bool,
+    /// Cosmetic model alias (JC-4s/JC-3s) used in the UI and logs only.
+    pub model: TunerModel,
+    /// USB serial of the MCP2221A board that drives this tuner.
+    /// Empty string = "first available board on the bus" (legacy fallback,
+    /// only sensible with a single tuner).
+    pub mcp_serial: String,
+    /// Amplitec-A antenna position (1..6) this tuner sits behind on the
+    /// coax switch. `None` means the tuner is not bound to any Amplitec
+    /// position; pressing Tune does not auto-route to it.
+    pub amplitec_pos: Option<u8>,
+    /// Tune-detector switch threshold on the yellow tune-status wire, in
+    /// volts. Default 2.25 V (midpoint between the typical ~4.5 V idle and
+    /// ~0 V LED-on level).
+    pub threshold_v: f32,
+    /// Hysteresis around the threshold, in volts. yellow_v <
+    /// (threshold - hyst/2) counts as tune-active; yellow_v >
+    /// (threshold + hyst/2) counts as tune-idle; samples inside the window
+    /// preserve the previous state. Default 0.50 V.
+    pub hysteresis_v: f32,
+}
+
+impl Default for TunerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: TunerModel::Jc4s,
+            mcp_serial: String::new(),
+            amplitec_pos: None,
+            threshold_v: 2.25,
+            hysteresis_v: 0.50,
+        }
+    }
+}
+
+/// Serializes all read-modify-write sequences on the server config file.
+/// Without it the UI thread (active_pa toggle, save_window_positions,
+/// start_server) and the RF2K poll thread (save_saved_drive) can race:
+/// each loads, modifies its field, writes — and the later writer silently
+/// drops the other's update if their load-windows overlap.
+static CONFIG_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone)]
 pub struct ServerConfig {
@@ -23,11 +104,14 @@ pub struct ServerConfig {
     pub amplitec_labels: [String; 6],
     /// Show Amplitec control window on start (default true)
     pub show_amplitec_window: bool,
-    /// JC-4s tuner serial port (e.g. "COM5")
-    pub tuner_port: Option<String>,
-    pub tuner_enabled: bool,
-    /// Assume tuner is already tuned when CTS never goes TRUE (JC-Control circuit limitation)
-    pub tuner_assume_tuned: bool,
+    /// Per-slot StockCorner tuner configuration. Index 0 = tuner 1, index 1 =
+    /// tuner 2. Each slot is independently enabled, has its own model alias
+    /// (cosmetic), targets a specific MCP2221A board by USB serial, and may be
+    /// bound to a specific Amplitec-A antenna position so the server knows
+    /// which tuner to drive when the user presses Tune. **Schema is wired into
+    /// load/save now; the runtime + UI that consume it land in a follow-up
+    /// patch, alongside the MCP2221A tuner-driver rewrite.**
+    pub tuners: [TunerConfig; 2],
     /// Show tuner control window on start (default true)
     pub show_tuner_window: bool,
     /// SPE Expert 1.3K-FA serial port (e.g. "COM6")
@@ -71,6 +155,18 @@ pub struct ServerConfig {
     pub autostart: bool,
     /// Active PA: 0=none, 1=SPE, 2=RF2K
     pub active_pa: u8,
+    /// Persisted pre-Operate Thetis ZZPC drive level per PA. `Some(n)` is the
+    /// last value captured when the PA went Standby→Operate; `None` means
+    /// no snapshot has been taken yet. Used by the TL2-server drive observer
+    /// to restore the value when the PA goes Operate→Standby, even across a
+    /// host restart that would otherwise lose the in-memory observer state.
+    pub rf2k_saved_drive: Option<u8>,
+    pub spe_saved_drive: Option<u8>,
+    /// UltraBeam control window: Menu section expanded (collapsible state)
+    pub ultrabeam_show_menu: bool,
+    /// Status panel: MCP2221A tuner-bridges section expanded. Persisted so
+    /// the owner's last open/closed choice survives a server restart.
+    pub mcp2221_section_expanded: bool,
     /// DX Cluster telnet server address (e.g. "dxc.pi4cc.nl:8000")
     pub dxcluster_server: String,
     /// DX Cluster callsign for login
@@ -105,9 +201,7 @@ impl Default for ServerConfig {
             amplitec_enabled: true,
             amplitec_labels: default_labels("Ant"),
             show_amplitec_window: true,
-            tuner_port: None,
-            tuner_enabled: true,
-            tuner_assume_tuned: false,
+            tuners: [TunerConfig::default(), TunerConfig::default()],
             show_tuner_window: true,
             spe_port: None,
             spe_enabled: true,
@@ -137,6 +231,10 @@ impl Default for ServerConfig {
             rotor_window_size: None,
             autostart: false,
             active_pa: 0,
+            rf2k_saved_drive: None,
+            spe_saved_drive: None,
+            ultrabeam_show_menu: false,
+            mcp2221_section_expanded: true,
             dxcluster_server: "dxc.pi4cc.nl:8000".to_string(),
             dxcluster_callsign: "PA3GHM".to_string(),
             dxcluster_enabled: true,
@@ -146,6 +244,34 @@ impl Default for ServerConfig {
             totp_enabled: false,
             friendly_name: None,
         }
+    }
+}
+
+/// Apply a `tuner1_FIELD=value` / `tuner2_FIELD=value` config entry to the
+/// matching `TunerConfig` slot.  Unknown sub-keys are silently ignored so a
+/// future field-name doesn't have to be cross-version-compatible.
+fn parse_tuner_key(t: &mut TunerConfig, sub: &str, value: &str) {
+    match sub {
+        "enabled" => t.enabled = value != "false",
+        "model" => t.model = TunerModel::parse(value),
+        "mcp_serial" => t.mcp_serial = value.to_string(),
+        "amplitec_pos" => {
+            t.amplitec_pos = match value.parse::<u8>().ok() {
+                Some(n) if (1..=6).contains(&n) => Some(n),
+                _ => None,
+            };
+        }
+        "threshold_v" => {
+            if let Ok(v) = value.parse::<f32>() {
+                t.threshold_v = v.clamp(0.5, 4.5);
+            }
+        }
+        "hysteresis_v" => {
+            if let Ok(v) = value.parse::<f32>() {
+                t.hysteresis_v = v.clamp(0.1, 2.0);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -172,7 +298,16 @@ fn config_path() -> PathBuf {
         .join("thetislink-server.conf")
 }
 
+/// Public load: takes the global CONFIG_LOCK so external callers always see
+/// a consistent snapshot — never the half-written file from a concurrent
+/// save. Internal `load_unlocked` is for `modify_config` which already
+/// holds the lock.
 pub fn load() -> ServerConfig {
+    let _guard = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    load_unlocked()
+}
+
+fn load_unlocked() -> ServerConfig {
     let path = config_path();
     let mut config = ServerConfig::default();
 
@@ -239,15 +374,27 @@ pub fn load() -> ServerConfig {
                     "amplitec_window" => {
                         config.show_amplitec_window = value.trim() == "true";
                     }
-                    "tuner_port" => {
-                        let v = value.trim().to_string();
-                        config.tuner_port = if v.is_empty() { None } else { Some(v) };
-                    }
+                    // Legacy v2.0.2 keys silently ignored on load (multi-tuner
+                    // runtime supersedes the single serial-port flow):
+                    //   `tuner_port`           — COM-port no longer used
+                    //   `tuner_enabled`        — replaced by per-slot enable
+                    //   `tuner_assume_tuned`   — assume-tuned pad retired
+                    "tuner_port" => {}
                     "tuner_enabled" => {
-                        config.tuner_enabled = value.trim() != "false";
+                        // Honour the legacy global toggle one last time so
+                        // owners upgrading from v2.0.2 do not lose their
+                        // slot-0 enable state: mirror into tuners[0].enabled.
+                        let v = value.trim() != "false";
+                        config.tuners[0].enabled = v;
                     }
-                    "tuner_assume_tuned" => {
-                        config.tuner_assume_tuned = value.trim() == "true";
+                    "tuner_assume_tuned" => {}
+                    // New per-slot keys: tuner1_* / tuner2_* dispatched to
+                    // config.tuners[0] / config.tuners[1] respectively.
+                    k if k.starts_with("tuner1_") => {
+                        parse_tuner_key(&mut config.tuners[0], &k[7..], value.trim());
+                    }
+                    k if k.starts_with("tuner2_") => {
+                        parse_tuner_key(&mut config.tuners[1], &k[7..], value.trim());
                     }
                     "tuner_window" => {
                         config.show_tuner_window = value.trim() == "true";
@@ -441,6 +588,20 @@ pub fn load() -> ServerConfig {
                     "active_pa" => {
                         config.active_pa = value.trim().parse().unwrap_or(0);
                     }
+                    "rf2k_saved_drive" => {
+                        let v = value.trim();
+                        config.rf2k_saved_drive = if v.is_empty() { None } else { v.parse().ok() };
+                    }
+                    "spe_saved_drive" => {
+                        let v = value.trim();
+                        config.spe_saved_drive = if v.is_empty() { None } else { v.parse().ok() };
+                    }
+                    "ultrabeam_show_menu" => {
+                        config.ultrabeam_show_menu = value.trim() == "true";
+                    }
+                    "mcp2221_section_expanded" => {
+                        config.mcp2221_section_expanded = value.trim() != "false";
+                    }
                     "dxcluster_server" => {
                         let v = value.trim().to_string();
                         if !v.is_empty() { config.dxcluster_server = v; }
@@ -494,10 +655,58 @@ pub fn load() -> ServerConfig {
     config
 }
 
+/// Atomic load-modify-save helper. All read-modify-write helpers funnel
+/// through here so the CONFIG_LOCK guarantees no other writer slips in
+/// between the load and the save.
+pub fn modify_config(f: impl FnOnce(&mut ServerConfig)) {
+    let _guard = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut config = load_unlocked();
+    f(&mut config);
+    save_unlocked(&config);
+}
+
+/// Read-modify-write helper for the `active_pa` config key. Used when the
+/// user clicks an Active checkbox on RF2K or SPE so the choice survives a
+/// non-graceful shutdown (process kill / power loss) without waiting for
+/// `start_server()` to persist the rest of the config.
+pub fn save_active_pa(value: u8) {
+    modify_config(|c| c.active_pa = value);
+}
+
+/// Read-modify-write helper for the per-PA pre-Operate drive snapshot.
+/// `pa_id`: 1 = SPE, 2 = RF2K (matching the `active_pa` encoding).
+/// `value`: `Some(zzpc)` to write, `None` to clear.
+pub fn save_saved_drive(pa_id: u8, value: Option<u8>) {
+    modify_config(|c| match pa_id {
+        1 => c.spe_saved_drive = value,
+        2 => c.rf2k_saved_drive = value,
+        _ => {}
+    });
+}
+
+/// Read-modify-write helper for the UltraBeam window Menu collapsible state.
+pub fn save_ultrabeam_show_menu(value: bool) {
+    modify_config(|c| c.ultrabeam_show_menu = value);
+}
+
+/// Read-modify-write helper for the MCP2221A tuner-bridges section
+/// collapsible state in the Status panel.
+pub fn save_mcp2221_section_expanded(value: bool) {
+    modify_config(|c| c.mcp2221_section_expanded = value);
+}
+
+/// Public save: takes the global CONFIG_LOCK so writes are serialised with
+/// reads and other writes. Internal `save_unlocked` is for `modify_config`
+/// which already holds the lock.
 pub fn save(config: &ServerConfig) {
+    let _guard = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    save_unlocked(config);
+}
+
+fn save_unlocked(config: &ServerConfig) {
     let path = config_path();
     let mut contents = format!(
-        "tci={}\nthetis_path={}\nyaesu_port={}\nyaesu_enabled={}\nyaesu_baud={}\nyaesu_audio={}\namplitec_port={}\namplitec_enabled={}\namplitec_window={}\ntuner_port={}\ntuner_enabled={}\ntuner_assume_tuned={}\ntuner_window={}\nspe_port={}\nspe_enabled={}\nspe_window={}\nrf2k_addr={}\nrf2k_enabled={}\nrf2k_window={}\nultrabeam_port={}\nultrabeam_enabled={}\nultrabeam_window={}\nrotor_addr={}\nrotor_enabled={}\nrotor_window={}\n",
+        "tci={}\nthetis_path={}\nyaesu_port={}\nyaesu_enabled={}\nyaesu_baud={}\nyaesu_audio={}\namplitec_port={}\namplitec_enabled={}\namplitec_window={}\ntuner_window={}\nspe_port={}\nspe_enabled={}\nspe_window={}\nrf2k_addr={}\nrf2k_enabled={}\nrf2k_window={}\nultrabeam_port={}\nultrabeam_enabled={}\nultrabeam_window={}\nrotor_addr={}\nrotor_enabled={}\nrotor_window={}\n",
         config.tci_addr.as_deref().unwrap_or(""),
         config.thetis_path.as_deref().unwrap_or(""),
         config.yaesu_port.as_deref().unwrap_or(""),
@@ -507,9 +716,6 @@ pub fn save(config: &ServerConfig) {
         config.amplitec_port.as_deref().unwrap_or(""),
         config.amplitec_enabled,
         config.show_amplitec_window,
-        config.tuner_port.as_deref().unwrap_or(""),
-        config.tuner_enabled,
-        config.tuner_assume_tuned,
         config.show_tuner_window,
         config.spe_port.as_deref().unwrap_or(""),
         config.spe_enabled,
@@ -524,6 +730,20 @@ pub fn save(config: &ServerConfig) {
         config.rotor_enabled,
         config.show_rotor_window,
     );
+    // Per-tuner slots — tuner1_* / tuner2_* keys keep the file readable by hand.
+    for (i, t) in config.tuners.iter().enumerate() {
+        let prefix = format!("tuner{}", i + 1);
+        contents.push_str(&format!("{}_enabled={}\n", prefix, t.enabled));
+        contents.push_str(&format!("{}_model={}\n", prefix, t.model.as_str()));
+        contents.push_str(&format!("{}_mcp_serial={}\n", prefix, t.mcp_serial));
+        contents.push_str(&format!(
+            "{}_amplitec_pos={}\n",
+            prefix,
+            t.amplitec_pos.map(|n| n.to_string()).unwrap_or_default()
+        ));
+        contents.push_str(&format!("{}_threshold_v={}\n", prefix, t.threshold_v));
+        contents.push_str(&format!("{}_hysteresis_v={}\n", prefix, t.hysteresis_v));
+    }
     for i in 0..6 {
         contents.push_str(&format!("amplitec_label{}={}\n", i + 1, config.amplitec_labels[i]));
     }
@@ -573,6 +793,14 @@ pub fn save(config: &ServerConfig) {
     }
     contents.push_str(&format!("autostart={}\n", config.autostart));
     contents.push_str(&format!("active_pa={}\n", config.active_pa));
+    if let Some(v) = config.rf2k_saved_drive {
+        contents.push_str(&format!("rf2k_saved_drive={}\n", v));
+    }
+    if let Some(v) = config.spe_saved_drive {
+        contents.push_str(&format!("spe_saved_drive={}\n", v));
+    }
+    contents.push_str(&format!("ultrabeam_show_menu={}\n", config.ultrabeam_show_menu));
+    contents.push_str(&format!("mcp2221_section_expanded={}\n", config.mcp2221_section_expanded));
     contents.push_str(&format!("dxcluster_server={}\n", config.dxcluster_server));
     contents.push_str(&format!("dxcluster_callsign={}\n", config.dxcluster_callsign));
     contents.push_str(&format!("dxcluster_enabled={}\n", config.dxcluster_enabled));

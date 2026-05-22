@@ -4,6 +4,8 @@ mod amplitec;
 mod audio_loops;
 mod audio_stats;
 mod config;
+mod mcp2221_debug;
+mod mcp2221_scan;
 mod mdns;
 mod ctun_recenter;
 mod dxcluster;
@@ -211,7 +213,6 @@ fn print_usage() {
     eprintln!("  --tci <ADDR>           Thetis TCI address (e.g. 127.0.0.1:40001)");
     eprintln!("  --thetis-path <PATH>   Path to Thetis.exe for auto-launch on POWER ON");
     eprintln!("  --amplitec-port <COM>  COM port for Amplitec 6/2 antenna switch");
-    eprintln!("  --tuner-port <COM>     COM port for JC-4s antenna tuner");
     eprintln!("  --spe-port <COM>       COM port for SPE Expert 1.3K-FA amplifier");
     eprintln!("  --rf2k <ADDR>          RF2K-S Pi address (e.g. 192.168.1.50:8080)");
     eprintln!();
@@ -274,7 +275,6 @@ fn main() -> Result<()> {
     let mut tci_addr: Option<String> = None;
     let mut thetis_path: Option<String> = None;
     let mut amplitec_port: Option<String> = None;
-    let mut tuner_port: Option<String> = None;
     let mut spe_port: Option<String> = None;
     let mut rf2k_addr: Option<String> = None;
     let mut i = 1;
@@ -291,10 +291,6 @@ fn main() -> Result<()> {
             "--amplitec-port" => {
                 i += 1;
                 amplitec_port = Some(args.get(i).cloned().unwrap_or_default());
-            }
-            "--tuner-port" => {
-                i += 1;
-                tuner_port = Some(args.get(i).cloned().unwrap_or_default());
             }
             "--spe-port" => {
                 i += 1;
@@ -319,7 +315,7 @@ fn main() -> Result<()> {
 
     let has_cli_args = tci_addr.is_some()
         || thetis_path.is_some() || amplitec_port.is_some()
-        || tuner_port.is_some() || spe_port.is_some() || rf2k_addr.is_some();
+        || spe_port.is_some() || rf2k_addr.is_some();
 
     if has_cli_args {
         // CLI mode — normal env_logger, no GUI
@@ -327,7 +323,6 @@ fn main() -> Result<()> {
 
         let defaults = ServerConfig::default();
         let amp_en = amplitec_port.is_some() || defaults.amplitec_port.is_some();
-        let tun_en = tuner_port.is_some() || defaults.tuner_port.is_some();
         let spe_en = spe_port.is_some() || defaults.spe_port.is_some();
         let rf2k_en = rf2k_addr.is_some() || defaults.rf2k_addr.is_some();
         let ub_en = defaults.ultrabeam_port.is_some();
@@ -343,8 +338,6 @@ fn main() -> Result<()> {
             amplitec_port: amplitec_port.or(defaults.amplitec_port),
             amplitec_labels: defaults.amplitec_labels,
             show_amplitec_window: false, // no GUI in CLI mode
-            tuner_port: tuner_port.or(defaults.tuner_port),
-            tuner_assume_tuned: defaults.tuner_assume_tuned,
             show_tuner_window: false, // no GUI in CLI mode
             spe_port: spe_port.or(defaults.spe_port),
             show_spe_window: false, // no GUI in CLI mode
@@ -361,7 +354,6 @@ fn main() -> Result<()> {
             ultrabeam_window_pos: None,
             rotor_window_pos: None,
             amplitec_enabled: amp_en,
-            tuner_enabled: tun_en,
             spe_enabled: spe_en,
             rf2k_enabled: rf2k_en,
             ultrabeam_enabled: ub_en,
@@ -376,6 +368,10 @@ fn main() -> Result<()> {
             rotor_window_size: None,
             autostart: false,
             active_pa: 0,
+            rf2k_saved_drive: None,
+            spe_saved_drive: None,
+            ultrabeam_show_menu: defaults.ultrabeam_show_menu,
+            mcp2221_section_expanded: defaults.mcp2221_section_expanded,
             dxcluster_server: defaults.dxcluster_server,
             dxcluster_callsign: defaults.dxcluster_callsign,
             dxcluster_enabled: defaults.dxcluster_enabled,
@@ -384,6 +380,7 @@ fn main() -> Result<()> {
             totp_secret: defaults.totp_secret,
             totp_enabled: defaults.totp_enabled,
             friendly_name: defaults.friendly_name,
+            tuners: defaults.tuners,
         };
         info!("Starting with tci={:?}", config.tci_addr);
         let rt = tokio::runtime::Runtime::new()?;
@@ -406,24 +403,9 @@ fn main() -> Result<()> {
                 None
             };
 
-            // Create tuner if configured (CLI mode) — after SPE so it gets the reference
-            let (tuner_arc, cat_cmd_rx) = if let Some(ref port) = config.tuner_port {
-                let (cat_tx, cat_rx) = tokio::sync::mpsc::channel(16);
-                match tuner::Jc4sTuner::new(port, cat_tx, spe_arc.clone(), None, config.tuner_assume_tuned) {
-                    Ok(t) => {
-                        info!("JC-4s tuner connected on {}", port);
-                        (Some(Arc::new(t)), Some(cat_rx))
-                    }
-                    Err(e) => {
-                        warn!("JC-4s tuner init failed: {}", e);
-                        (None, Some(cat_rx))
-                    }
-                }
-            } else {
-                (None, None)
-            };
-
-            let server = run_server_async(config, shutdown_rx, None, tuner_arc, spe_arc, None, None, None, cat_cmd_rx, None, None, None, None, None, None);
+            // CLI mode: tuners are built inside `run_server_async` from
+            // `config.tuners` (post-MCP2221A refactor); no prebuild here.
+            let server = run_server_async(config, shutdown_rx, None, None, spe_arc, None, None, None, None, None, None, None, None, None, None);
             tokio::select! {
                 result = server => {
                     if let Err(e) = result {
@@ -510,7 +492,7 @@ pub async fn run_server_async(
     config: ServerConfig,
     shutdown_rx: watch::Receiver<bool>,
     amplitec_prebuilt: Option<Arc<amplitec::AmplitecSwitch>>,
-    tuner_prebuilt: Option<Arc<tuner::Jc4sTuner>>,
+    tuners_prebuilt: Option<Arc<tuner::Tuners>>,
     spe_prebuilt: Option<Arc<spe_expert::SpeExpert>>,
     rf2k_prebuilt: Option<Arc<rf2k::Rf2k>>,
     ultrabeam_prebuilt: Option<Arc<ultrabeam::UltraBeam>>,
@@ -614,7 +596,8 @@ pub async fn run_server_async(
     // Shared CAT channel for tuner + RF2K-S tune carrier (CLI mode only, GUI passes prebuilt)
     // In GUI mode, cat_cmd_rx already carries CAT commands from ui.rs's shared channel.
     // In CLI mode, we create one here if tuner or RF2K needs it.
-    let needs_cat = !tuner_prebuilt.is_some() && ((config.tuner_enabled && config.tuner_port.is_some()) || (config.rf2k_enabled && config.rf2k_addr.is_some()));
+    let any_tuner_enabled = config.tuners.iter().any(|t| t.enabled);
+    let needs_cat = tuners_prebuilt.is_none() && (any_tuner_enabled || (config.rf2k_enabled && config.rf2k_addr.is_some()));
     let (cli_cat_tx, cli_cat_rx) = if needs_cat && cat_cmd_rx.is_none() {
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         (Some(tx), Some(rx))
@@ -636,36 +619,46 @@ pub async fn run_server_async(
         None
     };
 
-    // JC-4s tuner — use prebuilt (from GUI) or create here (CLI mode)
+    // StockCorner tuners — use prebuilt (from GUI) or create here (CLI mode).
+    // Multi-instance: 0, 1 or 2 tuners, each on its own MCP2221A board.
     let spe_arc = spe.as_ref().map(|s| s.clone());
     let rf2k_arc = rf2k.as_ref().map(|r| r.clone());
-    let (tuner, tuner_cat_rx) = if tuner_prebuilt.is_some() {
-        (tuner_prebuilt, shared_cat_rx)
-    } else if config.tuner_enabled && config.tuner_port.is_some() {
-        let port_name = config.tuner_port.as_ref().unwrap();
-        let cat_tx = cli_cat_tx.unwrap_or_else(|| {
-            let (tx, _) = tokio::sync::mpsc::channel(16);
-            tx
-        });
-        let (cat_tx_for_tuner, cat_rx_for_tuner) = if shared_cat_rx.is_some() {
-            (cat_tx, shared_cat_rx)
+    let (tuners, tuner_cat_rx) = if let Some(t) = tuners_prebuilt {
+        (t, shared_cat_rx)
+    } else if any_tuner_enabled {
+        // Need a tx half for the tuner thread(s) to push ZZTU1/ZZTU0. Prefer
+        // the CLI-side tx (so the rx half is `shared_cat_rx`); otherwise
+        // create a throw-away channel and let the GUI-supplied rx survive.
+        let (cat_tx_for_tuner, cat_rx_for_tuner) = if let Some(tx) = cli_cat_tx {
+            (tx, shared_cat_rx)
+        } else if shared_cat_rx.is_some() {
+            // GUI-supplied rx: we don't have a sibling tx, so spawn a fresh
+            // (orphan) one. The tuner's writes go to /dev/null, which is OK
+            // because the GUI path also routes its own ZZTU1 via the
+            // pre-existing cat channel.
+            let (tx, _) = tokio::sync::mpsc::channel::<String>(16);
+            (tx, shared_cat_rx)
         } else {
             let (tx, rx) = tokio::sync::mpsc::channel(16);
             (tx, Some(rx))
         };
-        match tuner::Jc4sTuner::new(port_name, cat_tx_for_tuner, spe_arc, rf2k_arc, config.tuner_assume_tuned) {
-            Ok(t) => {
-                info!("JC-4s tuner connected on {}", port_name);
-                (Some(Arc::new(t)), cat_rx_for_tuner)
-            }
-            Err(e) => {
-                warn!("JC-4s tuner init failed: {}", e);
-                (None, cat_rx_for_tuner)
-            }
-        }
+        let collection = tuner::Tuners::new(&config.tuners, cat_tx_for_tuner, spe_arc.clone(), rf2k_arc.clone());
+        (Arc::new(collection), cat_rx_for_tuner)
     } else {
-        (None, shared_cat_rx)
+        // No tuner enabled: build an empty collection so downstream code can
+        // still call .primary() (returns None) without conditionals.
+        let (throwaway_tx, _) = tokio::sync::mpsc::channel(16);
+        let collection = tuner::Tuners::new(&config.tuners, throwaway_tx, spe_arc.clone(), rf2k_arc.clone());
+        (Arc::new(collection), shared_cat_rx)
     };
+    // Backwards-compat: legacy paths (macros, settings UI, single-tuner status
+    // panel) consume `Option<Arc<TunerInstance>>` — give them the primary
+    // (first enabled) tuner, matching the pre-multi-tuner behaviour.
+    let tuner = tuners.primary();
+    // Publish the collection to the Status-panel slot so the UI can render
+    // per-tuner debug rows (auto-baseline, override, ratio). `.set` is
+    // idempotent-safe via OnceLock.
+    let _ = status_panel_state.tuners_slot.set(tuners.clone());
 
     // UltraBeam RCU-06 — use prebuilt (from GUI) or create here (CLI mode)
     let ultrabeam = if ultrabeam_prebuilt.is_some() {
@@ -706,6 +699,10 @@ pub async fn run_server_async(
     };
 
     // Network service
+    // Discard the `tuner` binding (kept for compat with macros / settings) —
+    // NetworkService now takes the full Tuners collection so it can route
+    // Tune commands per Amplitec-A position.
+    let _ = tuner;
     let network = NetworkService::new(
         bind_addr,
         session.clone(),
@@ -714,7 +711,7 @@ pub async fn run_server_async(
         rx2_spectrum.clone(),
         shutdown_rx.clone(),
         amplitec,
-        tuner,
+        tuners,
         spe,
         rf2k,
         ultrabeam,

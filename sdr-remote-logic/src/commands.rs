@@ -102,6 +102,7 @@ pub enum Command {
     UbRetract,
     UbSetFrequency(u16, u8),  // khz, direction
     UbReadElements,
+    UbModifyElement(u8, u16),  // index (0-5), length_mm
     // Rotor
     RotorGoTo(u16),    // angle_x10
     RotorStop,
@@ -118,4 +119,7 @@ pub enum Command {
     // Server management
     ServerReboot,
     ServerShutdown,
+    // S-meter source selection (matches Thetis Multimeter Sig/Avg/MaxBin choice).
+    // Value: 0=Sig, 1=Avg, 2=MaxBin. Applies to both RX1 and RX2.
+    SetSmeterSource(u8),
 }

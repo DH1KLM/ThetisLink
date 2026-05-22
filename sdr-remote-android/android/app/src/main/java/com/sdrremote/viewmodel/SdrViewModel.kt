@@ -79,7 +79,7 @@ class SdrViewModel(application: Application) : AndroidViewModel(application) {
                         frequencyHz = s.frequencyHz.toLong(),
                         frequencyRx2Hz = s.frequencyRx2Hz.toLong(),
                         mode = s.mode.toInt(),
-                        smeter = s.smeter.toInt(),
+                        smeter = s.smeter,
                         powerOn = s.powerOn,
                         txProfile = s.txProfile.toInt(),
                         nrLevel = s.nrLevel.toInt(),

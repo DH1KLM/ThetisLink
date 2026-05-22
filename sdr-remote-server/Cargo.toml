@@ -35,6 +35,11 @@ serde_json = "1"
 # local-network discovery. Apache-2.0 OR MIT — GPL-2.0-or-later compatible.
 # Pure-Rust, no system deps on Windows.
 mdns-sd = "=0.19.1"
+# Adafruit MCP2221A breakout — used for the StockCorner JC-4s tuner bridge
+# (GP0 → 2N7000 gate for grey-wire start, GP1 → ADC for yellow tune-status).
+# Server only exposes a debug panel for now; full tuner integration is a
+# follow-up patch. See docs/internal/referentie/MCP2221A-JC4s-wiring.md.
+mcp2221-hal = "0.1"
 
 [build-dependencies]
 winresource = "0.1"

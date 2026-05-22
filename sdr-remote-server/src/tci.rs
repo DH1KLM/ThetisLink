@@ -38,8 +38,13 @@ pub struct TciConnection {
     pub vfo_a_freq: u64,
     pub vfo_a_mode: u8,
     pub smeter_window: VecDeque<f32>,
-    /// Direct dBm value from TCI _ex format (bypasses window averaging)
+    /// Direct dBm value from TCI _ex format (bypasses window averaging).
+    /// This is the "Avg" source — the default S-meter value (true-mean detector).
     pub smeter_direct_dbm: Option<f32>,
+    /// Sig source dBm (peak-hold detector, ~100 ms decay). `_ex` format only.
+    pub smeter_sig_dbm: Option<f32>,
+    /// MaxBin source dBm (single highest FFT bin). _ex format only.
+    pub smeter_peakbin_dbm: Option<f32>,
     pub power_on: bool,
     pub tx_profile: u8,
     pub nr_level: u8,
@@ -64,7 +69,12 @@ pub struct TciConnection {
     pub vfo_b_mode: u8,
     pub rx2_af_gain: u8,
     pub smeter_rx2_window: VecDeque<f32>,
+    /// RX2 Avg source dBm (mirror of smeter_direct_dbm for RX1).
     pub smeter_rx2_direct_dbm: Option<f32>,
+    /// RX2 Sig source dBm.
+    pub smeter_rx2_sig_dbm: Option<f32>,
+    /// RX2 MaxBin source dBm.
+    pub smeter_rx2_peakbin_dbm: Option<f32>,
     pub rx2_nr_level: u8,
     pub rx2_anf_on: bool,
     pub rx2_agc_mode: u8,
@@ -130,6 +140,12 @@ pub struct TciConnection {
     pub six_m_gain_offset: [f32; 2],
     /// Raw TCI peakBinDbm for auto-calibration of spectrum offset
     pub smeter_raw_dbm: [Option<f32>; 2],
+    /// S9-frequency threshold in Hz. Above this VFO frequency the S-meter
+    /// scale shifts to S9 = -93 dBm (IARU VHF/UHF). Updated dynamically from
+    /// the fork-extension push `s9_frequency_ex`; default 50_000_000 Hz
+    /// matches the IARU Region 1 convention so stock-Thetis / extensions-off
+    /// renders correctly without the fork push.
+    pub s9_frequency_hz: u64,
     // TX Profile names from tx_profiles_ex (ordered list)
     pub tx_profile_names: Vec<String>,
     // Current TX profile name from tx_profile_ex
@@ -246,6 +262,8 @@ impl TciConnection {
             vfo_a_mode: 0,
             smeter_window: VecDeque::with_capacity(4),
             smeter_direct_dbm: None,
+            smeter_sig_dbm: None,
+            smeter_peakbin_dbm: None,
             power_on: false,
             tx_profile: 0,
             nr_level: 0,
@@ -265,6 +283,8 @@ impl TciConnection {
             rx2_af_gain: 100,
             smeter_rx2_window: VecDeque::with_capacity(4),
             smeter_rx2_direct_dbm: None,
+            smeter_rx2_sig_dbm: None,
+            smeter_rx2_peakbin_dbm: None,
             rx2_nr_level: 0,
             rx2_anf_on: false,
             rx2_agc_mode: 3,
@@ -314,6 +334,7 @@ impl TciConnection {
             xvtr_gain_offset: [0.0; 2],
             six_m_gain_offset: [0.0; 2],
             smeter_raw_dbm: [None; 2],
+            s9_frequency_hz: 50_000_000, // IARU Region 1 default; overridden by s9_frequency_ex push when the fork is active
             tx_profile_names: Vec::new(),
             tx_profile_name: String::new(),
             rx1_audio_rx: None,
@@ -570,36 +591,77 @@ impl TciConnection {
     /// abort-pad). Inconsistente CTUN-state tussen ZZCN0 en ZZCN1 is risicovoller
     /// dan een korte ZZCN1-tijdens-TX-glitch. `&mut self`-borrow + tokio::sleep
     /// garandeert dat geen andere recenter-actie de burst kan onderbreken.
+    ///
+    /// **VFO sync coalesce:** wanneer Thetis-side VFO sync ON staat, doet deze
+    /// burst óók de RX2-CTUN-toggle interleaved. Beide CTUN-AAN bevelen vuren
+    /// daardoor <1 ms van elkaar bij Thetis, dus beide DDCs recentreren op
+    /// dezelfde "huidige VFO" snapshot. Zonder coalesce zou de tweede RX-burst
+    /// pas 50 ms later starten en bij rapid tuning op een nieuwere VFO landen,
+    /// waardoor RX1 en RX2 DDC-centers op verschillende freqs eindigen.
     async fn execute_recenter_rx1(&mut self) {
+        let coupled = self.vfo_sync_on;
+        let flag_until = Instant::now() + std::time::Duration::from_millis(200);
         self.ctun_recenter.rx1.recentering = true;
-        self.ctun_recenter.rx1.flag_clear_at =
-            Some(Instant::now() + std::time::Duration::from_millis(200));
+        self.ctun_recenter.rx1.flag_clear_at = Some(flag_until);
+        if coupled {
+            self.ctun_recenter.rx2.recentering = true;
+            self.ctun_recenter.rx2.flag_clear_at = Some(flag_until);
+        }
         debug!(
-            "TCI: ctun recenter rx=0 START vfo={} → ddc_center will follow",
-            self.vfo_a_freq
+            "TCI: ctun recenter rx=0 START vfo={} coupled={}",
+            self.vfo_a_freq, coupled
         );
         self.run_cat("ZZCN0").await;
+        if coupled {
+            self.run_cat("ZZCO0").await;
+        }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         self.run_cat("ZZCN1").await;
-        debug!("TCI: ctun recenter rx=0 END");
+        if coupled {
+            self.run_cat("ZZCO1").await;
+        }
+        // Optimistic DDS-cache update: after ZZCx1 Thetis has forced
+        // DDC center = current VFO. Don't wait for the upstream `dds:` push —
+        // that adds 100-1000 ms of stale spectrum on the client. If Thetis
+        // later pushes a different value (rare, rounding), the equality check
+        // in the Dds notification handler covers it.
+        self.dds_freq[0] = self.vfo_a_freq;
+        if coupled {
+            self.dds_freq[1] = self.vfo_b_freq;
+        }
+        debug!("TCI: ctun recenter rx=0 END coupled={}", coupled);
     }
 
     /// Recenter-burst RX2: ZZCO0 → 50ms → ZZCO1.
     /// **Belangrijk:** RX2-CTUN gebruikt **ZZCO**, niet ZZCP. ZZCP = compander
-    /// (audio); ZZCO = CTUN RX2. Eerdere build 6 had ZZCP en toggelde per ongeluk
-    /// de compander tijdens elke recenter.
+    /// (audio); ZZCO = CTUN RX2.
+    ///
+    /// **VFO sync coalesce:** symmetrisch aan `execute_recenter_rx1` — wanneer
+    /// VFO sync ON staat doet deze burst óók de RX1-CTUN-toggle interleaved.
+    /// Zie commentaar daar voor de motivatie.
     async fn execute_recenter_rx2(&mut self) {
+        let coupled = self.vfo_sync_on;
+        let flag_until = Instant::now() + std::time::Duration::from_millis(200);
         self.ctun_recenter.rx2.recentering = true;
-        self.ctun_recenter.rx2.flag_clear_at =
-            Some(Instant::now() + std::time::Duration::from_millis(200));
+        self.ctun_recenter.rx2.flag_clear_at = Some(flag_until);
+        if coupled {
+            self.ctun_recenter.rx1.recentering = true;
+            self.ctun_recenter.rx1.flag_clear_at = Some(flag_until);
+        }
         debug!(
-            "TCI: ctun recenter rx=1 START vfo={} → ddc_center will follow",
-            self.vfo_b_freq
+            "TCI: ctun recenter rx=1 START vfo={} coupled={}",
+            self.vfo_b_freq, coupled
         );
         self.run_cat("ZZCO0").await;
+        if coupled {
+            self.run_cat("ZZCN0").await;
+        }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         self.run_cat("ZZCO1").await;
-        debug!("TCI: ctun recenter rx=1 END");
+        if coupled {
+            self.run_cat("ZZCN1").await;
+        }
+        debug!("TCI: ctun recenter rx=1 END coupled={}", coupled);
     }
 
     /// Band-switch heuristiek: VFO-jump > DDC-bandwidth → owner heeft band-switch
@@ -643,8 +705,29 @@ impl TciConnection {
     async fn handle_notification(&mut self, notif: TciNotification) {
         match notif {
             TciNotification::TciCapsEx { caps } => {
+                let had_caps = !self.server_caps.is_empty();
                 self.server_caps = caps.into_iter().collect();
+                let has_caps = !self.server_caps.is_empty();
                 info!("TCI: server caps = {:?}", self.server_caps);
+                // Caps dropped to empty (extensions toggled OFF in Thetis mid-
+                // session): reset state-machines that piggy-back on the cap
+                // surface so the next toggle ON starts clean.
+                if had_caps && !has_caps {
+                    info!("TCI: ThetisLink extensions disabled — releasing _ex feature surface");
+                    self.ctun_recenter.fork_active_logged = false;
+                    // Without the fork pushing s9_frequency_ex we have no
+                    // way to know the user's setting, so fall back to the
+                    // IARU Region 1 convention (S9 = -93 dBm above 50 MHz).
+                    self.s9_frequency_hz = 50_000_000;
+                }
+                // Claim auto-recenter ownership when caps transition from
+                // empty → non-empty (initial connect, or toggle ON after a
+                // previous OFF). Skipping when caps were already populated
+                // avoids re-spamming a claim on every refresh frame.
+                if !had_caps && has_caps && self.has_cap("auto_recenter_owner_ex") {
+                    info!("TCI: claiming auto-recenter ownership");
+                    self.send("auto_recenter_owner_ex:true;").await;
+                }
             }
             TciNotification::Ready => {
                 info!("TCI: READY received, sending init commands");
@@ -660,6 +743,18 @@ impl TciConnection {
                         if freq != self.vfo_a_freq {
                             log::debug!("TCI VFO A: {} Hz", freq);
                             self.vfo_a_freq = freq;
+                            // VFO-sync optimistic mirror: when Thetis has VFO sync ON,
+                            // the matching `vfo:0,1` push for the sync'd RX may arrive
+                            // 100-1000 ms later than `vfo:0,0`. Mirror immediately so
+                            // the periodic broadcast (10 Hz) sends both VFOs to the
+                            // client at the same tick — avoids "synced VFO marker lags
+                            // behind active VFO marker on the client". When Thetis's
+                            // delayed push eventually arrives with the same value the
+                            // equality check below silently absorbs it.
+                            if self.vfo_sync_on && freq != self.vfo_b_freq {
+                                log::debug!("TCI VFO A→B mirror (sync ON): {} Hz", freq);
+                                self.vfo_b_freq = freq;
+                            }
                             // TL2-1 ctun-auto-recenter: bij VFO-event eerst CTUN-aan
                             // garanderen (per owner-keuze 2026-05-08); daarna band-switch
                             // detect en trigger-eval. Dit lost het edge-geval op waar
@@ -675,6 +770,11 @@ impl TciConnection {
                         if freq != self.vfo_b_freq {
                             log::debug!("TCI VFO B: {} Hz", freq);
                             self.vfo_b_freq = freq;
+                            // VFO-sync optimistic mirror, symmetric to the VFO-A path.
+                            if self.vfo_sync_on && freq != self.vfo_a_freq {
+                                log::debug!("TCI VFO B→A mirror (sync ON): {} Hz", freq);
+                                self.vfo_a_freq = freq;
+                            }
                             // Idem RX2: ensure CTUN aan, daarna band-switch + trigger-eval.
                             self.ensure_ctun_aan_for_rx(1).await;
                             self.detect_band_switch_and_reforce().await;
@@ -746,15 +846,31 @@ impl TciConnection {
                     _ => {}
                 }
             }
-            TciNotification::RxChannelSensors { receiver, channel: _, dbm } => {
+            TciNotification::S9FrequencyEx { mhz } => {
+                let new_hz = (mhz * 1_000_000.0).round() as u64;
+                if new_hz != self.s9_frequency_hz {
+                    info!("TCI: S9 frequency threshold = {:.3} MHz (was {:.3} MHz)",
+                          mhz, self.s9_frequency_hz as f64 / 1_000_000.0);
+                    self.s9_frequency_hz = new_hz;
+                }
+            }
+            TciNotification::RxChannelSensors { receiver, channel: _, dbm, dbm_sig, dbm_peakbin } => {
                 if HAS_SENSORS_EX.load(std::sync::atomic::Ordering::Relaxed) {
-                    // _ex format: Thetis already provides avgdBm — use directly
+                    // _ex format: Thetis provides all three sources per tick
+                    // (Sig=peak-hold, Avg=true-mean, MaxBin=peak FFT bin) so
+                    // each client can subscribe via SmeterSources. Cache all
+                    // three; the broadcast loop in network.rs picks the right
+                    // one per client.
                     let idx = (receiver as usize).min(1);
                     self.smeter_raw_dbm[idx] = Some(dbm);
                     if receiver == 0 {
                         self.smeter_direct_dbm = Some(dbm);
+                        self.smeter_sig_dbm = dbm_sig;
+                        self.smeter_peakbin_dbm = dbm_peakbin;
                     } else {
                         self.smeter_rx2_direct_dbm = Some(dbm);
+                        self.smeter_rx2_sig_dbm = dbm_sig;
+                        self.smeter_rx2_peakbin_dbm = dbm_peakbin;
                     }
                 } else {
                     // Legacy format: do our own RMS averaging
@@ -1293,29 +1409,84 @@ impl TciConnection {
 
     // --- S-meter conversion ---
 
-    fn avg_mw_to_display(window: &VecDeque<f32>) -> u16 {
+    /// Sentinel "no signal" dBm value sent when the windowed-mW source has no
+    /// samples yet. Lies well below S0 (-127 dBm), so the client clamps it to
+    /// the bottom of the arc with no risk of looking like a real reading.
+    const SMETER_NO_DATA_DBM: f32 = -200.0;
+
+    fn avg_mw_to_dbm(&self, window: &VecDeque<f32>, freq_hz: u64) -> f32 {
         if window.is_empty() {
-            return 0;
+            return Self::SMETER_NO_DATA_DBM;
         }
         let sum: f32 = window.iter().sum();
         let avg_mw = sum / window.len() as f32;
         let avg_dbm = 10.0 * avg_mw.log10();
-        sdr_remote_core::dbm_to_display(avg_dbm)
+        self.apply_s9_band_shift(avg_dbm, freq_hz)
     }
 
-    pub fn smeter_avg(&self) -> u16 {
+    /// Thetis "above-S9-frequency" convention:
+    ///  - VFO < `s9_frequency_hz`: S9 = -73 dBm (HF scale, no shift)
+    ///  - VFO ≥ `s9_frequency_hz`: S9 = -93 dBm (VHF/UHF — add 20 dB to dBm)
+    /// The threshold is fork-pushed via `s9_frequency_ex` (user-configurable
+    /// in Thetis Setup, Thetis default 30 MHz). When the fork isn't present
+    /// the field defaults to 50 MHz (IARU Region 1) so stock Thetis behaves
+    /// like a typical ham-rig out of the box.
+    fn apply_s9_band_shift(&self, dbm: f32, freq_hz: u64) -> f32 {
+        if freq_hz >= self.s9_frequency_hz { dbm + 20.0 } else { dbm }
+    }
+
+    pub fn smeter_avg(&self) -> f32 {
+        // TCI sensor payload is already calibrated by Thetis before emission
+        // (meter_cal + xvtr + 6m gain + preamp are baked into the pushed dBm),
+        // so we pass the value straight through. Applying a second offset
+        // would double-count and shift the S-meter ~1-2 S-units high.
         if let Some(dbm) = self.smeter_direct_dbm {
-            sdr_remote_core::dbm_to_display(dbm)
+            self.apply_s9_band_shift(dbm, self.vfo_a_freq)
         } else {
-            Self::avg_mw_to_display(&self.smeter_window)
+            self.avg_mw_to_dbm(&self.smeter_window, self.vfo_a_freq)
         }
     }
 
-    pub fn smeter_rx2_avg(&self) -> u16 {
+    pub fn smeter_rx2_avg(&self) -> f32 {
         if let Some(dbm) = self.smeter_rx2_direct_dbm {
-            sdr_remote_core::dbm_to_display(dbm)
+            self.apply_s9_band_shift(dbm, self.vfo_b_freq)
         } else {
-            Self::avg_mw_to_display(&self.smeter_rx2_window)
+            self.avg_mw_to_dbm(&self.smeter_rx2_window, self.vfo_b_freq)
+        }
+    }
+
+    /// RX1 Sig source — peak-hold detector (~100 ms decay).
+    /// Returns Avg as fallback when Thetis hasn't pushed the _ex format yet.
+    pub fn smeter_sig(&self) -> f32 {
+        if let Some(dbm) = self.smeter_sig_dbm {
+            self.apply_s9_band_shift(dbm, self.vfo_a_freq)
+        } else {
+            self.smeter_avg()
+        }
+    }
+
+    /// RX1 MaxBin source — highest single FFT bin in passband.
+    pub fn smeter_peakbin(&self) -> f32 {
+        if let Some(dbm) = self.smeter_peakbin_dbm {
+            self.apply_s9_band_shift(dbm, self.vfo_a_freq)
+        } else {
+            self.smeter_avg()
+        }
+    }
+
+    pub fn smeter_rx2_sig(&self) -> f32 {
+        if let Some(dbm) = self.smeter_rx2_sig_dbm {
+            self.apply_s9_band_shift(dbm, self.vfo_b_freq)
+        } else {
+            self.smeter_rx2_avg()
+        }
+    }
+
+    pub fn smeter_rx2_peakbin(&self) -> f32 {
+        if let Some(dbm) = self.smeter_rx2_peakbin_dbm {
+            self.apply_s9_band_shift(dbm, self.vfo_b_freq)
+        } else {
+            self.smeter_rx2_avg()
         }
     }
 
@@ -1329,7 +1500,11 @@ impl TciConnection {
             self.smeter_window.clear();
             self.smeter_rx2_window.clear();
             self.smeter_direct_dbm = None;
+            self.smeter_sig_dbm = None;
+            self.smeter_peakbin_dbm = None;
             self.smeter_rx2_direct_dbm = None;
+            self.smeter_rx2_sig_dbm = None;
+            self.smeter_rx2_peakbin_dbm = None;
             if !active {
                 self.fwd_power_watts = 0.0;
             }

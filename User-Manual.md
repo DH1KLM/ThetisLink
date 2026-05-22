@@ -1,4 +1,4 @@
-﻿# ThetisLink v2.0.2 — Gebruikershandleiding
+﻿# ThetisLink v2.0.3 — Gebruikershandleiding
 
 ## Inhoudsopgave
 
@@ -47,7 +47,7 @@ ThetisLink wordt gedistribueerd als een zip bestand met de volgende inhoud:
 |---------|-------------|
 | `ThetisLink-Server.exe` | Server executable (Windows) |
 | `ThetisLink-Client.exe` | Desktop client executable |
-| `ThetisLink-2.0.2.apk` | Android client app |
+| `ThetisLink-2.0.3.apk` | Android client app |
 | `Installatie.pdf` | Installatiehandleiding (Nederlands) |
 | `User-Manual.pdf` | Gebruikershandleiding (Nederlands, dit document) |
 | `Technische-Referentie.pdf` | Technische referentie (Nederlands) |
@@ -83,7 +83,8 @@ flowchart TB
     Server <-->|"UDP :4580"| Desktop[Desktop Client<br>egui]
     Server <-->|"UDP :4580"| Android[Android Client<br>Compose]
     Server <--> Amplitec[Amplitec 6/2<br>COM 19200]
-    Server <--> Tuner[JC-4s Tuner<br>COM RTS/CTS]
+    Server <--> Tuner1[JC-4s / JC-3s Tuner #1<br>MCP2221A USB-HID]
+    Server <--> Tuner2[JC-4s / JC-3s Tuner #2<br>MCP2221A USB-HID]
     Server <--> SPE[SPE 1.3K-FA<br>COM 115200]
     Server <--> RF2K[RF2K-S PA<br>HTTP :8080]
     Server <--> UB[UltraBeam RCU-06<br>COM]
@@ -91,7 +92,7 @@ flowchart TB
     Server <--> Yaesu[Yaesu FT-991A<br>COM + USB Audio]
 ```
 
-Alle audio (RX/TX), IQ spectrum data en besturing gaan via één enkele TCI WebSocket verbinding. ThetisLink v2.0.2 gebruikt geen aparte CAT TCP verbinding — TCI dekt alle benodigde commando's, zowel met stock Thetis v2.10.3.15 als met de PA3GHM fork. Geen VB-Cable of andere drivers nodig.
+Alle audio (RX/TX), IQ spectrum data en besturing gaan via één enkele TCI WebSocket verbinding. ThetisLink v2.0.3 gebruikt geen aparte CAT TCP verbinding — TCI dekt alle benodigde commando's, zowel met stock Thetis v2.10.3.15 als met de PA3GHM fork. Geen VB-Cable of andere drivers nodig.
 
 ---
 
@@ -200,7 +201,7 @@ De filterbreedte is instelbaar met +/- knoppen. Presets zijn beschikbaar per mod
 - **SSB:** 1800, 2400, 2700, 3100, 3600 Hz
 - **AM/FM:** 6000, 8000, 10000, 12000 Hz
 
-**Filter preset tracking (v2.0.0, met fork):** met de PA3GHM fork synchroniseert de huidige Thetis-filter-preset (F1, F2, F3, VAR1, VAR2 of NONE) live naar de client. De client toont welke preset Thetis nu actief heeft en owner kan via dezelfde knop-set switchen — geen handmatig dubbel-instellen tussen client en Thetis-UI nodig.
+**Filter preset tracking (v2.0.0, met fork):** met de PA3GHM fork synchroniseert de huidige Thetis-filter-preset (F1, F2, F3, VAR1, VAR2 of NONE) live naar de client. De client toont welke preset Thetis nu actief heeft en je kunt via dezelfde knop-set switchen — geen handmatig dubbel-instellen tussen client en Thetis-UI nodig.
 
 ### Volume
 
@@ -298,17 +299,44 @@ Serieel USB verbinding (19200 baud). Toont:
 - 6 antenne posities met configureerbare labels
 - Schakel knoppen per poort
 
-### JC-4s Automatische Tuner
+### StockCorner JC-4s / JC-3s automatische tuners (multi-tuner via MCP2221A)
 
-Serieel USB verbinding. Functies:
-- **Tune** knop: start afstemming
-- **Abort** knop: breek afstemming af
-- Status weergave: Tuning, Done, Timeout, Aborted
-- Log venster (optioneel)
+Vanaf v2.0.3 ondersteunt de server **twee fysieke tuners parallel**, elk via een eigen Adafruit MCP2221A USB-HID breakout. JC-4s en JC-3s hebben hetzelfde besturingsprotocol — het modellabel is alleen cosmetisch. Per tuner-slot stel je het bord-serienummer en (optioneel) de Amplitec-A-antennepositie in waarachter de tuner fysiek hangt; de server stuurt vervolgens automatisch de juiste tuner aan bij een Tune-actie.
 
-De tuner werkt samen met eindversterkers (SPE/RF2K) voor veilig tunen: de PA gaat automatisch naar standby tijdens het tunen.
+**Hardware-koppeling (per tuner):**
+- **GP2** → in serie met een gate-weerstand naar de gate (2N7000) of basis (MMBT3904) van een transistor; bij `HIGH` trekt de transistor de **grijze "start"-draad** van de JC-Control naar GND (mechanisch gelijk aan de start-knop indrukken).
+- **GP1** → ADC-ingang op het middenpunt van een **1 MΩ + 1 MΩ 1:1 spanningsdeler** op de **gele "tune-status"-draad**. Idle ≈ 4.5 V, tune-actief ≈ 0 V; de hoge impedantie belast de JC-Control LED-keten niet noemenswaardig.
+- **GND** → gemeenschappelijke massa met de JC-Control.
+- Het volledige schema (inclusief 2N7000- en MMBT3904-varianten) staat in de technische referentie.
 
-> **Tuner knop zichtbaarheid:** De Tune-knop in het hoofdscherm is alleen zichtbaar als een Amplitec label het woord "JC-4s" (of "JC4s" of "Tuner") bevat. Zie [Naamconventies](#naamconventies).
+**Eerste keer instellen:**
+1. Plug alle MCP2221A-borden in en open het **MCP2221A tuner bridges**-blok onderin het server status-paneel (klap uit met het driehoekje; de stand wordt onthouden tot de volgende keer).
+2. Klik **Scan** onder "Detected MCP2221A boards" — alle borden op de USB-bus worden opgelijst met hun pad en huidig serienummer.
+3. Voor elk **anoniem** bord (leeg serienummer): vul een unieke naam in onder "Set serial:" (bijvoorbeeld `JC-4s loop` of `JC-3s vertical`) en klik **Program serial**. Het bord onthoudt de naam in EEPROM; klik nogmaals op **Scan** om de nieuwe naam te zien.
+4. Voor elk **Tuner1** / **Tuner2** blok in het paneel: kies onder "MCP serial:" het bord dat bij dat slot hoort en kies onder "Amplitec pos:" de antennepositie (1–6) waarachter de tuner fysiek zit. Beide acties triggeren een server-auto-restart zodat de bridge op het gekozen bord opent.
+
+**Per-tuner status-rij toont:**
+- Header: tuner-label + "Connected" / "Not connected" / "Error: …"
+- **MCP serial** dropdown en **Amplitec pos** dropdown.
+- **Live:** actuele spanning op de gele draad (V, na ×2 deler-correctie).
+- **Threshold** schuif (0.5–4.5 V, default 2.25 V): de schakelgrens op de gele draad.
+- **Hysteresis** schuif (0.1–2.0 V, default 0.50 V): doodband rondom de threshold om transient-ruis te onderdrukken.
+- **Edges:** de afgeleide grenzen (`active < … V`, `idle > … V`). Bij een onmogelijke combinatie (bijv. threshold 0.5 V + hysterese 2.0 V → active < 0 V) verschijnt een amber **⚠ clamped**-waarschuwing met hover-tip die uitlegt dat de combinatie nooit zal triggeren — verlaag de hysterese of beweeg de threshold weg van de rand.
+
+**Tune-volgorde (per tuner):**
+1. PA standby (SPE/RF2K) als één van beide in Operate staat.
+2. GP2 HIGH (start asserted) en wacht tot de gele draad onder de active-edge zakt = tuner ACK.
+3. GP2 LOW (start released).
+4. Thetis carrier ON (`ZZTU1;`).
+5. Wacht tot de gele draad terug boven de idle-edge komt = tune compleet.
+6. Thetis carrier OFF (`ZZTU0;`).
+7. PA terug naar Operate.
+
+Een timeout treedt op als de tuner binnen 3 s na GP2 HIGH niet ACK't (status **Timeout**), of als de tune-cyclus binnen 30 s niet compleet is (idem). **Abort** breekt de cyclus af en zet GP2 weer LOW. Eén ADC-poll is rate-limited tot 100 ms per bord; de tuner-thread checkt expliciet de sample-timestamp om dubbel-tellen van rate-limited cached samples te voorkomen.
+
+**USB auto-reconnect:** zodra een bridge "Connected" is geweest en de verbinding daarna wegvalt (kabel los, slaap-modus, hub reset, …) probeert de tuner-thread elke 5 s zelfstandig opnieuw te openen. Een succesvolle reconnect reset de timer zodat een volgende drop direct opnieuw geprobeerd wordt — geen server-restart nodig.
+
+> **Tune-knop zichtbaarheid:** De Tune-knop in het hoofdscherm is alleen zichtbaar wanneer er ten minste één Amplitec label naar een woord verwijst dat een tuner herkent (`JC-4s`, `JC4s`, `JC-3s`, `JC3s`, of `Tuner`). De routing naar het juiste fysieke tuner-slot gebeurt automatisch op basis van de actieve Amplitec-A positie — zie [Naamconventies](#naamconventies).
 
 ### SPE Expert 1.3K-FA
 
@@ -503,7 +531,7 @@ De server ondersteunt 24 programmeerbare macro knoppen in 2 rijen:
 Elke macro kan een reeks acties bevatten:
 - **CAT commando:** bijv. `ZZFA00014292000;` (stel VFO A in op 14.292 MHz)
 - **Delay:** bijv. `delay:200` (wacht 200ms)
-- **Tune:** start de JC-4s tuner
+- **Tune:** start de tuner die bij de actieve Amplitec-A positie hoort (één of twee fysieke tuners; zie [StockCorner JC-4s / JC-3s automatische tuners](#stockcorner-jc-4s--jc-3s-automatische-tuners-multi-tuner-via-mcp2221a))
 
 ### Macro configuratie
 
@@ -545,28 +573,35 @@ De Amplitec label voor de UltraBeam antenne-uitgang moet een van deze woorden be
   - Als Amplitec poort **A** op de UltraBeam positie staat -> volgt **VFO A**
   - Geen match -> default **VFO A**
 
-### JC-4s Tuner integratie
+### JC-4s / JC-3s tuner integratie (multi-tuner)
 
-De Amplitec label voor de JC-4s tuner uitgang moet bevatten:
+De Amplitec label voor elke tuner-uitgang moet één van deze woorden bevatten (hoofdletter-ongevoelig):
 - `JC-4s`
 - `JC4s`
+- `JC-3s`
+- `JC3s`
 - `Tuner`
 
 **Wat dit oplevert:**
-- De **Tune** knop in het hoofdscherm is alleen zichtbaar als een Amplitec label een van deze woorden bevat
-- Automatische antenna selection voor safe tune
+- De **Tune** knop in het hoofdscherm is alleen zichtbaar als ten minste één Amplitec label een van deze woorden bevat.
+- Wanneer de Amplitec-A naar een positie wordt geschakeld die in het server status-paneel aan een fysiek tuner-slot gekoppeld is (zie [tuner-blok](#stockcorner-jc-4s--jc-3s-automatische-tuners-multi-tuner-via-mcp2221a)), routeert de server een Tune-actie automatisch naar de juiste fysieke tuner — de andere tuner blijft idle.
 
-**Voorbeeld configuratie:**
+**Voorbeeld configuratie (twee tuners):**
 ```
-amplitec_label1=JC-4s
-amplitec_label2=Dipole
-amplitec_label3=Vertical
+amplitec_label1=JC-4s loop
+amplitec_label2=JC-3s vertical
+amplitec_label3=Dipole
 amplitec_label4=Beverage
 amplitec_label5=DummyLoad
 amplitec_label6=UltraBeam
 ```
 
-In dit voorbeeld staat de JC-4s tuner op positie 1 en de UltraBeam op positie 6. Als je de Amplitec poort B schakelt naar positie 6, volgt de UltraBeam automatisch VFO B.
+In dit voorbeeld:
+- Positie 1 = JC-4s loop → in het server status-paneel toegewezen aan **Tuner1**, MCP serial `JC-4s loop`.
+- Positie 2 = JC-3s vertical → toegewezen aan **Tuner2**, MCP serial `JC-3s vertical`.
+- Positie 6 = UltraBeam → Sync VFO / Auto tracking voor de UltraBeam (zie [UltraBeam integratie](#ultrabeam-integratie)).
+
+Een Tune-druk bij Amplitec-A op positie 1 start fysiek Tuner1; positie 2 start Tuner2. Alleen één van beide draait tegelijk — de PA-orchestration en RF-carrier worden door de actieve tuner gecoördineerd.
 
 ---
 
@@ -598,6 +633,7 @@ Als het spectrum (lijn) en de waterval niet synchroon lopen bij het pannen, hers
 
 | Versie | Hoogtepunten |
 |---|---|
+| **2.0.3** | **Multi-tuner release + wire-protocol breaking change.** Twee fysieke StockCorner JC-4s/JC-3s tuners parallel via Adafruit MCP2221A USB-HID breakouts (vervangt de v2.0.2 serial-port RTS/CTS aansturing); per-tuner threshold + hysterese schuiven op de gele tune-status draad (1 MΩ + 1 MΩ deler, default 2.25 V / 0.50 V); board scan + serial programming UI; automatische USB-reconnect; inklapbaar MCP2221A-blok in het status-paneel. Daarnaast: S-meter herschreven met drie bronnen (Sig peak-hold, Avg true-mean, MaxBin), `rx_channel_sensors_ex` subscription, S9-frequency band shift; CTUN coupled-recenter + RX1/RX2 spectrum-mirror; MIDI client-side VFO-coalesce + auto-recenter handshake met de Thetis-fork; per-PA drive-snapshot persistence over proces-restart heen; collapsible window-states onthouden. **Wire-protocol u8 bumped van 2 → 3** (S-meter payload herschikt); v2.0.2-clients tegen v2.0.3-server (en omgekeerd) krijgen `ProtocolVersionMismatch` met gelocaliseerde melding ("Server is te oud" / "Client is te oud"). |
 | **2.0.2** | **Log-spam hotfix:** server-side `DiversityPhaseEx`, `DiversityGainEx` en `DiversityGainMultiEx` notifications loggen nu alleen INFO bij echte value-change. Thetis pusht deze elke diversity-tick (~10-20 Hz), waardoor het server-log per sessie honderdduizenden regels telde. Functioneel gedrag en wire-protocol ongewijzigd — volledig interoperabel met v2.0.0 / v2.0.1. |
 | 2.0.1 | **Connect-ervaring release:** first-run 4-stappen setup-wizard (Vind server → Wachtwoord → 2FA → Verbonden), mDNS local-network discovery (auto-vind servers op hetzelfde WiFi/LAN), 9 gedifferentieerde connect-states met platform-bewuste NL/EN hints, server Status-paneel (bind-adres, TCI-status, actieve clients met RTT/loss/jitter, audio-routing chips, recente connect-pogingen), slimme TciUnreachable hint (weet of Thetis draait, opstart of gestopt is), server-side RX2 audio-filter fix (geen fantoom CH2-stream meer als RX2 uit staat), Setup-wizard opnieuw starten knop. Wire-protocol ongewijzigd (VERSION = 2) — volledig interoperabel met 2.0.0. |
 | 2.0.0 | **TL2 release:** Yaesu auto-DFM PTT-toggle (FM ↔ DATA-FM met memory-restore), server-side CTUN auto-recenter, live diversity null-circle broadcast (Smart/Ultra), filter-preset push (F1..VAR2/NONE), per-RX DDC sample rate (48..1536 kHz), `tci_caps_ex` capability broadcast, DX cluster click-to-tune, SWR display in TX meter, CW keyer + macros over TCI, single-TCI-only architectuur (geen aparte CAT meer), wire-protocol VERSION = 2 |

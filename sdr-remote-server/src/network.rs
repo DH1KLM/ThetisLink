@@ -22,10 +22,16 @@ use crate::rf2k::Rf2k;
 use crate::session::SessionManager;
 use crate::spe_expert::SpeExpert;
 use crate::spectrum::{Rx2SpectrumProcessor, SpectrumProcessor};
-use crate::tuner::Jc4sTuner;
+use crate::tuner::{TunerInstance, Tuners};
 use crate::dxcluster::DxCluster;
 use crate::rotor::Rotor;
 use crate::ultrabeam::UltraBeam;
+
+/// Pack a dBm reading into the wire format: dBm × 10 as i16, saturating at the
+/// ends so a stale `-200 dBm` sentinel still survives the cast intact.
+fn dbm_to_deci(dbm: f32) -> i16 {
+    (dbm * 10.0).round().clamp(i16::MIN as f32, i16::MAX as f32) as i16
+}
 
 /// Bind-fail / bind-timeout diagnostic write helper. Direct file-write to
 /// thetislink-server.log next to the executable, bypassing `log::` macros for
@@ -54,7 +60,11 @@ pub struct NetworkService {
     rx2_spectrum: Arc<Mutex<Rx2SpectrumProcessor>>,
     shutdown: watch::Receiver<bool>,
     amplitec: Option<Arc<AmplitecSwitch>>,
-    tuner: Option<Arc<Jc4sTuner>>,
+    /// Multi-tuner collection (0..2 instances). The single-tuner status
+    /// broadcast and the Tune command handler route via
+    /// `Tuners::for_amplitec_pos(active_pos)` and fall back to
+    /// `Tuners::primary()` when no Amplitec mapping matches.
+    tuners: Arc<Tuners>,
     spe: Option<Arc<SpeExpert>>,
     rf2k: Option<Arc<Rf2k>>,
     ultrabeam: Option<Arc<UltraBeam>>,
@@ -88,7 +98,7 @@ impl NetworkService {
         rx2_spectrum: Arc<Mutex<Rx2SpectrumProcessor>>,
         shutdown: watch::Receiver<bool>,
         amplitec: Option<Arc<AmplitecSwitch>>,
-        tuner: Option<Arc<Jc4sTuner>>,
+        tuners: Arc<Tuners>,
         spe: Option<Arc<SpeExpert>>,
         rf2k: Option<Arc<Rf2k>>,
         ultrabeam: Option<Arc<UltraBeam>>,
@@ -107,21 +117,51 @@ impl NetworkService {
         bind_status_slot: Arc<std::sync::OnceLock<crate::audio_stats::BindStatus>>,
     ) -> Result<Self> {
         // Wrap bind in 30s timeout to catch cold-boot kernel-hangs (memory
-        // project_tl2_coldboot_bind_fail.md). On Err: emit [BIND-FAIL] with
-        // concrete OS error. On timeout: emit [BIND-TIMEOUT] with elapsed.
-        // Direct file-write keeps diagnostic visible if logger state is fragile.
+        // project_tl2_coldboot_bind_fail.md). Within that window we retry
+        // every 250 ms on "address in use" / "access denied" / similar
+        // transient errors so the auto-restart path doesn't lose the race
+        // when the previous instance's socket is still in TIME_WAIT or the
+        // process slot is briefly held. Other errors fail immediately.
         const BIND_TIMEOUT_SECS: u64 = 30;
+        const BIND_RETRY_MS: u64 = 250;
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        let bind_loop = async {
+            let started = std::time::Instant::now();
+            let deadline = Duration::from_secs(BIND_TIMEOUT_SECS);
+            loop {
+                match UdpSocket::bind(bind_addr).await {
+                    Ok(s) => return Ok(s),
+                    Err(e) => {
+                        // Identify transient port-not-yet-released errors so we
+                        // distinguish them from "no such interface" etc.
+                        let kind = e.kind();
+                        let transient = matches!(
+                            kind,
+                            std::io::ErrorKind::AddrInUse
+                                | std::io::ErrorKind::PermissionDenied
+                        );
+                        if !transient || started.elapsed() >= deadline {
+                            return Err(e);
+                        }
+                        info!(
+                            "bind {} transient error ({:?}: {}), retrying in {}ms",
+                            bind_addr, kind, e, BIND_RETRY_MS
+                        );
+                        tokio::time::sleep(Duration::from_millis(BIND_RETRY_MS)).await;
+                    }
+                }
+            }
+        };
         let socket = match tokio::time::timeout(
-            Duration::from_secs(BIND_TIMEOUT_SECS),
-            UdpSocket::bind(bind_addr),
-        ).await {
+            Duration::from_secs(BIND_TIMEOUT_SECS + 2),
+            bind_loop,
+        )
+        .await
+        {
             Ok(Ok(s)) => {
-                // Publish to the Status-panel slot so the UI shows the real
-                // listen address instead of a hardcoded placeholder.
                 let _ = bind_status_slot.set(
                     crate::audio_stats::BindStatus::Ok { addr: bind_addr.to_string() },
                 );
@@ -167,6 +207,31 @@ impl NetworkService {
             let recv = sock_ref.recv_buffer_size().unwrap_or(0);
             info!("UDP socket bound to {} (send_buf={}KB, recv_buf={}KB)", bind_addr, send/1024, recv/1024);
         }
+        // Mark the UDP socket non-inheritable on Windows. Default WSASocket
+        // handles are inheritable, which means any child process we spawn
+        // (e.g. the auto-restart helper) keeps the socket alive after we
+        // exit, blocking the new process from binding the same port for
+        // ~tens of seconds. Clearing HANDLE_FLAG_INHERIT here makes the
+        // socket exclusively ours so it closes the instant we exit.
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawSocket;
+            extern "system" {
+                fn SetHandleInformation(
+                    h_object: usize,
+                    dw_mask: u32,
+                    dw_flags: u32,
+                ) -> i32;
+            }
+            const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+            unsafe {
+                SetHandleInformation(
+                    socket.as_raw_socket() as usize,
+                    HANDLE_FLAG_INHERIT,
+                    0,
+                );
+            }
+        }
 
         Ok(Self {
             socket: Arc::new(socket),
@@ -176,7 +241,7 @@ impl NetworkService {
             rx2_spectrum,
             shutdown,
             amplitec,
-            tuner,
+            tuners,
             spe,
             rf2k,
             ultrabeam,
@@ -373,7 +438,7 @@ impl NetworkService {
             let spectrum = self.spectrum.clone();
             let rx2_spectrum = self.rx2_spectrum.clone();
             let amplitec = self.amplitec.clone();
-            let tuner = self.tuner.clone();
+            let tuners = self.tuners.clone();
             let spe = self.spe.clone();
             let rf2k = self.rf2k.clone();
             let ultrabeam = self.ultrabeam.clone();
@@ -399,7 +464,11 @@ impl NetworkService {
                 let mut spectrum_tick = interval(Duration::from_millis(50)); // 20 Hz check rate
                 let mut equipment_tick = interval(Duration::from_millis(200));
                 let mut spectrum_frame_count: u32 = 0;
-                let mut tuner_done_freq: u64 = 0; // VFO at tune complete
+                // Per-tuner VFO-at-tune-complete tracking — each tuner has its
+                // own physical memory, so the "stale" check (VFO moved >25 kHz
+                // from the last tune) must be evaluated independently per slot.
+                // Index by `TunerInstance::slot_index()`.
+                let mut tuner_done_freqs: [u64; 2] = [0, 0];
                 let mut last_vfo_freq: u64 = 0; // cached VFO A for tuner stale check
                 let mut last_vfo_b_freq: u64 = 0; // cached VFO B for DX cluster band filter
                 let mut tci_spots_sent: std::collections::HashSet<(String, u64)> = std::collections::HashSet::new();
@@ -459,14 +528,19 @@ impl NetworkService {
 
                             // RX2 spectrum: also extract under lock, then release
                             {
-                                let rx2_client_info: Vec<(SocketAddr, f32, f32, u16)> = {
+                                let rx2_client_info: Vec<(SocketAddr, f32, f32, u16, u8)> = {
                                     let sess = session.lock().await;
-                                    sess.rx2_spectrum_clients()
+                                    sess.rx2_spectrum_clients().into_iter().map(|(addr, zoom, pan, max_bins)| {
+                                        let loss = sess.client_loss(addr);
+                                        (addr, zoom, pan, max_bins, loss)
+                                    }).collect()
                                 };
                                 if !rx2_client_info.is_empty() {
                                     let mut rx2_sp = rx2_spectrum.lock().await;
                                     if rx2_sp.is_frame_ready() {
-                                        for (addr, zoom, pan, max_bins) in &rx2_client_info {
+                                        for (addr, zoom, pan, max_bins, loss) in &rx2_client_info {
+                                            if *loss > 15 { continue; }
+                                            if *loss > 5 && spectrum_frame_count % 2 != 0 { continue; }
                                             let pkt = rx2_sp.extract_view(*zoom, *pan, *max_bins as usize);
                                             let mut buf = Vec::with_capacity(*max_bins as usize + 20);
                                             pkt.serialize_as_type(&mut buf, PacketType::SpectrumRx2);
@@ -558,19 +632,34 @@ impl NetworkService {
                                 };
                                 send_if_changed!(DeviceType::Rf2k, pkt, &eq_addrs);
                             }
-                            // Tuner: track tune frequency, show stale if VFO moved >25kHz
-                            if let Some(ref tuner_ref) = tuner {
+                            // Tuner: track tune frequency, show stale if VFO moved >25kHz.
+                            // Multi-tuner: pick the tuner bound to the active Amplitec-A
+                            // position; fall back to the primary (first enabled) tuner so
+                            // the panel still works without an Amplitec mapping configured.
+                            let active_amplitec_pos = amplitec
+                                .as_ref()
+                                .map(|a| a.status().switch_a)
+                                .filter(|p| (1..=6).contains(p));
+                            let active_tuner = active_amplitec_pos
+                                .and_then(|p| tuners.for_amplitec_pos(p))
+                                .or_else(|| tuners.primary());
+                            if let Some(tuner_ref) = active_tuner.as_ref() {
                                 let ts = tuner_ref.status();
                                 let current_freq = last_vfo_freq;
-                                let tuner_done = ts.state == crate::tuner::TUNER_DONE_OK
-                                    || ts.state == crate::tuner::TUNER_DONE_ASSUMED;
-                                if tuner_done {
-                                    if tuner_done_freq == 0 {
-                                        tuner_done_freq = current_freq;
+                                let tuner_done = ts.state == crate::tuner::TUNER_DONE_OK;
+                                // Per-tuner stale-check: the slot's last-tune VFO is
+                                // remembered across Amplitec switches, so a second tuner
+                                // does not see the first tuner's tune freq.
+                                let done_slot = tuner_ref.slot_index().min(tuner_done_freqs.len() - 1);
+                                let tuner_done_freq = if tuner_done {
+                                    if tuner_done_freqs[done_slot] == 0 {
+                                        tuner_done_freqs[done_slot] = current_freq;
                                     }
+                                    tuner_done_freqs[done_slot]
                                 } else {
-                                    tuner_done_freq = 0;
-                                }
+                                    tuner_done_freqs[done_slot] = 0;
+                                    0
+                                };
                                 let is_stale = tuner_done
                                     && tuner_done_freq > 0 && current_freq > 0
                                     && (current_freq as i64 - tuner_done_freq as i64).unsigned_abs() > 25_000;
@@ -580,13 +669,12 @@ impl NetworkService {
                                     state: broadcast_state,
                                     ..ts
                                 };
-                                let can_tune = if let Some(ref amp) = amplitec {
-                                    let amp_status = amp.status();
-                                    let pos = amp_status.switch_a;
-                                    pos > 0 && pos <= 6 && config.amplitec_labels[(pos - 1) as usize]
-                                        .to_lowercase().contains("jc-4s")
-                                } else {
-                                    true
+                                // can_tune: a tuner is available for the active antenna iff
+                                // a tuner-config slot is bound to that position. Without an
+                                // Amplitec mapping at all, the primary tuner is always usable.
+                                let can_tune = match active_amplitec_pos {
+                                    Some(p) => tuners.for_amplitec_pos(p).is_some(),
+                                    None => true,
                                 };
                                 let pkt = EquipmentStatusPacket {
                                     device_type: DeviceType::Tuner,
@@ -727,10 +815,23 @@ impl NetworkService {
                             let freq = ptt_guard.vfo_a_freq();
                             let mode = ptt_guard.vfo_a_mode();
                             let is_tx = ptt_guard.is_transmitting();
-                            let smeter = if is_tx {
-                                ptt_guard.fwd_power_raw()
+                            // S-meter packet `level` is signed deci-units on the wire:
+                            //  - RX (PTT flag clear): dBm × 10  (e.g. -730 = -73 dBm = S9)
+                            //  - TX (PTT flag set):   watts × 10 (e.g. 1000 = 100.0 W FWD)
+                            let smeter: i16 = if is_tx {
+                                ptt_guard.fwd_power_raw() as i16
                             } else {
-                                ptt_guard.smeter_avg()
+                                dbm_to_deci(ptt_guard.smeter_avg())
+                            };
+                            // Per-source S-meter values for client-side
+                            // subscription (Sig / Avg / MaxBin). During TX the
+                            // S-meter widget switches to FWD-power so the
+                            // alternate sources are unused; we keep them at 0
+                            // to avoid the cost of three more upstream sensor lookups.
+                            let (smeter_sig, smeter_peakbin): (i16, i16) = if is_tx {
+                                (0, 0)
+                            } else {
+                                (dbm_to_deci(ptt_guard.smeter_sig()), dbm_to_deci(ptt_guard.smeter_peakbin()))
                             };
                             let swr_x100 = if is_tx { ptt_guard.swr_x100() } else { 100 };
                             let power_on = ptt_guard.power_on();
@@ -749,7 +850,9 @@ impl NetworkService {
                             // RX2 state
                             let vfo_b_freq = ptt_guard.vfo_b_freq();
                             let vfo_b_mode = ptt_guard.vfo_b_mode();
-                            let smeter_rx2 = ptt_guard.smeter_rx2_avg();
+                            let smeter_rx2: i16 = dbm_to_deci(ptt_guard.smeter_rx2_avg());
+                            let smeter_rx2_sig: i16 = dbm_to_deci(ptt_guard.smeter_rx2_sig());
+                            let smeter_rx2_peakbin: i16 = dbm_to_deci(ptt_guard.smeter_rx2_peakbin());
                             let rx2_af_gain = ptt_guard.rx2_af_gain();
                             let rx2_filter_low = ptt_guard.filter_rx2_low_hz();
                             let rx2_filter_high = ptt_guard.filter_rx2_high_hz();
@@ -927,15 +1030,46 @@ impl NetworkService {
                                 }
                             }
 
-                            // S-meter to Thetis clients (Yaesu-only clients don't need it)
+                            // S-meter to Thetis clients (Yaesu-only clients don't need it).
+                            // Per-client: emit one packet per subscribed source from the
+                            // SmeterSources bitmap. The default mask (0x22) emits
+                            // RX1 Avg + RX2 Avg, matching pre-multi-source behaviour.
+                            // During TX we keep emitting the legacy Smeter (Avg slot)
+                            // packet with FWD-power so the existing TX-meter rendering
+                            // path on the client keeps working unchanged; the Sig and
+                            // MaxBin packets are zero-valued and effectively unused.
                             if !smeter_addrs.is_empty() {
                                 let flags = if is_tx || yaesu_ptt_flag.load(Ordering::Relaxed) { Flags::PTT } else { Flags::NONE };
-                                let pkt = SmeterPacket { level: smeter, flags };
-                                let mut buf = [0u8; SmeterPacket::SIZE];
-                                pkt.serialize(&mut buf);
+                                // Pre-serialise the three RX1 packet bodies once per
+                                // tick — they're identical across clients.
+                                let mut buf_avg = [0u8; SmeterPacket::SIZE];
+                                SmeterPacket { level: smeter, flags }.serialize(&mut buf_avg);
+                                let mut buf_sig = [0u8; SmeterPacket::SIZE];
+                                SmeterPacket { level: smeter_sig, flags }.serialize_as_type(&mut buf_sig, PacketType::SmeterSig);
+                                let mut buf_pkb = [0u8; SmeterPacket::SIZE];
+                                SmeterPacket { level: smeter_peakbin, flags }.serialize_as_type(&mut buf_pkb, PacketType::SmeterMaxBin);
+                                let sess = session.lock().await;
                                 for addr in &smeter_addrs {
-                                    let _ = socket.try_send_to(&buf, *addr);
+                                    let mask = sess.smeter_sources(*addr);
+                                    if is_tx {
+                                        // During TX the `smeter` field carries FWD-power
+                                        // (from `fwd_power_raw()` above), not an S-meter
+                                        // value. The Sig/MaxBin packets are zero-valued
+                                        // by design — emitting them would overwrite the
+                                        // client's TX-meter to 0. Force every TX-active
+                                        // client onto the legacy `Smeter` (Avg-slot)
+                                        // packet, regardless of subscription mask, so
+                                        // the PTT path keeps working for Sig/MaxBin
+                                        // subscribers too. Post-TX the regular per-source
+                                        // emission resumes.
+                                        let _ = socket.try_send_to(&buf_avg, *addr);
+                                    } else {
+                                        if mask & 0x01 != 0 { let _ = socket.try_send_to(&buf_sig, *addr); }
+                                        if mask & 0x02 != 0 { let _ = socket.try_send_to(&buf_avg, *addr); }
+                                        if mask & 0x04 != 0 { let _ = socket.try_send_to(&buf_pkb, *addr); }
+                                    }
                                 }
+                                drop(sess);
                             }
 
                             // Broadcast SWR during TX
@@ -1051,16 +1185,25 @@ impl NetworkService {
                                     }
                                 }
 
-                                // RX2 S-meter to RX2-enabled clients
+                                // RX2 S-meter: per-client subscription mirror of RX1.
+                                // Bits 4/5/6 in SmeterSources control which RX2 packet
+                                // types are emitted. Default mask 0x22 → bit 5 (Avg) only.
                                 {
-                                    let pkt = SmeterPacket { level: smeter_rx2, flags: Flags::NONE };
-                                    let mut buf = [0u8; SmeterPacket::SIZE];
-                                    pkt.serialize_as_type(&mut buf, PacketType::SmeterRx2);
+                                    let mut buf_avg = [0u8; SmeterPacket::SIZE];
+                                    SmeterPacket { level: smeter_rx2, flags: Flags::NONE }.serialize_as_type(&mut buf_avg, PacketType::SmeterRx2);
+                                    let mut buf_sig = [0u8; SmeterPacket::SIZE];
+                                    SmeterPacket { level: smeter_rx2_sig, flags: Flags::NONE }.serialize_as_type(&mut buf_sig, PacketType::SmeterRx2Sig);
+                                    let mut buf_pkb = [0u8; SmeterPacket::SIZE];
+                                    SmeterPacket { level: smeter_rx2_peakbin, flags: Flags::NONE }.serialize_as_type(&mut buf_pkb, PacketType::SmeterRx2MaxBin);
+                                    let sess = session.lock().await;
                                     for addr in &rx2_addrs {
-                                        let _ = socket.try_send_to(&buf, *addr);
+                                        let mask = sess.smeter_sources(*addr);
+                                        if mask & 0x10 != 0 { let _ = socket.try_send_to(&buf_sig, *addr); }
+                                        if mask & 0x20 != 0 { let _ = socket.try_send_to(&buf_avg, *addr); }
+                                        if mask & 0x40 != 0 { let _ = socket.try_send_to(&buf_pkb, *addr); }
                                     }
+                                    drop(sess);
                                 }
-
                                 // RX2 control states
                                 let rx2_controls: &[(ControlId, u16)] = &[
                                     (ControlId::Rx2AfGain, rx2_af_gain as u16),
@@ -1182,6 +1325,74 @@ impl NetworkService {
                 result = self.socket.recv_from(&mut recv_buf) => {
                     let (len, addr) = result.context("recv_from")?;
                     let data = &recv_buf[..len];
+
+                    // Protocol-version mismatch: detect BEFORE Packet::deserialize so we
+                    // can record it in the Status-panel ringbuffer. Otherwise the bail!
+                    // from Header::deserialize lands in the generic "Invalid packet" log
+                    // branch and the owner has no UI indication that an old client
+                    // (e.g. v2.0.2 APK against a build-58+ server) is retrying.
+                    if data.len() >= 2 && data[0] == MAGIC && data[1] != VERSION {
+                        let client_version = data[1];
+                        let mut session = self.session.lock().await;
+                        // De-dup against the previous entry for the same addr+version so
+                        // a reconnecting old client does not flood the 10-slot ringbuffer.
+                        let already_recent = session
+                            .recent_connect_attempts()
+                            .last()
+                            .map(|a| {
+                                a.remote_addr == addr
+                                    && matches!(
+                                        a.outcome,
+                                        crate::session::ConnectOutcome::ProtocolVersionMismatch {
+                                            client_version: v
+                                        } if v == client_version
+                                    )
+                            })
+                            .unwrap_or(false);
+                        if !already_recent {
+                            session.record_connect_attempt(
+                                addr,
+                                crate::session::ConnectOutcome::ProtocolVersionMismatch {
+                                    client_version,
+                                },
+                            );
+                        }
+                        drop(session);
+                        if !already_recent {
+                            // Log + back-channel reply happen at most once per
+                            // addr+version pair (gated on the same de-dup as
+                            // the status-panel ringbuffer entry). Without this,
+                            // a v2.0.2 client retrying connect every ~500 ms
+                            // would flood the server log at >100 lines/min
+                            // before its own ProtocolVersionMismatch UX kicks
+                            // in and the user closes the app.
+                            info!(
+                                "Rejecting packet from {} (client protocol v{}, server v{})",
+                                addr, client_version, VERSION
+                            );
+                            // 4-byte back-channel rejection so the client can
+                            // surface a localised ProtocolVersionMismatch
+                            // outcome instead of a generic "server unreachable"
+                            // timeout. Header layout is
+                            // `[MAGIC, VERSION, packet_type, flags]`; the
+                            // client's `Header::deserialize` checks the version
+                            // byte before the packet_type, so any value works
+                            // for bytes 2-3 — we use 0xFF as an "obviously
+                            // meaningless" type sentinel. The client falls into
+                            // the `Err(e)` recovery in
+                            // `sdr-remote-logic/src/engine.rs` (around L2274)
+                            // which checks for MAGIC + wrong-VERSION and raises
+                            // `ConnectError::ProtocolVersionMismatch`.
+                            let rejection: [u8; 4] = [MAGIC, VERSION, 0xFF, 0x00];
+                            if let Err(e) = self.socket.send_to(&rejection, addr).await {
+                                warn!(
+                                    "Failed to send protocol-mismatch rejection to {}: {}",
+                                    addr, e
+                                );
+                            }
+                        }
+                        continue;
+                    }
 
                     let packet = match Packet::deserialize(data) {
                         Ok(p) => p,
@@ -1436,10 +1647,26 @@ impl NetworkService {
                                     }
                                 }
                                 DeviceType::Tuner => {
-                                    if let Some(ref tuner_ref) = self.tuner {
+                                    // Multi-tuner routing: pick the tuner bound to the
+                                    // active Amplitec-A position; fall back to the primary
+                                    // (first enabled) when no Amplitec mapping matches.
+                                    let active_pos = self.amplitec
+                                        .as_ref()
+                                        .map(|a| a.status().switch_a)
+                                        .filter(|p| (1..=6).contains(p));
+                                    let target = active_pos
+                                        .and_then(|p| self.tuners.for_amplitec_pos(p))
+                                        .or_else(|| self.tuners.primary());
+                                    if let Some(tuner_ref) = target {
                                         match eq_cmd.command_id {
                                             CMD_TUNE_START => {
-                                                info!("Tuner: tune requested by client");
+                                                info!(
+                                                    "Tuner: tune requested by client ({}{})",
+                                                    tuner_ref.label(),
+                                                    active_pos
+                                                        .map(|p| format!(", amplitec_pos={}", p))
+                                                        .unwrap_or_default()
+                                                );
                                                 tuner_ref.send_command(crate::tuner::TunerCmd::StartTune);
                                             }
                                             CMD_TUNE_ABORT => {
@@ -1571,6 +1798,13 @@ impl NetworkService {
                                             CMD_UB_READ_ELEMENTS => {
                                                 Some(crate::ultrabeam::UltraBeamCmd::ReadElements)
                                             }
+                                            CMD_UB_MODIFY_ELEMENT => {
+                                                if eq_cmd.data.len() >= 3 && eq_cmd.data[0] < 6 {
+                                                    let index = eq_cmd.data[0];
+                                                    let length_mm = u16::from_le_bytes([eq_cmd.data[1], eq_cmd.data[2]]);
+                                                    Some(crate::ultrabeam::UltraBeamCmd::ModifyElement { index, length_mm })
+                                                } else { None }
+                                            }
                                             _ => {
                                                 debug!("Unknown UltraBeam command: 0x{:02X}", eq_cmd.command_id);
                                                 None
@@ -1652,7 +1886,9 @@ impl NetworkService {
                         }
                         // RX2 packets that are server→client only (ignore if received)
                         Packet::AudioRx2(_) | Packet::AudioBinR(_) | Packet::SmeterRx2(_)
-                        | Packet::SpectrumRx2(_) | Packet::FullSpectrumRx2(_) => {}
+                        | Packet::SpectrumRx2(_) | Packet::FullSpectrumRx2(_)
+                        | Packet::SmeterSig(_) | Packet::SmeterMaxBin(_)
+                        | Packet::SmeterRx2Sig(_) | Packet::SmeterRx2MaxBin(_) => {}
                         // Server→client only, ignore if received
                         Packet::Spot(_) | Packet::TxProfiles(_) | Packet::YaesuState(_)
                         | Packet::AuthChallenge(_) | Packet::AuthResponse(_) | Packet::AuthResult(_)
@@ -1852,6 +2088,11 @@ impl NetworkService {
                                     ptt.tci.effective_zoom_rx2_cache = new_eff_rx2;
                                     ptt.tci.trigger_eval_and_act_rx1(new_eff_rx1).await;
                                     ptt.tci.trigger_eval_and_act_rx2(new_eff_rx2).await;
+                                }
+                                ControlId::SmeterSources => {
+                                    let mask = ctrl.value;
+                                    info!("Client {} S-meter sources mask: 0x{:02x}", addr, mask);
+                                    self.session.lock().await.set_smeter_sources(addr, mask);
                                 }
                                 ControlId::Rx2SpectrumPan => {
                                     let pan = ctrl.value as f32 / 10000.0 - 0.5;

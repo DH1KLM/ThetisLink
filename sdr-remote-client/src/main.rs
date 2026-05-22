@@ -184,11 +184,16 @@ fn main() -> Result<()> {
         height: 32,
     };
     let window_size = ui::load_window_size();
+    let window_pos = ui::load_window_pos();
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size(window_size)
+        .with_title(format!("ThetisLink v{}", sdr_remote_core::version_string()))
+        .with_icon(std::sync::Arc::new(icon));
+    if let Some(pos) = window_pos {
+        viewport = viewport.with_position(egui::pos2(pos[0], pos[1]));
+    }
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size(window_size)
-            .with_title(format!("ThetisLink v{}", sdr_remote_core::version_string()))
-            .with_icon(std::sync::Arc::new(icon)),
+        viewport,
         ..Default::default()
     };
 

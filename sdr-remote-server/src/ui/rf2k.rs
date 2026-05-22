@@ -54,7 +54,11 @@ fn render_rf2k_header(
     ui.horizontal(|ui| {
         let mut active = is_active;
         if ui.checkbox(&mut active, "Active").changed() {
-            active_pa.store(if active { 2 } else { 0 }, Ordering::Relaxed);
+            let new_val = if active { 2 } else { 0 };
+            active_pa.store(new_val, Ordering::Relaxed);
+            // Persist immediately so a non-graceful shutdown (process kill,
+            // power loss, remote-restart) doesn't lose the user's PA choice.
+            crate::config::save_active_pa(new_val);
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.add_enabled(status.connected,

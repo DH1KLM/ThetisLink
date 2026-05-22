@@ -944,7 +944,8 @@ impl SdrRemoteApp {
     }
 
     pub(super) fn render_device_ultrabeam(&mut self, ui: &mut egui::Ui, _amber: Color32) {
-        // Header
+        // Header: heading on the left, Online/Offline + FW on the right,
+        // Menu toggle button between them so the layout mirrors the server window.
         ui.horizontal(|ui| {
             ui.heading("UltraBeam RCU-06");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -955,6 +956,15 @@ impl SdrRemoteApp {
                 }
                 if self.ub_fw_major > 0 {
                     ui.label(format!("FW {}.{}", self.ub_fw_major, self.ub_fw_minor));
+                }
+                ui.separator();
+                let menu_label = if self.ub_show_menu { "Menu \u{25BC}" } else { "Menu \u{25B6}" };
+                if ui.button(menu_label).clicked() {
+                    self.ub_show_menu = !self.ub_show_menu;
+                    if self.ub_show_menu {
+                        let _ = self.cmd_tx.send(Command::UbReadElements);
+                    }
+                    self.save_full_config();
                 }
             });
         });
@@ -1099,15 +1109,58 @@ impl SdrRemoteApp {
                 });
         }
 
-        // Element lengths (read-only)
-        if self.ub_elements_mm.iter().any(|&e| e > 0) {
-            ui.add_space(4.0);
+        // Collapsible Menu section — mirrors the server window so the
+        // owner only has to learn one UX. Editable element lengths +/-,
+        // Refresh, plus read-only Controller Info.
+        if self.ub_show_menu {
+            ui.add_space(8.0);
             ui.separator();
-            ui.label("Element lengths (mm):");
-            ui.horizontal(|ui| {
-                for (i, &mm) in self.ub_elements_mm.iter().enumerate() {
-                    ui.label(format!("E{}: {}", i + 1, mm));
+            ui.label(RichText::new("Menu").strong().size(16.0));
+
+            ui.add_space(4.0);
+            ui.label(RichText::new("Element Lengths").strong());
+            ui.indent("ub_elements_client", |ui| {
+                for i in 0..6 {
+                    let len = self.ub_elements_mm[i];
+                    if len > 0 {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("E{}: {} mm", i + 1, len));
+                            let can_edit = self.ub_connected;
+                            if ui.add_enabled(can_edit && len > 10, egui::Button::new("-").small()).clicked() {
+                                let _ = self.cmd_tx.send(Command::UbModifyElement(i as u8, len - 10));
+                                let _ = self.cmd_tx.send(Command::UbReadElements);
+                            }
+                            if ui.add_enabled(can_edit, egui::Button::new("+").small()).clicked() {
+                                let _ = self.cmd_tx.send(Command::UbModifyElement(i as u8, len + 10));
+                                let _ = self.cmd_tx.send(Command::UbReadElements);
+                            }
+                        });
+                    } else {
+                        ui.label(format!("E{}: --", i + 1));
+                    }
                 }
+                if ui.add_enabled(self.ub_connected, egui::Button::new("Refresh")).clicked() {
+                    let _ = self.cmd_tx.send(Command::UbReadElements);
+                }
+            });
+
+            ui.add_space(8.0);
+            ui.label(RichText::new("Controller Info").strong());
+            ui.indent("ub_info_client", |ui| {
+                ui.label("Model: 2 elements 6-40");
+                if self.ub_fw_major > 0 {
+                    ui.label(format!("FW: v{}.{:02}", self.ub_fw_major, self.ub_fw_minor));
+                }
+                if self.ub_freq_min_mhz > 0 && self.ub_freq_max_mhz > 0 {
+                    ui.label(format!("Freq range: {} - {} MHz", self.ub_freq_min_mhz, self.ub_freq_max_mhz));
+                }
+                let op_label = match self.ub_operation {
+                    0 => "Normal",
+                    2 => "User Adjust",
+                    3 => "Setup",
+                    _ => "Unknown",
+                };
+                ui.label(format!("Operation mode: {}", op_label));
             });
         }
     }
@@ -1422,7 +1475,7 @@ impl SdrRemoteApp {
                 painter.rect_filled(fill_rect, 3.0, color);
                 let s_val = (self.yaesu_smeter as f32 / 12.0).min(9.0);
                 let text = if s_val >= 9.0 {
-                    let db_over = ((self.yaesu_smeter as f32 - 108.0) / (152.0 / 60.0)).max(0.0);
+                    let db_over = ((self.yaesu_smeter as f32 - 108.0) * 0.5).max(0.0);
                     format!("S9+{:.0} dB", db_over)
                 } else {
                     format!("S{:.0}", s_val)
@@ -1462,8 +1515,10 @@ impl SdrRemoteApp {
         ui.separator();
 
         // 5-band Equalizer
-        egui::CollapsingHeader::new(RichText::new("Equalizer").strong().size(14.0))
-            .default_open(false)
+        let eq_initial = self.collapse_yaesu_eq;
+        let eq_resp = egui::CollapsingHeader::new(RichText::new("Equalizer").strong().size(14.0))
+            .id_salt("collapse_yaesu_eq")
+            .default_open(eq_initial)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let mut eq_on = self.yaesu_eq_enabled;
@@ -1536,21 +1591,85 @@ impl SdrRemoteApp {
                     }
                 });
             });
+        let eq_now = eq_resp.openness >= 0.5;
+        if eq_now != self.collapse_yaesu_eq {
+            self.collapse_yaesu_eq = eq_now;
+            self.save_full_config();
+        }
 
         ui.separator();
 
-        // Memory channels
-        egui::CollapsingHeader::new(RichText::new("Memory Channels").strong().size(14.0))
-            .default_open(false)
+        // Memory channels — visible body height is user-resizable so it
+        // doesn't push the Radio Settings header off the bottom of the window.
+        let mem_initial = self.collapse_yaesu_memories;
+        let mem_max_h = self.yaesu_memories_h;
+        let mem_resp = egui::CollapsingHeader::new(RichText::new("Memory Channels").strong().size(14.0))
+            .id_salt("collapse_yaesu_memories")
+            .default_open(mem_initial)
             .show(ui, |ui| {
-                self.render_yaesu_memories(ui);
+                egui::ScrollArea::vertical()
+                    .id_salt("yaesu_memories_scroll")
+                    .max_height(mem_max_h)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.render_yaesu_memories(ui);
+                    });
             });
+        let mem_now = mem_resp.openness >= 0.5;
+        if mem_now != self.collapse_yaesu_memories {
+            self.collapse_yaesu_memories = mem_now;
+            self.save_full_config();
+        }
+        // Drag-handle below memories — only visible when memories expanded
+        // so it can resize the visible portion of the channel list.
+        if self.collapse_yaesu_memories {
+            let handle_h = 6.0;
+            let (rect, response) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), handle_h),
+                egui::Sense::drag(),
+            );
+            let visuals = ui.visuals();
+            let fill = if response.hovered() || response.dragged() {
+                visuals.widgets.hovered.bg_fill
+            } else {
+                visuals.widgets.inactive.bg_fill
+            };
+            ui.painter().rect_filled(rect, 2.0, fill);
+            let grip_color = visuals.widgets.inactive.fg_stroke.color;
+            let cx = rect.center().x;
+            let cy = rect.center().y;
+            for dx in [-12.0, 0.0, 12.0] {
+                ui.painter().line_segment(
+                    [egui::pos2(cx + dx - 4.0, cy), egui::pos2(cx + dx + 4.0, cy)],
+                    egui::Stroke::new(1.0, grip_color),
+                );
+            }
+            if response.dragged() {
+                let dy = response.drag_delta().y;
+                if dy.abs() > 0.01 {
+                    self.yaesu_memories_h = (self.yaesu_memories_h + dy).clamp(100.0, 800.0);
+                }
+            }
+            if response.drag_stopped() {
+                self.save_full_config();
+            }
+            if response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+            }
+        }
 
-        egui::CollapsingHeader::new(RichText::new("Radio Settings (EX Menu)").strong().size(14.0))
-            .default_open(false)
+        let menu_initial = self.collapse_yaesu_menu;
+        let menu_resp = egui::CollapsingHeader::new(RichText::new("Radio Settings (EX Menu)").strong().size(14.0))
+            .id_salt("collapse_yaesu_menu")
+            .default_open(menu_initial)
             .show(ui, |ui| {
                 self.render_yaesu_menu(ui);
             });
+        let menu_now = menu_resp.openness >= 0.5;
+        if menu_now != self.collapse_yaesu_menu {
+            self.collapse_yaesu_menu = menu_now;
+            self.save_full_config();
+        }
     }
 
     fn render_yaesu_menu(&mut self, ui: &mut egui::Ui) {

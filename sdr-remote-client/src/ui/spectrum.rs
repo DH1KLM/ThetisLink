@@ -44,7 +44,7 @@ pub(crate) fn spectrum_plot(
     tune_base_hz: u64,      // actual VFO frequency for scroll/click/drag tuning
     ref_db: f32,
     range_db: f32,
-    smeter: u16,
+    smeter: f32,
     transmitting: bool,
     other_tx: bool,
     filter_low_hz: i32,
@@ -476,18 +476,18 @@ pub(crate) fn spectrum_plot(
     } // show_band_markers
 
     // ── S-meter / TX power overlay (top-right) ──────────────────────────
+    // In TX mode `smeter` holds watts (server packs watts × 10 / 10 in engine).
+    // In RX mode `smeter` is dBm; -73 dBm = S9, 6 dB per S-unit below S9.
     let meter_text = if other_tx {
-        let watts = smeter as f32 / 10.0;
-        format!("TX in use: {:.0}W", watts)
+        format!("TX in use: {:.0}W", smeter)
     } else if transmitting {
-        let watts = smeter as f32 / 10.0;
-        format!("TX: {:.0}W", watts)
-    } else if smeter <= 108 {
-        let s_unit = smeter / 12;
+        format!("TX: {:.0}W", smeter)
+    } else if smeter <= -73.0 {
+        let s_unit = ((smeter + 127.0) / 6.0).floor().clamp(0.0, 9.0) as u8;
         format!("S{}", s_unit)
     } else {
-        let db_over = ((smeter as f32 - 108.0) * 60.0 / 152.0).round() as u16;
-        format!("S9+{}dB", db_over)
+        let db_over = (smeter + 73.0).round() as i32;
+        format!("S9+{}dB", db_over.max(0))
     };
 
     let meter_color = if transmitting || other_tx {

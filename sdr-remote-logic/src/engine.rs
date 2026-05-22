@@ -229,6 +229,7 @@ impl ClientEngine {
         let mut rx2_volume: f32 = 0.2;     // Thetis ZZLB sync + RX2 audio gain
         let mut vfo_b_volume: f32 = 1.0;   // Additional client-only RX2 gain (VFO B Vol slider)
         let mut audio_mode: u16 = 0;       // 0=Mono, 1=BIN, 2=Split
+        let mut smeter_source: u8 = 1;     // 0=Sig, 1=Avg (default), 2=MaxBin
         // Track last Binaural ControlPacket value sent on PTT-side-effect path.
         // Avoids spamming the server with redundant rx_bin_enable cmds when the
         // PTT-state hasn't actually flipped (alpha-5 testlog: 38k events/session).
@@ -255,6 +256,8 @@ impl ClientEngine {
         let mut spectrum_fps: u8 = sdr_remote_core::DEFAULT_SPECTRUM_FPS;
         let mut spectrum_zoom: f32 = 1.0;
         let mut spectrum_pan: f32 = 0.0;
+        let mut rx2_spectrum_zoom: f32 = 1.0;
+        let mut rx2_spectrum_pan: f32 = 0.0;
         let mut spectrum_max_bins: u16 = sdr_remote_core::DEFAULT_SPECTRUM_BINS as u16;
         let mut spectrum_fft_size_k: u16 = 0;
         let mut rx2_spectrum_fft_size_k: u16 = 0;
@@ -295,7 +298,15 @@ impl ClientEngine {
         let mut last_server_addr: Option<String> = None;
 
         loop {
-            // Process all pending commands (non-blocking)
+            // Process all pending commands (non-blocking).
+            // SetFrequency / SetFrequencyRx2 are coalesced: under rapid MIDI-wheel
+            // tuning the engine can see dozens of frequency commands in a single
+            // drain pass; only the latest matters, so we capture it and emit one
+            // UDP packet after the drain. Eliminates VFO command pile-up in
+            // Thetis's TCI queue (was visible as A/B drift + late CTUN recenter
+            // after the MIDI controller had already stopped).
+            let mut deferred_freq: Option<u64> = None;
+            let mut deferred_freq_rx2: Option<u64> = None;
             while let Ok(cmd) = self.cmd_rx.try_recv() {
                 match cmd {
                     Command::Connect(addr, pw) => {
@@ -505,16 +516,7 @@ impl ClientEngine {
                         info!("TX AGC: {}", if enabled { "ON" } else { "OFF" });
                     }
                     Command::SetFrequency(hz) => {
-                        if state.vfo_lock { continue; } // VFO A locked
-                        if let Some(ref addr) = server_addr {
-                            let pkt = FrequencyPacket { frequency_hz: hz };
-                            let mut buf = [0u8; FrequencyPacket::SIZE];
-                            pkt.serialize(&mut buf);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
-                        }
-                        state.frequency_hz = hz;
-                        pending_freq = Some(hz);
-                        pending_freq_time = Some(Instant::now());
+                        deferred_freq = Some(hz);
                     }
                     Command::SetMode(mode) => {
                         if let Some(ref addr) = server_addr {
@@ -967,6 +969,18 @@ impl ClientEngine {
                             let _ = socket.send_to(&buf, addr.as_str()).await;
                         }
                     }
+                    Command::UbModifyElement(index, length_mm) => {
+                        if let Some(ref addr) = server_addr {
+                            let pkt = EquipmentCommandPacket {
+                                device_type: DeviceType::UltraBeam,
+                                command_id: CMD_UB_MODIFY_ELEMENT,
+                                data: vec![index, (length_mm & 0xFF) as u8, ((length_mm >> 8) & 0xFF) as u8],
+                            };
+                            let mut buf = Vec::with_capacity(10);
+                            pkt.serialize(&mut buf);
+                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                        }
+                    }
                     Command::RotorGoTo(angle) => {
                         if let Some(ref addr) = server_addr {
                             let pkt = EquipmentCommandPacket {
@@ -1039,6 +1053,24 @@ impl ClientEngine {
                             pkt.serialize(&mut buf);
                             let _ = socket.send_to(&buf, addr.as_str()).await;
                             info!("Server shutdown request sent");
+                        }
+                    }
+                    Command::SetSmeterSource(source) => {
+                        // Translate the 0/1/2 source choice into the per-RX bitmap
+                        // expected by the server (one bit per RX × source). We apply
+                        // the same choice to both RX1 (bits 0-2) and RX2 (bits 4-6).
+                        let mask: u16 = match source {
+                            0 => 0x11, // Sig: bit 0 (RX1) + bit 4 (RX2)
+                            1 => 0x22, // Avg: bit 1 + bit 5  (default)
+                            2 => 0x44, // MaxBin: bit 2 + bit 6
+                            _ => 0x22,
+                        };
+                        smeter_source = source;
+                        if let Some(ref addr) = server_addr {
+                            let ctrl = ControlPacket { control_id: ControlId::SmeterSources, value: mask };
+                            let mut buf = [0u8; ControlPacket::SIZE];
+                            ctrl.serialize(&mut buf);
+                            let _ = socket.send_to(&buf, addr.as_str()).await;
                         }
                     }
                     Command::StartRecording { rx1, rx2, yaesu, path } => {
@@ -1249,16 +1281,7 @@ impl ClientEngine {
                         }
                     }
                     Command::SetFrequencyRx2(hz) => {
-                        if state.rx2_vfo_lock { continue; } // VFO B locked
-                        if let Some(ref addr) = server_addr {
-                            let pkt = FrequencyPacket { frequency_hz: hz };
-                            let mut buf = [0u8; FrequencyPacket::SIZE];
-                            pkt.serialize_as_type(&mut buf, PacketType::FrequencyRx2);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
-                        }
-                        state.frequency_rx2_hz = hz;
-                        pending_freq_rx2 = Some(hz);
-                        pending_freq_rx2_time = Some(Instant::now());
+                        deferred_freq_rx2 = Some(hz);
                     }
                     Command::SetModeRx2(mode) => {
                         if let Some(ref addr) = server_addr {
@@ -1296,6 +1319,7 @@ impl ClientEngine {
                         }
                     }
                     Command::SetRx2SpectrumZoom(zoom) => {
+                        rx2_spectrum_zoom = zoom;
                         if let Some(ref addr) = server_addr {
                             if was_connected {
                                 let ctrl = ControlPacket { control_id: ControlId::Rx2SpectrumZoom, value: (zoom * 10.0) as u16 };
@@ -1306,6 +1330,7 @@ impl ClientEngine {
                         }
                     }
                     Command::SetRx2SpectrumPan(pan) => {
+                        rx2_spectrum_pan = pan;
                         if let Some(ref addr) = server_addr {
                             if was_connected {
                                 let ctrl = ControlPacket { control_id: ControlId::Rx2SpectrumPan, value: ((pan + 0.5) * 10000.0) as u16 };
@@ -1315,6 +1340,34 @@ impl ClientEngine {
                             }
                         }
                     }
+                }
+            }
+
+            // Emit coalesced VFO-A / VFO-B frequency, if any commands accumulated.
+            if let Some(hz) = deferred_freq.take() {
+                if !state.vfo_lock {
+                    if let Some(ref addr) = server_addr {
+                        let pkt = FrequencyPacket { frequency_hz: hz };
+                        let mut buf = [0u8; FrequencyPacket::SIZE];
+                        pkt.serialize(&mut buf);
+                        let _ = socket.send_to(&buf, addr.as_str()).await;
+                    }
+                    state.frequency_hz = hz;
+                    pending_freq = Some(hz);
+                    pending_freq_time = Some(Instant::now());
+                }
+            }
+            if let Some(hz) = deferred_freq_rx2.take() {
+                if !state.rx2_vfo_lock {
+                    if let Some(ref addr) = server_addr {
+                        let pkt = FrequencyPacket { frequency_hz: hz };
+                        let mut buf = [0u8; FrequencyPacket::SIZE];
+                        pkt.serialize_as_type(&mut buf, PacketType::FrequencyRx2);
+                        let _ = socket.send_to(&buf, addr.as_str()).await;
+                    }
+                    state.frequency_rx2_hz = hz;
+                    pending_freq_rx2 = Some(hz);
+                    pending_freq_rx2_time = Some(Instant::now());
                 }
             }
 
@@ -1546,6 +1599,14 @@ impl ClientEngine {
                                         bins_ctrl.serialize(&mut rx2_buf);
                                         let _ = socket.send_to(&rx2_buf, addr.as_str()).await;
 
+                                        let zoom_ctrl = ControlPacket { control_id: ControlId::Rx2SpectrumZoom, value: (rx2_spectrum_zoom * 10.0) as u16 };
+                                        zoom_ctrl.serialize(&mut rx2_buf);
+                                        let _ = socket.send_to(&rx2_buf, addr.as_str()).await;
+
+                                        let pan_ctrl = ControlPacket { control_id: ControlId::Rx2SpectrumPan, value: ((rx2_spectrum_pan + 0.5) * 10000.0) as u16 };
+                                        pan_ctrl.serialize(&mut rx2_buf);
+                                        let _ = socket.send_to(&rx2_buf, addr.as_str()).await;
+
                                         if rx2_spectrum_fft_size_k != 0 {
                                             let fft_ctrl = ControlPacket { control_id: ControlId::Rx2SpectrumFftSize, value: rx2_spectrum_fft_size_k };
                                             fft_ctrl.serialize(&mut rx2_buf);
@@ -1558,6 +1619,20 @@ impl ClientEngine {
                                     let mut am_buf = [0u8; ControlPacket::SIZE];
                                     ctrl.serialize(&mut am_buf);
                                     let _ = socket.send_to(&am_buf, addr.as_str()).await;
+                                    // Re-send S-meter source subscription. Server's per-client
+                                    // session resets to default 0x22 (Avg-only) on every new
+                                    // ClientSession insert, so we must restore the user's choice
+                                    // after auth completes.
+                                    let mask: u16 = match smeter_source {
+                                        0 => 0x11,
+                                        1 => 0x22,
+                                        2 => 0x44,
+                                        _ => 0x22,
+                                    };
+                                    let ctrl = ControlPacket { control_id: ControlId::SmeterSources, value: mask };
+                                    let mut sm_buf = [0u8; ControlPacket::SIZE];
+                                    ctrl.serialize(&mut sm_buf);
+                                    let _ = socket.send_to(&sm_buf, addr.as_str()).await;
                                 }
                                 state.connected = true;
                                 was_connected = true;
@@ -1585,7 +1660,7 @@ impl ClientEngine {
                             state.mode = mode_pkt.mode;
                         }
                         Ok(Packet::Smeter(sm_pkt)) => {
-                            state.smeter = sm_pkt.level;
+                            state.smeter = sm_pkt.level as f32 / 10.0;
                             state.other_tx = sm_pkt.flags.ptt() && !ptt && !yaesu_ptt;
                         }
                         Ok(Packet::Spectrum(sp)) => {
@@ -1664,7 +1739,35 @@ impl ClientEngine {
                             state.mode_rx2 = mode_pkt.mode;
                         }
                         Ok(Packet::SmeterRx2(sm_pkt)) => {
-                            state.smeter_rx2 = sm_pkt.level;
+                            state.smeter_rx2 = sm_pkt.level as f32 / 10.0;
+                        }
+                        // Alternate S-meter sources. Both the per-source field
+                        // AND the primary `state.smeter` / `state.smeter_rx2`
+                        // are updated so the existing render path (which reads
+                        // `state.smeter`) transparently follows the active
+                        // source — the server only sends one source per RX
+                        // unless the client subscribes to multiple.
+                        Ok(Packet::SmeterSig(sm_pkt)) => {
+                            let dbm = sm_pkt.level as f32 / 10.0;
+                            state.smeter_sig = dbm;
+                            state.smeter = dbm;
+                            state.other_tx = sm_pkt.flags.ptt() && !ptt && !yaesu_ptt;
+                        }
+                        Ok(Packet::SmeterMaxBin(sm_pkt)) => {
+                            let dbm = sm_pkt.level as f32 / 10.0;
+                            state.smeter_peakbin = dbm;
+                            state.smeter = dbm;
+                            state.other_tx = sm_pkt.flags.ptt() && !ptt && !yaesu_ptt;
+                        }
+                        Ok(Packet::SmeterRx2Sig(sm_pkt)) => {
+                            let dbm = sm_pkt.level as f32 / 10.0;
+                            state.smeter_rx2_sig = dbm;
+                            state.smeter_rx2 = dbm;
+                        }
+                        Ok(Packet::SmeterRx2MaxBin(sm_pkt)) => {
+                            let dbm = sm_pkt.level as f32 / 10.0;
+                            state.smeter_rx2_peakbin = dbm;
+                            state.smeter_rx2 = dbm;
                         }
                         Ok(Packet::SpectrumRx2(sp)) => {
                             state.rx2_spectrum_bins = sp.bins;
@@ -1809,6 +1912,7 @@ impl ClientEngine {
                                 ControlId::DdcSampleRateRx2 => state.ddc_sample_rate_rx2 = ctrl.value,
                                 ControlId::AudioMode => {} // handled client-side
                                 ControlId::AllowZoomBelow2x => {} // handled client-side (setup-vink)
+                                ControlId::SmeterSources => {} // client→server only; server echoes ignored
                             }
                         }
                         Ok(Packet::EquipmentStatus(eq)) => {
@@ -1949,13 +2053,15 @@ impl ClientEngine {
                                     state.ub_available = true;
                                     state.ub_band = eq.switch_b;
                                     state.ub_direction = eq.switch_a;
-                                    // Parse labels CSV: fw_major,fw_minor,operation,frequency_khz,band,direction,off_state,motors_moving,motor_distance_mm,motor_completion,elements(;-sep)
+                                    // Parse labels CSV:
+                                    //  v1 (11 fields): fw_major,fw_minor,operation,frequency_khz,band,direction,off_state,motors_moving,motor_distance_mm,motor_completion,elements(;-sep)
+                                    //  v2 (13 fields): + freq_min_mhz, freq_max_mhz
                                     if let Some(labels) = eq.labels {
                                         let parts: Vec<&str> = labels.split(',').collect();
                                         if parts.len() >= 11 {
                                             state.ub_fw_major = parts[0].parse().unwrap_or(0);
                                             state.ub_fw_minor = parts[1].parse().unwrap_or(0);
-                                            // parts[2] = operation (not needed in client)
+                                            state.ub_operation = parts[2].parse().unwrap_or(0);
                                             state.ub_frequency_khz = parts[3].parse().unwrap_or(0);
                                             state.ub_band = parts[4].parse().unwrap_or(0);
                                             state.ub_direction = parts[5].parse().unwrap_or(0);
@@ -1967,6 +2073,10 @@ impl ClientEngine {
                                             let elem_parts: Vec<&str> = parts[10].split(';').collect();
                                             for (i, ep) in elem_parts.iter().enumerate().take(6) {
                                                 state.ub_elements_mm[i] = ep.parse().unwrap_or(0);
+                                            }
+                                            if parts.len() >= 13 {
+                                                state.ub_freq_min_mhz = parts[11].parse().unwrap_or(0);
+                                                state.ub_freq_max_mhz = parts[12].parse().unwrap_or(0);
                                             }
                                         }
                                     }

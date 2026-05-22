@@ -34,7 +34,7 @@ data class SdrUiState(
     val frequencyHz: Long = 0,
     val frequencyRx2Hz: Long = 0,
     val mode: Int = 0,
-    val smeter: Int = 0,
+    val smeter: Float = -200f,
     val powerOn: Boolean = false,
     val txProfile: Int = 0,
     val nrLevel: Int = 0,

@@ -43,7 +43,9 @@ pub struct BridgeRadioState {
     pub frequency_hz: u64,
     pub frequency_rx2_hz: u64,
     pub mode: u8,
-    pub smeter: u16,
+    /// S-meter — dBm in RX, watts in TX (use `other_tx` / client PTT to
+    /// disambiguate, same as the desktop client and wire protocol).
+    pub smeter: f32,
     pub power_on: bool,
     pub tx_profile: u8,
     pub nr_level: u8,

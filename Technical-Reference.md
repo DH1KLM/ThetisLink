@@ -1,10 +1,10 @@
-# ThetisLink - Technical Reference
+# ThetisLink v2.0.3 - Technical Reference
 
 ## 1. Overview
 
 ThetisLink is a system for remote operation of an ANAN 7000DLE + Thetis SDR receiver and a Yaesu FT-991A transceiver over a network connection. It provides bidirectional real-time audio streaming, PTT control, DDC spectrum/waterfall display, full RX2/VFO-B support, diversity, Yaesu memory channel management and radio settings editor over UDP with Opus codec.
 
-**Version:** v2.0.2 (shared version number in `sdr-remote-core::VERSION`)
+**Version:** v2.0.3 (shared version number in `sdr-remote-core::VERSION`)
 **Development language:** Rust + Kotlin (Android UI)
 **Target platform:** Windows 10/11, macOS (Intel/Apple Silicon), Android 8+ (arm64)
 **Design priority:** latency > bandwidth > features
@@ -26,9 +26,23 @@ All extensions are behind the **"ThetisLink extensions"** checkbox in Setup → 
 The default IQ sample rate is 384 kHz. With ThetisLink extensions the user can choose from: 48, 96, 192, 384, 768 or **1536 kHz** — selectable per receiver via the DDC sample rate dropdown in the client.
 
 **Repos:**
-- ThetisLink: [cjenschede/ThetisLink](https://github.com/cjenschede/ThetisLink) (public release repo, tag `v2.0.2`)
+- ThetisLink: [cjenschede/ThetisLink](https://github.com/cjenschede/ThetisLink) (public release repo, tag `v2.0.3`)
 - Thetis fork: [cjenschede/Thetis](https://github.com/cjenschede/Thetis) (branch `thetislink-tl2`)
 - Original Thetis: [ramdor/Thetis](https://github.com/ramdor/Thetis)
+
+### v2.0.3 highlights
+
+**Multi-tuner release + wire-protocol breaking change.** Wire-protocol `VERSION` u8 bumped from 2 → 3 (S-meter payload rearranged). v2.0.2 clients against a v2.0.3 server (or vice versa) receive a localised `ProtocolVersionMismatch` modal ("Server is too old" / "Client is too old") instead of garbled audio or a silent connect failure — the server sends a 4-byte back-channel rejection packet `[MAGIC, VERSION, 0xFF, 0x00]` so the client can detect the mismatch.
+
+- **Multi-tuner runtime** — up to two physical StockCorner JC-4s / JC-3s tuners in parallel via Adafruit MCP2221A USB-HID breakouts (replaces the v2.0.2 serial-port RTS/CTS flow). Per-tuner threshold + hysteresis sliders on the yellow tune-status wire (1 MΩ + 1 MΩ divider, default 2.25 V / 0.50 V). Board scan + serial programming UI in the status panel. Automatic USB reconnect with 5 s retry interval. Collapsible MCP2221A section with its open/closed state persisted across restarts.
+- **S-meter overhaul** — multi-source subscription via `rx_channel_sensors_ex` (Sig peak-hold, Avg true-mean, MaxBin), S9-frequency band shift driven by the fork-broadcast `s9_frequency_ex` (fallback 50 MHz against stock), TX FWD-power keeps updating under Sig/MaxBin selection.
+- **CTUN coupled-recenter + RX1/RX2 spectrum mirror** — both RX spectra stay in sync during rapid tuning, Auto FFT retuned to ~25 FPS, connect-time balancing so RX1 and RX2 come up at the same moment.
+- **MIDI client-side VFO coalesce + auto-recenter handshake** — extreme MIDI wheel input no longer fills Thetis' VFO queue; auto-recenter ownership handshake with the Thetis fork now also works when no ThetisLink server is connected.
+- **PA active_pa + drive-snapshot persistence** — survives process kill / power loss without waiting for the next `start_server()` write.
+- **Status-panel protocol version-mismatch banner** — previously silent, now a visible row and ringbuffer entry.
+- **Hardware-doc update** — the impedance of the yellow-line voltage divider was raised from 10 kΩ + 10 kΩ to **1 MΩ + 1 MΩ** (ratio 1:1, ×2 in voltage, unchanged; only much less loading on the JC-Control LED circuit).
+- **Cleanup** — `assume_tuned` / `TUNER_DONE_ASSUMED` (state 5) / 500 ms assume-deadline pad retired now that feedback-driven detection works reliably in production. `tuner_port` / `tuner_enabled` legacy COM-port settings UI removed from the Settings tab (multi-tuner config now lives in the status panel). Legacy config keys (`tuner_assume_tuned`, `tuner_port`, `threshold_ratio`, `baseline_override`) are silently ignored so existing config files do not break.
+- **Compliance** — vendored Rust crate `mcp2221-hal` v0.1.0 (Copyright © 2025 Rob Wells), dual-licensed `MIT OR Apache-2.0` — ThetisLink uses the **MIT** branch (Apache-2.0 not compatible with GPL-2.0-only). Attribution in `NOTICE.md`, full MIT text in `compliance/THIRD-PARTY-LICENSES.html`, SPDX SBOM in `compliance/sbom.spdx.json`.
 
 ### v2.0.2 highlights
 
@@ -70,7 +84,7 @@ The v2.0.0 release is a major step compared to the v0.x line. Key changes:
 
 ## 2. Architecture
 
-ThetisLink v2.0.2 uses a single TCI WebSocket connection to Thetis for audio, IQ and all radio commands. With the PA3GHM fork the additional `_ex` commands extend the surface (CTUN auto-recenter, diversity, per-RX DDC sample rate). No parallel CAT connection is required against either stock v2.10.3.15 or the fork.
+ThetisLink v2.0.3 uses a single TCI WebSocket connection to Thetis for audio, IQ and all radio commands. With the PA3GHM fork the additional `_ex` commands extend the surface (CTUN auto-recenter, diversity, per-RX DDC sample rate). No parallel CAT connection is required against either stock v2.10.3.15 or the fork.
 
 ```mermaid
 flowchart LR
@@ -168,7 +182,9 @@ sdr-remote/
 │       ├── spe_expert.rs       # SPE Expert 1.3K-FA serial controller
 │       ├── ultrabeam.rs        # UltraBeam RCU-06 serial controller
 │       ├── rotor.rs            # EA7HG Visual Rotor UDP controller
-│       ├── tuner.rs            # JC-4s tuner controller (serial RTS/CTS)
+│       ├── tuner.rs            # JC-4s/JC-3s tuner controllers (MCP2221A USB-HID)
+│       ├── mcp2221_debug.rs    # MCP2221A USB-HID bridge (GP2 + GP1 ADC)
+│       ├── mcp2221_scan.rs     # USB-HID board scan + serial programming
 │       ├── config.rs           # Server configuration (persistent)
 │       └── ui/                 # Server GUI (egui)
 ├── sdr-remote-client/          # Desktop client (egui)
@@ -716,7 +732,7 @@ TCI (Transceiver Control Interface) is a WebSocket-based protocol built into The
 
 ### Stock vs fork TCI sub-protocol
 
-ThetisLink v2.0.2 talks TCI to both **stock Thetis v2.10.3.15** and the **PA3GHM fork (TL2-1)**. The base protocol is identical — but the fork adds an `_ex` extension layer that ThetisLink uses when available.
+ThetisLink v2.0.3 talks TCI to both **stock Thetis v2.10.3.15** and the **PA3GHM fork (TL2-1)**. The base protocol is identical — but the fork adds an `_ex` extension layer that ThetisLink uses when available.
 
 **Capability negotiation:** at connect time the client requests `tci_caps_ex;`. With the fork (and the "ThetisLink extensions" Setup checkbox enabled) Thetis responds with a list of supported `_ex` capabilities (`auto_recenter_ex`, `rx_filter_preset_ex`, `ddc_sample_rate_ex`, `diversity_ex`, ...). Stock Thetis does not implement `tci_caps_ex` and the request times out → ThetisLink falls back to stock-mode behaviour.
 
@@ -824,7 +840,7 @@ TCI binary header: 16 x u32 = 64 bytes. Stream type at offset 24, sample format 
 
 Earlier ThetisLink versions (≤ v1.x) used a parallel TCP CAT connection alongside TCI for commands TCI did not support. **ThetisLink v2.0.0 removed the CAT path entirely** — all radio control flows over the single TCI WebSocket from §9. The ZZ-command listing below is retained as a Thetis CAT reference for users who connect external CAT clients (logging software, N1MM, etc.) directly to the Thetis CAT server (Thetis Setup → Serial/Network/Midi CAT → Network → TCP/IP CAT Server).
 
-| ZZ command | TCI counterpart used by ThetisLink v2.0.2 |
+| ZZ command | TCI counterpart used by ThetisLink v2.0.3 |
 |------------|-------------------------------------------|
 | `ZZLA` / `ZZLB` (RX1/RX2 AF volume) | `volume` / `rx_volume:1,...` |
 | `ZZBY` (shutdown) | `run_cat_ex:ZZBY;` (server-initiated only) |
@@ -841,7 +857,7 @@ Earlier ThetisLink versions (≤ v1.x) used a parallel TCP CAT connection alongs
 | `ZZFL`/`ZZFH` / `ZZFS`/`ZZFR` (filter low/high) | `rx_filter_band:0/1,low,high;` |
 | `ZZVS2` (VFO swap) | `vfo_swap_ex;` (stock-supported, no cap advertised) |
 
-The only CAT-shaped escape hatch in v2.0.2 is `run_cat_ex:<ZZ-cmd>;` over TCI: this is a TCI-only relay that asks Thetis to execute a ZZ command on its own internal CAT parser (response returns over TCI). Used by the server for niche operations such as `ZZCN0/ZZCN1` (CTUN auto-recenter) and `ZZBY` (Thetis shutdown).
+The only CAT-shaped escape hatch in v2.0.3 is `run_cat_ex:<ZZ-cmd>;` over TCI: this is a TCI-only relay that asks Thetis to execute a ZZ command on its own internal CAT parser (response returns over TCI). Used by the server for niche operations such as `ZZCN0/ZZCN1` (CTUN auto-recenter) and `ZZBY` (Thetis shutdown).
 
 ---
 
@@ -1211,7 +1227,7 @@ ThetisLink supports 7 external devices via the server. Status is read and forwar
 | Value | Device | Connection |
 |-------|--------|------------|
 | 0x01 | Amplitec 6/2 Antenna Switch | Serial USB-TTL, 9600 baud |
-| 0x02 | JC-4s Antenna Tuner | Serial USB, 9600 baud |
+| 0x02 | JC-4s / JC-3s Antenna Tuner (×2) | Adafruit MCP2221A USB-HID |
 | 0x03 | SPE Expert 1.3K-FA Linear Amplifier | Serial USB, 115200 baud |
 | 0x04 | RF2K-S Linear Amplifier | TCP/IP |
 | 0x05 | UltraBeam RCU-06 Antenna Controller | Serial USB, 19200 baud |
@@ -1226,9 +1242,18 @@ ThetisLink supports 7 external devices via the server. Status is read and forwar
 - **Status:** switch_a = position A (1-6), switch_b = position B (1-6), labels = CSV with position names
 - **Commands:** SetSwitchA (0x01, value=position 1-6), SetSwitchB (0x02, value=position 1-6)
 
-### JC-4s Antenna Tuner
+### JC-4s / JC-3s Antenna Tuners (MCP2221A USB-HID bridge)
 
-Automatic antenna tuner. Uses serial USB RTS/CTS signal lines (no data). Tune-on/off relays to Thetis via TCI `tune:0,true;` / `tune:0,false;` (forwarded over a tokio channel).
+From v2.0.3 up to two StockCorner JC-4s / JC-3s tuners are driven in parallel via one **Adafruit MCP2221A USB-to-HID breakout** per tuner (replacing the v2.0.2 serial RTS/CTS flow). The control protocol is identical for JC-4s and JC-3s; the model label is cosmetic.
+
+**Hardware (per tuner):**
+- GP2 (digital out) → series gate resistor → transistor (2N7000 / MMBT3904) → grey "start" wire to GND.
+- GP1 (ADC) → midpoint of 1 MΩ + 1 MΩ 1:1 voltage divider on the yellow "tune-status" wire (idle ≈ 4.5 V, tune-active ≈ 0 V).
+- Full wiring schematics with component values and BJT/MOSFET variants: see the internal MCP2221A-JC4s wiring reference (available on request from PA3GHM).
+
+**Native library:** `mcp2221-hal` v0.1.0 — vendored at `vendor/mcp2221-hal/`, dual-licensed `MIT OR Apache-2.0`; ThetisLink uses the MIT branch (Apache-2.0 is not compatible with GPL-2.0-only). See `NOTICE.md` and `compliance/THIRD-PARTY-LICENSES.html` for attribution.
+
+**Tune on/off** relays to Thetis via TCI `tune:0,true;` / `tune:0,false;` (forwarded over a tokio channel).
 
 **Tuner states:**
 
@@ -1237,12 +1262,27 @@ Automatic antenna tuner. Uses serial USB RTS/CTS signal lines (no data). Tune-on
 | Idle | 0 | No tune active | Grey |
 | Tuning | 1 | Tune in progress | Blue |
 | DoneOk | 2 | Tune successful | Green |
-| Timeout | 3 | No response within 30s | Orange (3s, then Idle) |
-| Aborted | 4 | User aborted | Orange (3s, then Idle) |
+| Timeout | 3 | No ACK within 3s or no completion within 30s | Amber (3s, then Idle) |
+| Aborted | 4 | User aborted | Amber (3s, then Idle) |
 
-**PA protection:** During tuning the SPE Expert or RF2K-S PA is automatically put in Standby and restored to Operate after tuning.
+State `5` (DoneAssumed) existed in v2.0.2 for the assume-tuned workaround and has been removed in v2.0.3; older clients that still expect state 5 will never see it from a v2.0.3 server.
 
-**Stale detection:** DoneOk turns grey if the VFO frequency has shifted more than 25 kHz from the last successful tune.
+**Per-tuner config keys** (in `thetislink-server.conf`):
+- `tuner{1,2}_enabled` — slot on/off
+- `tuner{1,2}_model` — `jc-4s` / `jc-3s` (cosmetic label)
+- `tuner{1,2}_mcp_serial` — USB serial of the assigned MCP2221A board
+- `tuner{1,2}_amplitec_pos` — Amplitec-A position (1..6) the tuner sits behind
+- `tuner{1,2}_threshold_v` — switch level on the yellow wire (default 2.25 V)
+- `tuner{1,2}_hysteresis_v` — dead band around the threshold (default 0.50 V)
+- `mcp2221_section_expanded` — open/closed state of the status panel MCP section
+
+Legacy v2.0.2 keys (`tuner_assume_tuned`, `tuner{1,2}_assume_tuned`, `threshold_ratio`, `baseline_override`) are silently ignored on load — existing config files do not break.
+
+**PA protection:** during tuning SPE Expert or RF2K-S is automatically put in Standby and restored to Operate afterwards.
+
+**Stale detection:** DoneOk turns grey if the VFO frequency has shifted more than 25 kHz from the last successful tune (tracked per tuner slot so a second tuner does not inherit the first tuner's frequency).
+
+**USB auto-reconnect:** the tuner thread retries every 5 s while the bridge is disconnected; a successful reconnect resets the timer. No exponential back-off.
 
 ### SPE Expert 1.3K-FA Linear Amplifier
 

@@ -16,7 +16,7 @@ pub(crate) mod yaesu_menu;
 pub(crate) use helpers::*;
 pub(crate) use meters::*;
 pub(crate) use spectrum::*;
-pub(crate) use config::{load_window_size, save_config, load_config, NUM_MEMORIES};
+pub(crate) use config::{load_window_size, load_window_pos, save_config, load_config, NUM_MEMORIES};
 
 use std::time::Instant;
 
@@ -133,6 +133,10 @@ pub struct SdrRemoteApp {
     rec_yaesu: bool,
     last_recorded_path: Option<String>,
     midi_ptt_toggle_mode: bool,  // independent MIDI PTT mode
+    /// S-meter source: 0=Sig, 1=Avg (default), 2=MaxBin. Single setting shared
+    /// by RX1 and RX2. Translated to a per-RX bitmap by the engine and pushed
+    /// via ControlId::SmeterSources whenever it changes.
+    smeter_source: u8,
     /// TL2-1 ctun-auto-recenter setup-vink "Allow zoom below 2x (with smear during tune)".
     /// Default false → zoom-min 2x. True → zoom-min 1x toegestaan.
     allow_zoom_below_2x: bool,
@@ -213,8 +217,11 @@ pub struct SdrRemoteApp {
     yaesu_mic_level: f32,
     frequency_hz: u64,
     mode: u8,
-    smeter: u16,
-    smeter_peak: u16,
+    /// RX1 S-meter — dBm in RX mode, watts in TX mode (disambiguated by
+    /// `self.ptt || self.other_tx`).  `SMETER_NO_DATA_DBM` (-200.0) before
+    /// the first sample arrives.
+    smeter: f32,
+    smeter_peak: f32,
     smeter_peak_time: Instant,
     power_on: bool,
     power_press_start: Option<Instant>,
@@ -285,6 +292,9 @@ pub struct SdrRemoteApp {
     spectrum_max_bins: u16,
     spectrum_fft_size_k: u16,      // FFT size in K (0=auto, 32, 64, 128, 256)
     rx2_spectrum_fft_size_k: u16,  // RX2 FFT size (independent from RX1)
+    /// User-set total height (egui-points) of the spectrum+waterfall block in
+    /// the Radio tab. Persisted in config. Range 300..=1200. Popouts ignore.
+    spectrum_total_h: f32,
     spectrum_popout: bool,
     // Window size persistence
     window_w: f32,
@@ -409,6 +419,9 @@ pub struct SdrRemoteApp {
     ub_fw_minor: u8,
     ub_available: bool,
     ub_elements_mm: [u16; 6],
+    ub_operation: u8,
+    ub_freq_min_mhz: u16,
+    ub_freq_max_mhz: u16,
     ub_confirm_retract: bool,
     ub_auto_track: bool,
     ub_last_auto_khz: u16,
@@ -430,6 +443,29 @@ pub struct SdrRemoteApp {
     yaesu_popout: bool,
     yaesu_popout_pos: Option<egui::Pos2>,
     yaesu_popout_size: Option<egui::Vec2>,
+    /// Persisted geometry of the RX1 spectrum popout (separate-mode window).
+    /// `None` until the user moves/resizes once; falls back to a 900x600 default.
+    spectrum_popout_pos: Option<egui::Pos2>,
+    spectrum_popout_size: Option<egui::Vec2>,
+    /// Persisted geometry of the RX2 popout window (separate-mode).
+    rx2_popout_pos: Option<egui::Pos2>,
+    rx2_popout_size: Option<egui::Vec2>,
+    /// Persisted geometry of the joined RX1+RX2 popout (when popout_joined=true
+    /// and both spectrums are popped out into a single combined window).
+    popout_joined_pos: Option<egui::Pos2>,
+    popout_joined_size: Option<egui::Vec2>,
+    /// Per-popout "init applied" flags. `false` means the next render must
+    /// include `with_position()` so the saved geometry takes effect.
+    /// Subsequent renders omit `with_position()` to avoid a feedback loop
+    /// where every frame egui re-asserts the saved position, the OS rounds
+    /// it by a sub-pixel, we read the new value back, save, and re-assert
+    /// → the window appears to jitter / vibrate after a manual move. The
+    /// flags reset to `false` when the popout closes so the next reopen
+    /// applies the saved position fresh.
+    spectrum_popout_init_applied: bool,
+    rx2_popout_init_applied: bool,
+    popout_joined_init_applied: bool,
+    yaesu_popout_init_applied: bool,
     yaesu_popout_first_frame: bool,
     yaesu_enable_sent: bool,
     yaesu_mic_gain: f32, // multiplier for Yaesu USB TX audio (default 20x)
@@ -470,6 +506,16 @@ pub struct SdrRemoteApp {
     rx2_popout: bool,
     popout_joined: bool,
     popout_meter_analog: bool,
+    ub_show_menu: bool,
+    collapse_diversity: bool,
+    collapse_yaesu_eq: bool,
+    collapse_yaesu_memories: bool,
+    collapse_yaesu_menu: bool,
+    yaesu_memories_h: f32,
+    /// Persisted main-window outer position; tracked during runtime so a
+    /// next launch can re-apply it via `with_position()`. `None` until the
+    /// first frame reads `viewport().outer_rect`.
+    main_window_pos: Option<egui::Pos2>,
     /// Last S-meter rects in popout viewports (screen coords) for A⇔B overlay
     popout_rx1_smeter_rect: egui::Rect,
     popout_rx2_smeter_rect: egui::Rect,
@@ -477,8 +523,8 @@ pub struct SdrRemoteApp {
     rx2_af_gain_display: u8, // Thetis ZZLB value for display
     rx2_frequency_hz: u64,
     rx2_mode: u8,
-    rx2_smeter: u16,
-    rx2_smeter_peak: u16,
+    rx2_smeter: f32,
+    rx2_smeter_peak: f32,
     rx2_smeter_peak_time: Instant,
     rx2_filter_low_hz: i32,
     rx2_filter_high_hz: i32,
@@ -701,6 +747,7 @@ impl SdrRemoteApp {
             rec_yaesu: false,
             last_recorded_path: None,
             midi_ptt_toggle_mode: config.midi_ptt_toggle,
+            smeter_source: config.smeter_source,
             allow_zoom_below_2x: config.allow_zoom_below_2x,
             ui_language: config.language.clone(),
             reboot_confirm: false,
@@ -773,8 +820,8 @@ impl SdrRemoteApp {
             yaesu_mic_level: 0.0,
             frequency_hz: 0,
             mode: 0,
-            smeter: 0,
-            smeter_peak: 0,
+            smeter: sdr_remote_logic::state::SMETER_NO_DATA_DBM,
+            smeter_peak: sdr_remote_logic::state::SMETER_NO_DATA_DBM,
             smeter_peak_time: Instant::now(),
             power_on: false,
             power_press_start: None,
@@ -835,7 +882,8 @@ impl SdrRemoteApp {
             spectrum_max_bins: config.spectrum_max_bins,
             spectrum_fft_size_k: config.spectrum_fft_size_k,
             rx2_spectrum_fft_size_k: config.rx2_spectrum_fft_size_k,
-            spectrum_popout: false,
+            spectrum_total_h: config.spectrum_total_h,
+            spectrum_popout: config.spectrum_popout,
             window_w: config.window_w,
             window_h: config.window_h,
             log_buffer,
@@ -954,6 +1002,9 @@ impl SdrRemoteApp {
             ub_fw_minor: 0,
             ub_available: false,
             ub_elements_mm: [0; 6],
+            ub_operation: 0,
+            ub_freq_min_mhz: 0,
+            ub_freq_max_mhz: 0,
             ub_confirm_retract: false,
             ub_auto_track: false,
             ub_last_auto_khz: 0,
@@ -971,8 +1022,18 @@ impl SdrRemoteApp {
             yaesu_power_on: false,
             yaesu_volume: config.yaesu_volume,
             yaesu_popout: config.yaesu_popout,
-            yaesu_popout_pos: None,
-            yaesu_popout_size: None,
+            yaesu_popout_pos: config.yaesu_popout_pos.map(|(x, y)| egui::pos2(x, y)),
+            yaesu_popout_size: config.yaesu_popout_size.map(|(w, h)| egui::vec2(w, h)),
+            spectrum_popout_pos: config.spectrum_popout_pos.map(|(x, y)| egui::pos2(x, y)),
+            spectrum_popout_size: config.spectrum_popout_size.map(|(w, h)| egui::vec2(w, h)),
+            rx2_popout_pos: config.rx2_popout_pos.map(|(x, y)| egui::pos2(x, y)),
+            rx2_popout_size: config.rx2_popout_size.map(|(w, h)| egui::vec2(w, h)),
+            popout_joined_pos: config.popout_joined_pos.map(|(x, y)| egui::pos2(x, y)),
+            popout_joined_size: config.popout_joined_size.map(|(w, h)| egui::vec2(w, h)),
+            spectrum_popout_init_applied: false,
+            rx2_popout_init_applied: false,
+            popout_joined_init_applied: false,
+            yaesu_popout_init_applied: false,
             yaesu_popout_first_frame: true,
             yaesu_enable_sent: false,
             yaesu_mic_gain: 0.5,
@@ -1023,17 +1084,24 @@ impl SdrRemoteApp {
             smooth_alpha: 1.0,
             last_frame_time: Instant::now(),
             rx2_enabled: config.rx2_enabled,
-            rx2_popout: false,
+            rx2_popout: config.rx2_popout,
             popout_joined: config.popout_joined,
             popout_meter_analog: config.popout_meter_analog,
+            ub_show_menu: config.ub_show_menu,
+            collapse_diversity: config.collapse_diversity,
+            collapse_yaesu_eq: config.collapse_yaesu_eq,
+            collapse_yaesu_memories: config.collapse_yaesu_memories,
+            collapse_yaesu_menu: config.collapse_yaesu_menu,
+            yaesu_memories_h: config.yaesu_memories_h,
+            main_window_pos: config.main_window_pos.map(|(x, y)| egui::pos2(x, y)),
             popout_rx1_smeter_rect: egui::Rect::NOTHING,
             popout_rx2_smeter_rect: egui::Rect::NOTHING,
             rx2_volume: config.rx2_volume,
             rx2_af_gain_display: 0,
             rx2_frequency_hz: 0,
             rx2_mode: 0,
-            rx2_smeter: 0,
-            rx2_smeter_peak: 0,
+            rx2_smeter: sdr_remote_logic::state::SMETER_NO_DATA_DBM,
+            rx2_smeter_peak: sdr_remote_logic::state::SMETER_NO_DATA_DBM,
             rx2_smeter_peak_time: Instant::now(),
             rx2_filter_low_hz: 0,
             rx2_filter_high_hz: 0,
@@ -1137,6 +1205,129 @@ impl SdrRemoteApp {
         app
     }
 
+    /// Apply persisted popout geometry to a ViewportBuilder. Both
+    /// `with_position()` AND `with_inner_size()` are only included on the
+    /// first frame after the popout opens. Subsequent frames omit both so
+    /// the OS keeps the window wherever the user dragged or resized it —
+    /// without that gating the OS gets a fresh "go to this rect" request
+    /// every frame and the window oscillates between successive committed
+    /// rects during an active move / resize gesture.
+    fn apply_popout_geometry(
+        builder: ViewportBuilder,
+        pos: Option<egui::Pos2>,
+        size: Option<egui::Vec2>,
+        default_size: [f32; 2],
+        init_applied: &mut bool,
+    ) -> ViewportBuilder {
+        let mut b = builder;
+        if !*init_applied {
+            let sz = size.map(|v| [v.x, v.y]).unwrap_or(default_size);
+            b = b.with_inner_size(sz);
+            if let Some(p) = pos {
+                b = b.with_position(p);
+            }
+            *init_applied = true;
+        }
+        b
+    }
+
+    /// Read the current viewport pos+size from egui and update the supplied
+    /// state slots. Returns `true` when anything changed by more than 5 px
+    /// AND the user is not actively dragging/resizing (i.e. mouse button is
+    /// up). Per-frame `save_full_config()` during a drag causes ~5-20 ms of
+    /// blocking disk-I/O which stalls the input thread; Windows then shows
+    /// the window oscillating between successive committed positions. By
+    /// gating the save on "pointer released" the move/resize stays smooth
+    /// during the gesture and persists on release.
+    fn track_popout_geometry(
+        ctx: &egui::Context,
+        pos: &mut Option<egui::Pos2>,
+        size: &mut Option<egui::Vec2>,
+    ) -> bool {
+        let (outer, inner) = ctx.input(|i| (i.viewport().outer_rect, i.viewport().inner_rect));
+        let mut state_changed = false;
+        if let Some(o) = outer {
+            let np = o.min;
+            if pos.map_or(true, |p| (p.x - np.x).abs() > 5.0 || (p.y - np.y).abs() > 5.0) {
+                *pos = Some(np);
+                state_changed = true;
+            }
+        }
+        if let Some(r) = inner {
+            let ns = r.size();
+            if size.map_or(true, |s| (s.x - ns.x).abs() > 5.0 || (s.y - ns.y).abs() > 5.0) {
+                *size = Some(ns);
+                state_changed = true;
+            }
+        }
+        state_changed && !ctx.input(|i| i.pointer.any_down())
+    }
+
+    fn render_split_join_button(
+        &mut self,
+        ui: &mut egui::Ui,
+        label: &str,
+        target_state: bool,
+        size: Option<egui::Vec2>,
+        rounding: egui::Rounding,
+    ) {
+        let active = target_state == self.popout_joined;
+        let mut btn = if active {
+            egui::Button::new(RichText::new(label).strong())
+                .fill(Color32::from_rgb(100, 160, 230))
+        } else {
+            egui::Button::new(label)
+        };
+        btn = btn.rounding(rounding);
+        if let Some(s) = size { btn = btn.min_size(s); }
+        if ui.add(btn).clicked() && !active {
+            self.popout_joined = target_state;
+            self.save_full_config();
+        }
+    }
+
+    /// Render Split/Join as a single segmented toggle (two halves of one
+    /// rounded rectangle). Outer corners rounded, inner edge flat, zero
+    /// spacing between halves. Active = blue fill.
+    fn render_split_join_segmented(
+        &mut self,
+        ui: &mut egui::Ui,
+        vertical: bool,
+        size: Option<egui::Vec2>,
+    ) {
+        let r = 2.0;
+        let (split_round, join_round) = if vertical {
+            (
+                egui::Rounding { nw: r, ne: r, sw: 0.0, se: 0.0 },
+                egui::Rounding { nw: 0.0, ne: 0.0, sw: r, se: r },
+            )
+        } else {
+            (
+                egui::Rounding { nw: r, ne: 0.0, sw: r, se: 0.0 },
+                egui::Rounding { nw: 0.0, ne: r, sw: 0.0, se: r },
+            )
+        };
+        let split_first = matches!(
+            ui.layout().main_dir(),
+            egui::Direction::TopDown | egui::Direction::LeftToRight
+        );
+        let stroke = egui::Stroke::new(2.0, ui.visuals().widgets.noninteractive.bg_stroke.color);
+        egui::Frame::none()
+            .stroke(stroke)
+            .rounding(egui::Rounding::same(r))
+            .inner_margin(egui::Margin::same(0.0))
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                if split_first {
+                    self.render_split_join_button(ui, "Split", false, size, split_round);
+                    self.render_split_join_button(ui, "Join", true, size, join_round);
+                } else {
+                    self.render_split_join_button(ui, "Join", true, size, join_round);
+                    self.render_split_join_button(ui, "Split", false, size, split_round);
+                }
+            });
+    }
+
     fn save_ptt_config(&self) {
         if let Ok(exe) = std::env::current_exe() {
             let path = exe.with_file_name("thetislink-client.conf");
@@ -1173,6 +1364,15 @@ impl SdrRemoteApp {
             self.spectrum_max_bins,
             self.spectrum_fft_size_k,
             self.rx2_spectrum_fft_size_k,
+            self.spectrum_total_h,
+            self.spectrum_popout_pos.map(|p| (p.x, p.y)),
+            self.spectrum_popout_size.map(|v| (v.x, v.y)),
+            self.rx2_popout_pos.map(|p| (p.x, p.y)),
+            self.rx2_popout_size.map(|v| (v.x, v.y)),
+            self.popout_joined_pos.map(|p| (p.x, p.y)),
+            self.popout_joined_size.map(|v| (v.x, v.y)),
+            self.yaesu_popout_pos.map(|p| (p.x, p.y)),
+            self.yaesu_popout_size.map(|v| (v.x, v.y)),
             &self.wf_contrast_per_band,
             self.rx2_spectrum_ref_db,
             self.rx2_spectrum_range_db,
@@ -1181,6 +1381,15 @@ impl SdrRemoteApp {
             self.rx2_enabled,
             self.popout_joined,
             self.popout_meter_analog,
+            self.spectrum_popout,
+            self.rx2_popout,
+            self.main_window_pos.map(|p| (p.x, p.y)),
+            self.ub_show_menu,
+            self.collapse_diversity,
+            self.collapse_yaesu_eq,
+            self.collapse_yaesu_memories,
+            self.collapse_yaesu_menu,
+            self.yaesu_memories_h,
             self.device_tab,
             self.yaesu_enabled,
             self.yaesu_volume,
@@ -1513,6 +1722,9 @@ impl SdrRemoteApp {
                 sdr_remote_core::protocol::ControlId::AllowZoomBelow2x,
                 if self.allow_zoom_below_2x { 1 } else { 0 },
             ));
+            // Also push S-meter source choice on (re)connect — engine state
+            // and UI state must agree so the right subscription mask is sent.
+            let _ = self.cmd_tx.send(Command::SetSmeterSource(self.smeter_source));
         }
         self.power_on = state.power_on;
         self.tx_profile = state.tx_profile;
@@ -1849,6 +2061,9 @@ impl SdrRemoteApp {
         self.ub_fw_minor = state.ub_fw_minor;
         self.ub_available = state.ub_available;
         self.ub_elements_mm = state.ub_elements_mm;
+        self.ub_operation = state.ub_operation;
+        self.ub_freq_min_mhz = state.ub_freq_min_mhz;
+        self.ub_freq_max_mhz = state.ub_freq_max_mhz;
 
         // Rotor
         self.rotor_connected = state.rotor_connected;
@@ -2192,6 +2407,16 @@ impl SdrRemoteApp {
                         }
                     }
                 });
+            // Height slider — only in the main Radio tab. Popouts fill the
+            // whole window and ignore this setting.
+            if !is_popout {
+                ui.label("H:");
+                if ui.add(egui::Slider::new(&mut self.spectrum_total_h, 300.0..=1200.0)
+                    .custom_formatter(|v, _| format!("{:.0}", v))
+                ).on_hover_text("Total height of the spectrum + waterfall block in pixels. The page becomes scrollable when content overflows.").changed() {
+                    self.save_full_config();
+                }
+            }
             if zoom_changed || pan_changed {
                 self.zoom_pan_changed_at = Some(Instant::now());
             }
@@ -2258,9 +2483,17 @@ impl SdrRemoteApp {
         let smooth_vfo = (self.smooth_display_center_hz
             - self.spectrum_pan as f64 * self.full_spectrum_span_hz as f64) as u64;
 
-        // Dynamic spectrum + waterfall height based on available space
-        let available = ui.available_height();
-        let spec_area = (available - reserve_bottom).max(200.0);
+        // Spectrum + waterfall area sizing.
+        // - Popout: fills the popout window (dynamic from available_height).
+        // - Main Radio tab: fixed `self.spectrum_total_h` so the rest of the
+        //   tab (Diversity etc.) can expand below into a scrollable area
+        //   instead of pushing the spectrum off-screen.
+        let spec_area = if is_popout {
+            let available = ui.available_height();
+            (available - reserve_bottom).max(200.0)
+        } else {
+            self.spectrum_total_h.clamp(300.0, 1200.0)
+        };
         let spec_h = (spec_area * 0.45).max(100.0);
         let wf_h = (spec_area * 0.55).max(80.0);
 
@@ -2305,6 +2538,44 @@ impl SdrRemoteApp {
             wf_h,
             &SpectrumPlotConfig { is_popout, ..RX1_PLOT_CONFIG },
         );
+        // Drag-handle for resizing spectrum + waterfall height in the main
+        // Radio tab. Popouts skip — they always fill their window.
+        if !is_popout {
+            let handle_h = 6.0;
+            let (rect, response) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), handle_h),
+                egui::Sense::drag(),
+            );
+            let visuals = ui.visuals();
+            let fill = if response.hovered() || response.dragged() {
+                visuals.widgets.hovered.bg_fill
+            } else {
+                visuals.widgets.inactive.bg_fill
+            };
+            ui.painter().rect_filled(rect, 2.0, fill);
+            // Small visual "grip" — three short horizontal lines centred.
+            let grip_color = visuals.widgets.inactive.fg_stroke.color;
+            let cx = rect.center().x;
+            let cy = rect.center().y;
+            for dx in [-12.0, 0.0, 12.0] {
+                ui.painter().line_segment(
+                    [egui::pos2(cx + dx - 4.0, cy), egui::pos2(cx + dx + 4.0, cy)],
+                    egui::Stroke::new(1.0, grip_color),
+                );
+            }
+            if response.dragged() {
+                let dy = response.drag_delta().y;
+                if dy.abs() > 0.01 {
+                    self.spectrum_total_h = (self.spectrum_total_h + dy).clamp(300.0, 1200.0);
+                }
+            }
+            if response.drag_stopped() {
+                self.save_full_config();
+            }
+            if response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+            }
+        }
     }
 
     /// Render RX1 controls only (VFO, S-meter, band, mode, freq step, filter, NR, ANF).
@@ -2599,8 +2870,14 @@ impl SdrRemoteApp {
     fn render_rx1_popout_content(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         self.render_rx1_controls(ui, controls::UiSurface::PopoutSeparate);
         ui.separator();
-        // -- Spectrum + waterfall --
-        self.render_spectrum_content(ui, ctx, 0.0, true);
+        // -- Spectrum + waterfall (placeholder when no bins yet, mirrors RX2) --
+        if !self.spectrum_bins.is_empty() {
+            self.render_spectrum_content(ui, ctx, 0.0, true);
+        } else {
+            ui.centered_and_justified(|ui| {
+                ui.label(RichText::new("Waiting for RX1 spectrum data...").weak());
+            });
+        }
     }
 
     /// Render RX2 controls only (VFO, S-meter, band, mode, freq step, filter, NR, ANF)
@@ -2616,17 +2893,44 @@ impl SdrRemoteApp {
             self.render_rx2_controls_inner(&mut measure, show_split_button, is_popout, surface);
             let controls_h = measure.min_rect().height();
 
+            // Reserve a slim column for the Split button so the analog meter
+            // can render at its natural size (matching RX1's meter).
+            let split_w: f32 = if show_split_button { 60.0 } else { 0.0 };
             let meter_w = (controls_h * 2.0).min(total_w - 480.0).max(0.0);
-            let controls_w = total_w - meter_w - if meter_w > 0.0 { 8.0 } else { 0.0 };
+            let gap_left = if meter_w > 0.0 { 8.0 } else { 0.0 };
+            let split_gap = if split_w > 0.0 { 4.0 } else { 0.0 };
+            let controls_w = (total_w - meter_w - split_w - split_gap - gap_left).max(0.0);
 
             let controls_rect = egui::Rect::from_min_size(start, egui::vec2(controls_w, 500.0));
             let mut left = ui.new_child(egui::UiBuilder::new().max_rect(controls_rect).layout(egui::Layout::top_down(egui::Align::LEFT)));
             self.render_rx2_controls_inner(&mut left, show_split_button, is_popout, surface);
 
+            if show_split_button {
+                let btn_h: f32 = 24.0;
+                let pair_h: f32 = btn_h * 2.0 + 4.0;
+                let split_x = start.x + controls_w + split_gap;
+                // Top-align with the meter so RX1 (A<>B) and RX2 (Split/Join)
+                // buttons share the same visual baseline.
+                let btn_rect = egui::Rect::from_min_size(
+                    egui::pos2(split_x, start.y),
+                    egui::vec2(split_w, pair_h),
+                );
+                let mut btn_ui = ui.new_child(
+                    egui::UiBuilder::new().max_rect(btn_rect).layout(egui::Layout::top_down(egui::Align::Center))
+                );
+                let sz = Some(egui::vec2(split_w, btn_h));
+                self.render_split_join_segmented(&mut btn_ui, true, sz);
+            }
+
             if meter_w > 80.0 {
-                let meter_pos = egui::pos2(start.x + controls_w + 4.0, start.y);
-                let meter_rect = egui::Rect::from_min_size(meter_pos, egui::vec2(meter_w, controls_h));
-                let mut right = ui.new_child(egui::UiBuilder::new().max_rect(meter_rect).layout(egui::Layout::top_down(egui::Align::LEFT)));
+                let meter_x = start.x + controls_w + split_gap + split_w + gap_left;
+                let meter_rect = egui::Rect::from_min_size(
+                    egui::pos2(meter_x, start.y),
+                    egui::vec2(meter_w, controls_h),
+                );
+                let mut right = ui.new_child(
+                    egui::UiBuilder::new().max_rect(meter_rect).layout(egui::Layout::top_down(egui::Align::LEFT))
+                );
                 self.popout_rx2_smeter_rect = smeter_analog_sized(&mut right, self.rx2_smeter, self.rx2_smeter_peak, false, false, Some((meter_w, controls_h)));
             }
 
@@ -2703,12 +3007,7 @@ impl SdrRemoteApp {
                         smeter_bar(ui, self.rx2_smeter, self.rx2_smeter_peak, false, false, 100)
                     };
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let join_btn = egui::Button::new(RichText::new("Split").strong())
-                            .fill(Color32::from_rgb(100, 160, 230));
-                        if ui.add(join_btn).clicked() {
-                            self.popout_joined = false;
-                            self.save_full_config();
-                        }
+                        self.render_split_join_segmented(ui, false, None);
                     });
                 });
             } else {
@@ -3256,15 +3555,28 @@ impl eframe::App for SdrRemoteApp {
 
         // (TX spectrum override sets ref/range directly in PTT handler)
 
-        // Track window size for persistence
+        // Track main-window geometry for persistence. Position is gated
+        // on pointer-up like popouts to avoid disk-I/O stalls during a drag
+        // (which causes the OS to oscillate the window between frames).
+        let mut geom_changed = false;
         if let Some(rect) = ctx.input(|i| i.viewport().inner_rect) {
             let w = rect.width();
             let h = rect.height();
             if (w - self.window_w).abs() > 5.0 || (h - self.window_h).abs() > 5.0 {
                 self.window_w = w;
                 self.window_h = h;
-                self.save_full_config();
+                geom_changed = true;
             }
+        }
+        if let Some(outer) = ctx.input(|i| i.viewport().outer_rect) {
+            let np = outer.min;
+            if self.main_window_pos.map_or(true, |p| (p.x - np.x).abs() > 5.0 || (p.y - np.y).abs() > 5.0) {
+                self.main_window_pos = Some(np);
+                geom_changed = true;
+            }
+        }
+        if geom_changed && !ctx.input(|i| i.pointer.any_down()) {
+            self.save_full_config();
         }
 
         // Volume routing based on popout state:
@@ -3387,22 +3699,24 @@ impl eframe::App for SdrRemoteApp {
                 let _ = self.cmd_tx.send(Command::SetPtt(new_ptt));
                 self.ptt = new_ptt;
 
-                // Tune button (visible when tuner available on JC-4s antenna)
+                // Tune button (visible when tuner available on the active antenna).
+                // Multi-tuner note: stale-detection is handled SERVER-side now —
+                // the server tracks per-tuner tune frequency and already broadcasts
+                // state = IDLE when the VFO has drifted >25 kHz from the active
+                // tuner's last-tune freq. Client-side stale check used to apply a
+                // second filter on top, but its `tuner_tune_freq` only updated on
+                // TUNING→DONE_OK transitions, so an Amplitec switch (which sees
+                // IDLE→DONE_OK without TUNING) left the client comparing against
+                // the wrong tuner's freq. Drop the client-side gate and trust the
+                // server state directly.
                 if self.tuner_can_tune && self.tuner_connected {
-                    let freq_delta = if self.tuner_tune_freq > 0 && self.frequency_hz > 0 {
-                        (self.frequency_hz as i64 - self.tuner_tune_freq as i64).unsigned_abs()
-                    } else {
-                        u64::MAX // Never tuned = always stale
-                    };
-                    let stale = freq_delta > 25_000; // >25kHz = needs retune
-
                     let olive_green = Color32::from_rgb(120, 160, 40);
                     let (tune_color, tune_text) = match self.tuner_state {
                         1 => (Color32::from_rgb(60, 120, 220), "Tune..."),  // Tuning = blue
-                        2 if !stale => (Color32::from_rgb(50, 180, 50), "Tune OK"),  // Done OK + in range = green
-                        5 if !stale => (olive_green, "Tune ~"),  // Done assumed + in range = olive green
+                        2 => (Color32::from_rgb(50, 180, 50), "Tune OK"),  // Done OK = green
+                        5 => (olive_green, "Tune ~"),  // Done assumed = olive green
                         3 | 4 => (Color32::from_rgb(220, 160, 40), "Tune X"),  // Timeout/Aborted = orange
-                        _ => (Color32::from_rgb(80, 80, 80), "Tune"),  // Idle or stale = grey
+                        _ => (Color32::from_rgb(80, 80, 80), "Tune"),  // Idle = grey
                     };
 
                     let tune_btn = egui::Button::new(
@@ -3679,12 +3993,26 @@ impl eframe::App for SdrRemoteApp {
             if self.active_tab == Tab::Devices {
                 self.render_devices_screen(ui);
             } else if self.active_tab == Tab::Thetis {
-                self.render_thetis_screen(ui);
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    self.render_thetis_screen(ui);
+                });
             } else if self.active_tab == Tab::Server {
-                self.render_server_screen(ui);
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    self.render_server_screen(ui);
+                });
             } else if self.active_tab == Tab::Midi {
-                self.render_midi_screen(ui);
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    self.render_midi_screen(ui);
+                });
             } else {
+            // Wrap the Radio tab content in a ScrollArea so the panel stays
+            // usable when the user expands the Diversity panel (or sets a
+            // tall spectrum_total_h) and the total content height exceeds
+            // the window. Spectrum height itself is fixed at
+            // `self.spectrum_total_h` (set via the H: slider / drag-handle
+            // below the waterfall) — without the ScrollArea wrapper any
+            // overflow would push content off-screen.
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
 
             // VFO A frequency
             ui.separator();
@@ -3965,7 +4293,6 @@ impl eframe::App for SdrRemoteApp {
                 ui.label("Drive:");
                 let mut drive_f32 = self.drive_level as f32;
                 let slider = egui::Slider::new(&mut drive_f32, 0.0..=100.0)
-                    .show_value(false)
                     .custom_formatter(|v, _| format!("{:.0}%", v));
                 if ui.add(slider).changed() {
                     let new_val = drive_f32.round() as u8;
@@ -3978,31 +4305,51 @@ impl eframe::App for SdrRemoteApp {
 
             // Diversity
             ui.separator();
-            egui::CollapsingHeader::new(RichText::new("Diversity").strong().size(14.0))
-                .default_open(false)
+            let div_resp = egui::CollapsingHeader::new(RichText::new("Diversity").strong().size(14.0))
+                .id_salt("collapse_diversity")
+                .default_open(self.collapse_diversity)
                 .show(ui, |ui| {
                     self.render_diversity(ui);
                 });
+            let now_open = div_resp.openness >= 0.5;
+            if now_open != self.collapse_diversity {
+                self.collapse_diversity = now_open;
+                self.save_full_config();
+            }
 
+            }); // end of Radio-tab ScrollArea
             } // end of Radio tab
         });
 
-        // Pop-out viewports: joined or separate
-        let show_rx1_popout = self.spectrum_popout && self.spectrum_enabled && !self.spectrum_bins.is_empty();
+        // Pop-out viewports: joined or separate. Both gates intentionally
+        // omit a bins/connected check so the popout opens at its saved
+        // geometry from the very first frame — same UX as the Yaesu popout.
+        // The popout's content gates internally on bin-availability and
+        // shows a "Waiting for ..." placeholder pre-connect.
+        let show_rx1_popout = self.spectrum_popout && self.spectrum_enabled;
         let show_rx2_popout = self.rx2_popout && self.rx2_enabled;
 
         if show_rx1_popout && show_rx2_popout && self.popout_joined {
             // Joined mode: single combined window with RX1 on top, RX2 below
+            let vb = Self::apply_popout_geometry(
+                ViewportBuilder::default().with_title("ThetisLink - RX1 + RX2"),
+                self.popout_joined_pos,
+                self.popout_joined_size,
+                [900.0, 900.0],
+                &mut self.popout_joined_init_applied,
+            );
             ctx.show_viewport_immediate(
                 ViewportId::from_hash_of("spectrum_popout"),
-                ViewportBuilder::default()
-                    .with_title("ThetisLink - RX1 + RX2")
-                    .with_inner_size([900.0, 900.0]),
+                vb,
                 |ctx, _class| {
                     if ctx.input(|i| i.viewport().close_requested()) {
                         self.spectrum_popout = false;
                         self.rx2_popout = false;
+                        self.popout_joined_init_applied = false;
                         return;
+                    }
+                    if Self::track_popout_geometry(ctx, &mut self.popout_joined_pos, &mut self.popout_joined_size) {
+                        self.save_full_config();
                     }
                     egui::CentralPanel::default().show(ctx, |ui| {
                         // Controls side by side: RX1 left, RX2 right
@@ -4016,12 +4363,22 @@ impl eframe::App for SdrRemoteApp {
 
                         ui.separator();
 
-                        // Spectrums stacked: RX1 on top, RX2 below
+                        // Spectrums stacked: RX1 on top, RX2 below. Pre-connect both
+                        // halves show their respective "Waiting for ..." placeholder so
+                        // the layout is recognisable as two stacked RX-panes even before
+                        // any spectrum bins arrive (RX2 already had this gate inside
+                        // render_rx2_spectrum_only; RX1 gets it here to mirror that).
                         let total_w = ui.available_width();
                         let available = ui.available_height();
                         let half = (available - 4.0) / 2.0;
                         ui.allocate_ui(egui::vec2(total_w, half), |ui| {
-                            self.render_spectrum_content(ui, ctx, 0.0, true);
+                            if !self.spectrum_bins.is_empty() {
+                                self.render_spectrum_content(ui, ctx, 0.0, true);
+                            } else {
+                                ui.centered_and_justified(|ui| {
+                                    ui.label(RichText::new("Waiting for RX1 spectrum data...").weak());
+                                });
+                            }
                         });
                         ui.add_space(2.0);
                         self.render_rx2_spectrum_only(ui, ctx);
@@ -4038,48 +4395,84 @@ impl eframe::App for SdrRemoteApp {
                     let r1 = self.popout_rx1_smeter_rect;
                     let r2 = self.popout_rx2_smeter_rect;
                     if r1.is_positive() && r2.is_positive() {
-                        let pos = if self.popout_meter_analog {
-                            // Bottom-left of RX1 analog meter
-                            egui::pos2(r1.left() + 4.0, r1.max.y - 24.0)
+                        if self.popout_meter_analog {
+                            // Analog: 60×28 button just left of RX1 meter,
+                            // top-aligned — mirrors the Split button on RX2.
+                            // Default styling (no fill) — blue is reserved for
+                            // toggled-on state in this app; A<>B is momentary.
+                            // Use a centered child-UI so the button text is
+                            // horizontally centered (matches Split).
+                            let btn_w = 60.0_f32;
+                            let btn_h = 28.0_f32;
+                            let pos = egui::pos2(r1.left() - btn_w - 4.0, r1.top());
+                            egui::Area::new(egui::Id::new("vfo_swap_joined_analog"))
+                                .fixed_pos(pos)
+                                .order(egui::Order::Foreground)
+                                .interactable(true)
+                                .show(ctx, |ui| {
+                                    let btn_rect = egui::Rect::from_min_size(pos, egui::vec2(btn_w, btn_h));
+                                    let mut btn_ui = ui.new_child(
+                                        egui::UiBuilder::new()
+                                            .max_rect(btn_rect)
+                                            .layout(egui::Layout::top_down(egui::Align::Center))
+                                    );
+                                    let btn = egui::Button::new(RichText::new("A<>B").strong())
+                                        .min_size(egui::vec2(btn_w, btn_h));
+                                    if btn_ui.add_enabled(self.connected, btn).clicked() {
+                                        let _ = self.cmd_tx.send(Command::SetControl(ControlId::VfoSwap, 2));
+                                    }
+                                });
                         } else {
-                            // Centered between the two bar S-meters
+                            // Bar mode: keep original between-meters placement.
+                            // Separate Area ID from the analog one to avoid
+                            // egui caching a previous frame's larger size
+                            // constraint and triggering character-wrap of
+                            // "A<>B" when toggling Analog → Bar.
                             let center_x = (r1.right() + r2.left()) / 2.0;
                             let center_y = (r1.center().y + r2.center().y) / 2.0;
-                            egui::pos2(center_x - 23.0, center_y - 10.0)
-                        };
-                        egui::Area::new(egui::Id::new("vfo_swap_joined"))
-                            .fixed_pos(pos)
-                            .order(egui::Order::Foreground)
-                            .interactable(true)
-                            .show(ctx, |ui| {
-                                if ui.add_enabled(self.connected, egui::Button::new(RichText::new("A<>B").size(10.0))).clicked() {
-                                    let _ = self.cmd_tx.send(Command::SetControl(ControlId::VfoSwap, 2));
-                                }
-                            });
+                            let pos = egui::pos2(center_x - 23.0, center_y - 10.0);
+                            egui::Area::new(egui::Id::new("vfo_swap_joined_bar"))
+                                .fixed_pos(pos)
+                                .order(egui::Order::Foreground)
+                                .interactable(true)
+                                .show(ctx, |ui| {
+                                    let btn = egui::Button::new(RichText::new("A<>B").size(10.0))
+                                        .min_size(egui::vec2(40.0, 18.0));
+                                    if ui.add_enabled(self.connected, btn).clicked() {
+                                        let _ = self.cmd_tx.send(Command::SetControl(ControlId::VfoSwap, 2));
+                                    }
+                                });
+                        }
                     }
                 },
             );
         } else {
             // Separate mode: individual windows
             if show_rx1_popout {
+                let vb = Self::apply_popout_geometry(
+                    ViewportBuilder::default().with_title("ThetisLink - RX1 / VFO-A"),
+                    self.spectrum_popout_pos,
+                    self.spectrum_popout_size,
+                    [900.0, 600.0],
+                    &mut self.spectrum_popout_init_applied,
+                );
                 ctx.show_viewport_immediate(
                     ViewportId::from_hash_of("spectrum_popout"),
-                    ViewportBuilder::default()
-                        .with_title("ThetisLink - RX1 / VFO-A")
-                        .with_inner_size([900.0, 600.0]),
+                    vb,
                     |ctx, _class| {
                         if ctx.input(|i| i.viewport().close_requested()) {
                             self.spectrum_popout = false;
+                            self.spectrum_popout_init_applied = false;
                             return;
                         }
+                        if Self::track_popout_geometry(ctx, &mut self.spectrum_popout_pos, &mut self.spectrum_popout_size) {
+                            self.save_full_config();
+                        }
                         egui::CentralPanel::default().show(ctx, |ui| {
-                            // Join button right-aligned (only visible when RX2 is also popped out)
+                            // Split/Join segmented right-aligned (only visible when RX2 is also popped out)
                             if show_rx2_popout {
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                                    if ui.button("Join").clicked() {
-                                        self.popout_joined = true;
-                                        self.save_full_config();
-                                    }
+                                    self.render_split_join_segmented(ui, false, None);
                                 });
                             }
                             self.render_rx1_popout_content(ui, ctx);
@@ -4114,24 +4507,30 @@ impl eframe::App for SdrRemoteApp {
             }
 
             if show_rx2_popout {
+                let vb = Self::apply_popout_geometry(
+                    ViewportBuilder::default().with_title("ThetisLink - RX2 / VFO-B"),
+                    self.rx2_popout_pos,
+                    self.rx2_popout_size,
+                    [900.0, 600.0],
+                    &mut self.rx2_popout_init_applied,
+                );
                 ctx.show_viewport_immediate(
                     ViewportId::from_hash_of("rx2_popout"),
-                    ViewportBuilder::default()
-                        .with_title("ThetisLink - RX2 / VFO-B")
-                        .with_inner_size([900.0, 600.0]),
+                    vb,
                     |ctx, _class| {
                         if ctx.input(|i| i.viewport().close_requested()) {
                             self.rx2_popout = false;
+                            self.rx2_popout_init_applied = false;
                             return;
                         }
+                        if Self::track_popout_geometry(ctx, &mut self.rx2_popout_pos, &mut self.rx2_popout_size) {
+                            self.save_full_config();
+                        }
                         egui::CentralPanel::default().show(ctx, |ui| {
-                            // Join button right-aligned (only visible when RX1 is also popped out)
+                            // Split/Join segmented right-aligned (only visible when RX1 is also popped out)
                             if show_rx1_popout {
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                                    if ui.button("Join").clicked() {
-                                        self.popout_joined = true;
-                                        self.save_full_config();
-                                    }
+                                    self.render_split_join_segmented(ui, false, None);
                                 });
                             }
                             self.render_rx2_content(ui, ctx);
@@ -4168,16 +4567,25 @@ impl eframe::App for SdrRemoteApp {
 
         // Yaesu popout window
         if self.yaesu_popout && self.yaesu_enabled {
+            let vb = Self::apply_popout_geometry(
+                ViewportBuilder::default().with_title("ThetisLink - Yaesu FT-991A"),
+                self.yaesu_popout_pos,
+                self.yaesu_popout_size,
+                [465.0, 335.0],
+                &mut self.yaesu_popout_init_applied,
+            );
             ctx.show_viewport_immediate(
                 ViewportId::from_hash_of("yaesu_popout"),
-                ViewportBuilder::default()
-                    .with_title("ThetisLink - Yaesu FT-991A")
-                    .with_inner_size([465.0, 335.0]),
+                vb,
                 |ctx, _class| {
                     if ctx.input(|i| i.viewport().close_requested()) {
                         self.yaesu_popout = false;
+                        self.yaesu_popout_init_applied = false;
                         self.save_full_config();
                         return;
+                    }
+                    if Self::track_popout_geometry(ctx, &mut self.yaesu_popout_pos, &mut self.yaesu_popout_size) {
+                        self.save_full_config();
                     }
                     // Fixed PTT button at bottom
                     egui::TopBottomPanel::bottom("yaesu_ptt_panel").show(ctx, |ui| {
@@ -4224,7 +4632,9 @@ impl eframe::App for SdrRemoteApp {
                         });
                     });
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        self.render_yaesu_popout(ui);
+                        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                            self.render_yaesu_popout(ui);
+                        });
                     });
                     ctx.request_repaint_after(std::time::Duration::from_millis(100));
                 },

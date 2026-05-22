@@ -26,7 +26,9 @@ pub(super) fn render_spe_panel(
         ui.heading("SPE Expert 1.3K-FA");
         let mut active = is_active;
         if ui.checkbox(&mut active, "Active").changed() {
-            active_pa.store(if active { 1 } else { 0 }, Ordering::Relaxed);
+            let new_val = if active { 1 } else { 0 };
+            active_pa.store(new_val, Ordering::Relaxed);
+            crate::config::save_active_pa(new_val);
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if status.connected {

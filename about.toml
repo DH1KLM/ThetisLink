@@ -6,12 +6,22 @@
 # `compliance/sbom.spdx.json` instead — THIRD-PARTY-LICENSES.html is the
 # per-host license-text bundle, the SBOM is the full crate inventory.
 #
-# Known cosmetic warning: cargo-about v0.8.4 emits a "GPL-2.0 deprecated
-# identifier" message during validation. This comes from cargo-about's
-# own internal license-expression checker, not from our config or the
-# dependency tree (grep on ~/.cargo/registry for `license = "GPL-2.0"`
-# plain yields zero hits). Output is correctly generated. Documented
-# here so future maintainers don't chase a non-existent bug.
+# cargo-about v0.8.4 caveat: the default `--threshold 0.8` lets the
+# fuzzy license-text scanner identify license-text fragments inside
+# crate sources (build.rs comments, LICENSE-orig.txt boilerplate,
+# vendored upstream headers etc.). Some of those resolve to the
+# deprecated bare `GPL-2.0` SPDX identifier which cargo-about then
+# refuses to parse, exiting non-zero. None of our actual crate-level
+# `license = ...` declarations use the bare identifier (grep over
+# `cargo metadata` confirms), so the fuzzy-scanner result is the only
+# trigger.
+#
+# Mitigation: regenerate with `--threshold 1.0` so cargo-about only
+# trusts exact license-text matches and drops the noisy file scans.
+# This is what RELEASE.md should reference for compliance regen:
+#   cargo about generate about.hbs -o compliance/THIRD-PARTY-LICENSES.html --threshold 1.0
+# Output is the per-host license-text bundle; the SBOM (regen via
+# `cargo sbom > compliance/sbom.spdx.json`) is the full crate inventory.
 #
 # The Ubuntu Font License 1.0 (UFL-1.0) attached to epaint_default_fonts
 # has no standard SPDX identifier; we clarify the crate's expression
@@ -56,3 +66,35 @@ override-git-commit = "0.29.1"
 path = "fonts/OFL.txt"
 license = "OFL-1.1"
 checksum = "6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2"
+
+# unescaper 0.1.8 declares `license = "GPL-3.0/MIT"` (deprecated slash form,
+# with the bare `GPL-3.0` identifier that SPDX has deprecated in favour of
+# `GPL-3.0-only` or `GPL-3.0-or-later`). cargo-about can't parse this in
+# 0.8.4+. We're pulling unescaper transitively via `serialport`; we choose
+# the MIT branch of the dual-licence — MIT is compatible with our
+# `GPL-2.0-or-later` distribution and avoids the GPL-3 propagation
+# question entirely.
+[unescaper.clarify]
+license = "MIT"
+override-git-commit = "0.1.8"
+
+[[unescaper.clarify.files]]
+path = "LICENSE-MIT"
+license = "MIT"
+checksum = "6e0bad263cbd2aa6235d78e3c26bcfa2668cf32f6b274ae21ce0dd620114c7b3"
+
+# hidapi 2.6.6 declares `license = "MIT"` in its Cargo.toml but ships
+# triple-licensing text files in `etc/hidapi/` (LICENSE.txt naming all
+# three, plus LICENSE-bsd.txt, LICENSE-gpl3.txt, LICENSE-orig.txt).
+# cargo-about scans these and re-derives a GPL-3.0 expression that uses
+# the deprecated bare identifier, causing a parse error in 0.8.4. We
+# pin the expression to MIT (matching the crate's own Cargo.toml choice)
+# and point at LICENSE.txt as the canonical text.
+[hidapi.clarify]
+license = "MIT"
+override-git-commit = "2.6.6"
+
+[[hidapi.clarify.files]]
+path = "etc/hidapi/LICENSE.txt"
+license = "MIT"
+checksum = "7d3b087c34f35d4d538e3bcddd1ff8f66e92f9ef336881999482800ddf840913"

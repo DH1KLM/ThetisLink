@@ -1,10 +1,10 @@
-# ThetisLink — Technische Documentatie
+# ThetisLink v2.0.3 — Technische Documentatie
 
 ## 1. Overzicht
 
 ThetisLink is een systeem voor het op afstand bedienen van een ANAN 7000DLE + Thetis SDR-ontvanger en een Yaesu FT-991A transceiver via een netwerkverbinding. Het biedt bidirectionele real-time audio streaming, PTT-bediening, DDC spectrum/waterfall display, volledige RX2/VFO-B ondersteuning, diversity, Yaesu memory channel management en radio settings editor over UDP met Opus codec.
 
-**Versie:** v2.0.2 (gedeeld versienummer in `sdr-remote-core::VERSION`)
+**Versie:** v2.0.3 (gedeeld versienummer in `sdr-remote-core::VERSION`)
 **Ontwikkeltaal:** Rust + Kotlin (Android UI)
 **Doelplatform:** Windows 10/11, macOS (Intel/Apple Silicon), Android 8+ (arm64)
 **Ontwerpprioriteit:** latency > bandbreedte > features
@@ -26,9 +26,23 @@ Alle uitbreidingen zitten achter de **"ThetisLink extensions"** checkbox in Setu
 De standaard IQ sample rate is 384 kHz. Met ThetisLink extensions kan de gebruiker kiezen uit: 48, 96, 192, 384, 768 of **1536 kHz** — selecteerbaar per receiver via de DDC sample rate dropdown in de client.
 
 **Repos:**
-- ThetisLink: [cjenschede/ThetisLink](https://github.com/cjenschede/ThetisLink) (publieke release repo, tag `v2.0.2`)
+- ThetisLink: [cjenschede/ThetisLink](https://github.com/cjenschede/ThetisLink) (publieke release repo, tag `v2.0.3`)
 - Thetis fork: [cjenschede/Thetis](https://github.com/cjenschede/Thetis) (branch `thetislink-tl2`)
 - Origineel Thetis: [ramdor/Thetis](https://github.com/ramdor/Thetis)
+
+### v2.0.3 highlights
+
+**Multi-tuner release + wire-protocol breaking change.** Wire-protocol `VERSION` u8 bumped van 2 → 3 (S-meter payload herschikt). v2.0.2 clients tegen een v2.0.3 server (of omgekeerd) krijgen een gelocaliseerde `ProtocolVersionMismatch` modal ("Server is te oud" / "Client is te oud") in plaats van garbled audio of een stille connect-fail — server stuurt een 4-byte back-channel rejection-packet `[MAGIC, VERSION, 0xFF, 0x00]` zodat de client de mismatch kan detecteren.
+
+- **Multi-tuner runtime** — tot twee fysieke StockCorner JC-4s / JC-3s tuners parallel via Adafruit MCP2221A USB-HID breakouts (vervangt de v2.0.2 serial-port RTS/CTS aansturing). Per-tuner threshold + hysterese schuiven op de gele tune-status draad (1 MΩ + 1 MΩ deler, default 2.25 V / 0.50 V). Board scan + serial programming UI in het status-paneel. Automatische USB-reconnect met 5 s retry-interval. Inklapbaar MCP2221A-blok waarvan de open/dicht-stand persist over restart.
+- **S-meter overhaul** — multi-source subscription via `rx_channel_sensors_ex` (Sig peak-hold, Avg true-mean, MaxBin), S9-frequency band shift met fork-broadcast `s9_frequency_ex` (fallback 50 MHz tegen stock), TX FWD-power blijft updaten onder Sig/MaxBin selection.
+- **CTUN coupled-recenter + RX1/RX2 spectrum mirror** — beide RX-spectra blijven sync tijdens snel tunen, Auto FFT hertuned naar ~25 FPS, connect-time balancing zodat RX1 en RX2 gelijktijdig opkomen.
+- **MIDI client-side VFO coalesce + auto-recenter handshake** — extreem MIDI-wheel-input vult Thetis' VFO-queue niet meer; auto-recenter ownership handshake met de Thetis-fork werkt nu ook wanneer geen ThetisLink-server actief is.
+- **PA active_pa + drive-snapshot persistence** — overleven proces-kill / power-loss zonder dat de volgende `start_server()`-write nodig is.
+- **Status-panel protocol version-mismatch banner** — voorheen silent, nu zichtbare regel + ringbuffer-entry.
+- **Hardware-doc update** — de impedantie van de yellow-line spanningsdeler is verhoogd van 10 kΩ + 10 kΩ naar **1 MΩ + 1 MΩ** (verhouding 1:1, ×2 in spanning, ongewijzigd; alleen veel minder belasting van de JC-Control LED-keten).
+- **Cleanup** — `assume_tuned` / `TUNER_DONE_ASSUMED` (state 5) / 500 ms assume-deadline pad verwijderd nu feedback-driven detection in productie betrouwbaar werkt. `tuner_port` / `tuner_enabled` legacy COM-port settings UI weg uit de Settings-tab (multi-tuner config loopt nu via het status-paneel). Oude config-keys (`tuner_assume_tuned`, `tuner_port`, `threshold_ratio`, `baseline_override`) worden stilzwijgend genegeerd zodat bestaande config-files niet breken.
+- **Compliance** — vendored Rust crate `mcp2221-hal` v0.1.0 (Copyright © 2025 Rob Wells), dual-licensed `MIT OR Apache-2.0` — ThetisLink gebruikt de **MIT**-tak (Apache-2.0 niet compatible met GPL-2.0-only). Attributie in `NOTICE.md` + volledige MIT-tekst in `compliance/THIRD-PARTY-LICENSES.html` + SPDX SBOM in `compliance/sbom.spdx.json`.
 
 ### v2.0.2 highlights
 
@@ -70,7 +84,7 @@ De v2.0.0 release is een grote stap ten opzichte van de v0.x-lijn. Belangrijkste
 
 ## 2. Architectuur
 
-ThetisLink v2.0.2 gebruikt één enkele TCI WebSocket verbinding naar Thetis voor audio, IQ en alle radio-commando's. Met de PA3GHM fork breiden de aanvullende `_ex` commando's het oppervlak uit (CTUN auto-recenter, diversity, per-RX DDC sample rate). Tegen zowel stock v2.10.3.15 als de fork is geen parallelle CAT-verbinding meer nodig.
+ThetisLink v2.0.3 gebruikt één enkele TCI WebSocket verbinding naar Thetis voor audio, IQ en alle radio-commando's. Met de PA3GHM fork breiden de aanvullende `_ex` commando's het oppervlak uit (CTUN auto-recenter, diversity, per-RX DDC sample rate). Tegen zowel stock v2.10.3.15 als de fork is geen parallelle CAT-verbinding meer nodig.
 
 ```mermaid
 flowchart LR
@@ -168,7 +182,9 @@ sdr-remote/
 │       ├── spe_expert.rs       # SPE Expert 1.3K-FA serieel controller
 │       ├── ultrabeam.rs        # UltraBeam RCU-06 serieel controller
 │       ├── rotor.rs            # EA7HG Visual Rotor UDP controller
-│       ├── tuner.rs            # JC-4s tuner controller (serieel RTS/CTS)
+│       ├── tuner.rs            # JC-4s/JC-3s tuner controllers (MCP2221A USB-HID)
+│       ├── mcp2221_debug.rs    # MCP2221A USB-HID bridge (GP2 + GP1 ADC)
+│       ├── mcp2221_scan.rs     # USB-HID board scan + serial programming
 │       ├── config.rs           # Server configuratie (persistent)
 │       └── ui/                 # Server GUI (egui)
 ├── sdr-remote-client/          # Desktop client (egui)
@@ -716,7 +732,7 @@ TCI (Transceiver Control Interface) is een WebSocket-gebaseerd protocol ingebouw
 
 ### Stock vs fork TCI sub-protocol
 
-ThetisLink v2.0.2 praat TCI met zowel **stock Thetis v2.10.3.15** als de **PA3GHM fork (TL2-1)**. Het basisprotocol is identiek — maar de fork voegt een `_ex` extensielaag toe die ThetisLink gebruikt wanneer beschikbaar.
+ThetisLink v2.0.3 praat TCI met zowel **stock Thetis v2.10.3.15** als de **PA3GHM fork (TL2-1)**. Het basisprotocol is identiek — maar de fork voegt een `_ex` extensielaag toe die ThetisLink gebruikt wanneer beschikbaar.
 
 **Capability-negotiation:** bij verbinden vraagt de client `tci_caps_ex;` op. Met de fork (en de "ThetisLink extensions" Setup-checkbox aan) antwoordt Thetis met een lijst van ondersteunde `_ex` capabilities (`auto_recenter_ex`, `rx_filter_preset_ex`, `ddc_sample_rate_ex`, `diversity_ex`, ...). Stock Thetis implementeert `tci_caps_ex` niet en het verzoek timet uit → ThetisLink valt terug op stock-mode gedrag.
 
@@ -824,7 +840,7 @@ TCI binary header: 16 x u32 = 64 bytes. Stream type op offset 24, sample format 
 
 Eerdere ThetisLink versies (≤ v1.x) gebruikten een parallelle TCP CAT-verbinding naast TCI voor commando's die TCI niet ondersteunde. **ThetisLink v2.0.0 heeft het CAT-pad volledig verwijderd** — alle radio-besturing loopt via de enkele TCI WebSocket uit §9. De ZZ-commando lijst hieronder blijft staan als Thetis-CAT-referentie voor gebruikers die externe CAT-clients (logging-software, N1MM, etc.) direct aan de Thetis CAT-server koppelen (Thetis Setup → Serial/Network/Midi CAT → Network → TCP/IP CAT Server).
 
-| ZZ commando | TCI-tegenhanger gebruikt door ThetisLink v2.0.2 |
+| ZZ commando | TCI-tegenhanger gebruikt door ThetisLink v2.0.3 |
 |-------------|-------------------------------------------------|
 | `ZZLA` / `ZZLB` (RX1/RX2 AF volume) | `volume` / `rx_volume:1,...` |
 | `ZZBY` (shutdown) | `run_cat_ex:ZZBY;` (alleen server-initiated) |
@@ -841,7 +857,7 @@ Eerdere ThetisLink versies (≤ v1.x) gebruikten een parallelle TCP CAT-verbindi
 | `ZZFL`/`ZZFH` / `ZZFS`/`ZZFR` (filter low/high) | `rx_filter_band:0/1,low,high;` |
 | `ZZVS2` (VFO swap) | `vfo_swap_ex;` (stock-supported, geen cap geadverteerd) |
 
-De enige CAT-achtige escape-hatch in v2.0.2 is `run_cat_ex:<ZZ-cmd>;` over TCI: dit is een TCI-only relay die Thetis vraagt een ZZ-commando uit te voeren op de eigen interne CAT-parser (response komt terug via TCI). Door de server gebruikt voor specifieke operaties zoals `ZZCN0/ZZCN1` (CTUN auto-recenter) en `ZZBY` (Thetis shutdown).
+De enige CAT-achtige escape-hatch in v2.0.3 is `run_cat_ex:<ZZ-cmd>;` over TCI: dit is een TCI-only relay die Thetis vraagt een ZZ-commando uit te voeren op de eigen interne CAT-parser (response komt terug via TCI). Door de server gebruikt voor specifieke operaties zoals `ZZCN0/ZZCN1` (CTUN auto-recenter) en `ZZBY` (Thetis shutdown).
 
 ---
 
@@ -1211,7 +1227,7 @@ ThetisLink ondersteunt 7 externe apparaten via de server. Status wordt uitgeleze
 | Waarde | Apparaat | Verbinding |
 |--------|----------|-----------|
 | 0x01 | Amplitec 6/2 Antenneschakelaar | Serieel USB-TTL, 9600 baud |
-| 0x02 | JC-4s Antenna Tuner | Serieel USB, 9600 baud |
+| 0x02 | JC-4s / JC-3s Antenna Tuner (×2) | Adafruit MCP2221A USB-HID |
 | 0x03 | SPE Expert 1.3K-FA Eindversterker | Serieel USB, 115200 baud |
 | 0x04 | RF2K-S Eindversterker | TCP/IP |
 | 0x05 | UltraBeam RCU-06 Antennecontroller | Serieel USB, 19200 baud |
@@ -1226,9 +1242,18 @@ ThetisLink ondersteunt 7 externe apparaten via de server. Status wordt uitgeleze
 - **Status:** switch_a = positie A (1-6), switch_b = positie B (1-6), labels = CSV met positie-namen
 - **Commands:** SetSwitchA (0x01, value=positie 1-6), SetSwitchB (0x02, value=positie 1-6)
 
-### JC-4s Antenna Tuner
+### JC-4s / JC-3s Antenna Tuners (MCP2221A USB-HID bridge)
 
-Automatische antennetuner. Gebruikt serieel USB RTS/CTS signaallijnen (geen data). Tune aan/uit gaat naar Thetis via TCI `tune:0,true;` / `tune:0,false;` (doorgestuurd via een tokio channel).
+Vanaf v2.0.3 worden tot twee StockCorner JC-4s / JC-3s tuners parallel aangestuurd via een **Adafruit MCP2221A USB-naar-HID breakout** per tuner (vervangt het serial-RTS/CTS-flow uit v2.0.2). Het protocol is identiek voor JC-4s en JC-3s; het model-label is cosmetisch.
+
+**Hardware (per tuner):**
+- GP2 (digital out) → serie-gate-weerstand → transistor (2N7000 / MMBT3904) → grey "start"-draad naar GND.
+- GP1 (ADC) → midpunt 1 MΩ + 1 MΩ 1:1 spanningsdeler op de yellow "tune-status"-draad (idle ≈ 4.5 V, tune-actief ≈ 0 V).
+- Volledige wiring-schema's met componentwaardes en BJT/MOSFET-varianten: zie de interne MCP2221A-JC4s wiring reference (beschikbaar op aanvraag bij PA3GHM).
+
+**Native library:** `mcp2221-hal` v0.1.0 — vendored als `vendor/mcp2221-hal/`, dual-licensed `MIT OR Apache-2.0`; ThetisLink kiest de MIT-tak (Apache-2.0 ↔ GPL-2.0-only incompatible). Zie `NOTICE.md` en `compliance/THIRD-PARTY-LICENSES.html` voor attributie.
+
+**Tune aan/uit** gaat naar Thetis via TCI `tune:0,true;` / `tune:0,false;` (doorgestuurd via een tokio channel).
 
 **Tuner states:**
 
@@ -1237,12 +1262,27 @@ Automatische antennetuner. Gebruikt serieel USB RTS/CTS signaallijnen (geen data
 | Idle | 0 | Geen tune actief | Grijs |
 | Tuning | 1 | Tune bezig | Blauw |
 | DoneOk | 2 | Tune succesvol | Groen |
-| Timeout | 3 | Geen antwoord binnen 30s | Oranje (3s, dan Idle) |
-| Aborted | 4 | Gebruiker afgebroken | Oranje (3s, dan Idle) |
+| Timeout | 3 | Geen ACK binnen 3s of geen complete binnen 30s | Amber (3s, dan Idle) |
+| Aborted | 4 | Gebruiker afgebroken | Amber (3s, dan Idle) |
 
-**PA bescherming:** Tijdens tuning wordt de SPE Expert of RF2K-S PA automatisch in Standby gezet en na tune hersteld naar Operate.
+State `5` (DoneAssumed) bestond in v2.0.2 voor de assume-tuned compensatie en is in v2.0.3 verwijderd; oude clients die nog state 5 verwachten zien dit nooit meer van een v2.0.3 server.
 
-**Stale detectie:** DoneOk wordt grijs als de VFO-frequentie meer dan 25 kHz is verschoven t.o.v. de laatst succesvolle tune.
+**Per-tuner config keys** (in `thetislink-server.conf`):
+- `tuner{1,2}_enabled` — slot aan/uit
+- `tuner{1,2}_model` — `jc-4s` / `jc-3s` (cosmetisch label)
+- `tuner{1,2}_mcp_serial` — USB-serienummer van het toegewezen MCP2221A bord
+- `tuner{1,2}_amplitec_pos` — Amplitec-A positie (1..6) waarachter de tuner fysiek hangt
+- `tuner{1,2}_threshold_v` — switch-niveau op de gele draad (default 2.25 V)
+- `tuner{1,2}_hysteresis_v` — dood-band rond de threshold (default 0.50 V)
+- `mcp2221_section_expanded` — open/dicht-stand van het status-paneel MCP-blok
+
+Legacy v2.0.2 keys (`tuner_assume_tuned`, `tuner{1,2}_assume_tuned`, `threshold_ratio`, `baseline_override`) worden stilzwijgend genegeerd bij inlezen — bestaande config-files breken niet.
+
+**PA bescherming:** tijdens tuning wordt SPE Expert of RF2K-S automatisch in Standby gezet en na tune hersteld naar Operate.
+
+**Stale detectie:** DoneOk wordt grijs als de VFO-frequentie meer dan 25 kHz is verschoven t.o.v. de laatst succesvolle tune (per-tuner-slot bijgehouden zodat een tweede tuner niet de freq van de eerste meekrijgt).
+
+**USB auto-reconnect:** de tuner-thread retry't elke 5 s zolang de bridge disconnected is; bij succes reset de timer. Geen exponential back-off.
 
 ### SPE Expert 1.3K-FA Eindversterker
 

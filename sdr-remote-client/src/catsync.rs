@@ -211,10 +211,10 @@ impl CatSync {
             None => return,
         };
 
-        let freq_delta_khz = (freq_hz as i64 - self.last_synced_freq as i64).unsigned_abs() / 1000;
+        let freq_changed = freq_hz != self.last_synced_freq;
         let mode_changed = mode != self.last_synced_mode;
 
-        if freq_delta_khz == 0 && !mode_changed {
+        if !freq_changed && !mode_changed {
             self.freq_changed_at = None;
             return;
         }

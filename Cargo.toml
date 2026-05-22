@@ -9,7 +9,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "2.0.2"
+version = "2.0.3"
 edition = "2021"
 license = "GPL-2.0-or-later"
 
@@ -34,3 +34,12 @@ midir = "0.10"
 # Optimize dependencies even in dev mode (Opus/rubato are too slow unoptimized)
 [profile.dev.package."*"]
 opt-level = 2
+
+# Local fork of mcp2221-hal: adds `connect_with_serial` and `list_devices` so
+# we can drive two MCP2221A boards (one per StockCorner tuner) from the same
+# host. Upstream 0.1.0 only exposes `connect()` which always returns the first
+# device matching VID/PID. The fork keeps the same crate-version and licence
+# (Apache-2.0 OR MIT) so callers see no API surface change beyond the
+# additions. See `vendor/mcp2221-hal/` for the diff.
+[patch.crates-io]
+mcp2221-hal = { path = "vendor/mcp2221-hal" }

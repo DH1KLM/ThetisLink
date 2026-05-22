@@ -84,8 +84,8 @@ fn websdr_js_set_freq(freq_hz: u64, mode: u8) -> String {
     let freq_khz = freq_hz as f64 / 1000.0;
     let (mode_str, lo, hi) = websdr_mode_params(mode);
     format!(
-        "try {{ setfreqif('{}'); setmf('{}', {}, {}); }} catch(e) {{}}",
-        freq_khz as u64, mode_str, lo, hi
+        "try {{ setfreqif('{:.3}'); setmf('{}', {}, {}); }} catch(e) {{}}",
+        freq_khz, mode_str, lo, hi
     )
 }
 

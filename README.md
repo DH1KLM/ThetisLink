@@ -1,8 +1,14 @@
 # ThetisLink
 
-> **Current release: [v2.0.2](https://github.com/cjenschede/ThetisLink/releases/tag/v2.0.2)** —
-> single TCI WebSocket transport, wire-protocol VERSION = 2 (breaking change
-> from v0.x). Download `ThetisLink-2.0.2.zip` from the
+> **Current release: [v2.0.3](https://github.com/cjenschede/ThetisLink/releases/tag/v2.0.3)** —
+> multi-tuner runtime (two StockCorner JC-4s/JC-3s tuners in parallel via
+> Adafruit MCP2221A USB-HID breakouts), S-meter overhaul (Sig/Avg/MaxBin
+> multi-source subscription with S9-frequency band shift), CTUN coupled-recenter
+> + RX1/RX2 spectrum mirror, MIDI VFO-coalesce + Thetis-fork ownership handshake.
+> **Wire-protocol VERSION bumped from 2 → 3** — v2.0.2 clients receive a
+> localised "Client is too old" modal when connecting to a v2.0.3 server (and
+> vice versa for the inverse). Upgrade server, desktop client and Android
+> client together. Download `ThetisLink-2.0.3.zip` from the
 > [Releases page](https://github.com/cjenschede/ThetisLink/releases) — the ZIP
 > contains both Windows binaries, the Android APK, all six PDF manuals,
 > `LICENSE` and `SHA256SUMS.txt`. SBOM and third-party license artefacts are
@@ -22,7 +28,7 @@ radio control over the network via TCI WebSocket.
 - Real-time bidirectional audio (Opus codec, minimal latency)
 - Spectrum and waterfall display (up to 1536 kHz with the PA3GHM Thetis fork)
 - Full RX2/VFO-B support with diversity reception
-- External device control: Amplitec 6/2, JC-4s tuner, SPE Expert 1.3K-FA, RF2K-S, UltraBeam RCU-06, EA7HG Visual Rotor
+- External device control: Amplitec 6/2, two StockCorner JC-4s/JC-3s tuners in parallel (MCP2221A USB-HID), SPE Expert 1.3K-FA, RF2K-S, UltraBeam RCU-06, EA7HG Visual Rotor
 - Yaesu FT-991A as second radio (CAT + USB audio)
 - MIDI controller support (desktop + Android)
 - DX Cluster with spectrum overlay
@@ -43,7 +49,7 @@ ThetisLink talks to the radio through Thetis. It targets **Thetis v2.10.3.15**
 (the latest official release by ramdor) and works with stock Thetis out of the
 box. Optionally use the [PA3GHM Thetis fork](https://github.com/cjenschede/Thetis/tree/thetislink-tl2)
 (branch `thetislink-tl2`) for the additional `_ex` TCI extensions used by
-ThetisLink v2.0.2 (capability broadcast, per-RX filter preset, diversity
+ThetisLink v2.0.3 (capability broadcast, per-RX filter preset, diversity
 control suite, server-side DDC recenter, relaxed IQ-stream rate cap). All
 extensions are gated behind the **ThetisLink extensions** checkbox in Setup
 > Network > IQ Stream; with the checkbox unchecked the fork behaves like
