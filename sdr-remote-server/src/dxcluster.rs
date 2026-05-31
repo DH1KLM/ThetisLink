@@ -97,9 +97,15 @@ async fn cluster_task(
     expiry_secs: u64,
 ) {
     let mut backoff_secs = 1u64;
+    let mut consecutive_failures = 0u32;
 
     loop {
-        info!("DX Cluster: connecting to {}...", server);
+        // Log "connecting" alleen bij de eerste poging of na een eerdere
+        // succesvolle verbinding — niet bij elke retry tijdens een
+        // langdurige outage (anders krijg je 3 regels per backoff-cycle).
+        if consecutive_failures == 0 {
+            info!("DX Cluster: connecting to {}...", server);
+        }
         match tokio::time::timeout(
             tokio::time::Duration::from_secs(10),
             TcpStream::connect(server),
@@ -107,25 +113,37 @@ async fn cluster_task(
         .await
         {
             Ok(Ok(stream)) => {
-                info!("DX Cluster: connected to {}", server);
+                if consecutive_failures > 0 {
+                    info!(
+                        "DX Cluster: reconnected to {} after {} failed attempts",
+                        server, consecutive_failures
+                    );
+                } else {
+                    info!("DX Cluster: connected to {}", server);
+                }
+                consecutive_failures = 0;
                 backoff_secs = 1;
                 if let Err(e) = handle_connection(stream, callsign, &spots, expiry_secs).await {
                     warn!("DX Cluster: connection error: {}", e);
                 }
             }
             Ok(Err(e)) => {
-                warn!("DX Cluster: connect failed: {}", e);
+                consecutive_failures += 1;
+                if consecutive_failures == 1 {
+                    warn!("DX Cluster: connect failed: {} — retrying in background", e);
+                }
             }
             Err(_) => {
-                warn!("DX Cluster: connect timeout");
+                consecutive_failures += 1;
+                if consecutive_failures == 1 {
+                    warn!("DX Cluster: connect timeout — retrying in background");
+                }
             }
         }
 
-        // Reconnect with backoff
-        info!(
-            "DX Cluster: reconnecting in {} seconds...",
-            backoff_secs
-        );
+        // Backoff zonder per-cycle log (de retry-status werd al gemeld
+        // op failure 1; volgende successtate komt vanzelf terug in het
+        // log via de "reconnected after N attempts"-regel).
         tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
         backoff_secs = (backoff_secs * 2).min(60);
     }

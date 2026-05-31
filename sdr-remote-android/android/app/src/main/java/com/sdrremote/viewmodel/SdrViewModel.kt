@@ -74,6 +74,9 @@ class SdrViewModel(application: Application) : AndroidViewModel(application) {
                         bufferDepth = s.bufferDepth.toInt(),
                         rxPackets = s.rxPackets.toLong(),
                         lossPercent = s.lossPercent.toInt(),
+                        downKbps = s.downKbps.toInt(),
+                        upKbps = s.upKbps.toInt(),
+                        dxSpotsEnabled = s.dxSpotsEnabled,
                         captureLevel = s.captureLevel,
                         playbackLevel = s.playbackLevel,
                         frequencyHz = s.frequencyHz.toLong(),
@@ -349,6 +352,7 @@ class SdrViewModel(application: Application) : AndroidViewModel(application) {
             bridge?.setPtt(active)
         }
     }
+    fun setDxSpotsEnabled(enabled: Boolean) { bridge?.setDxSpotsEnabled(enabled) }
     fun setRxVolume(volume: Float) { bridge?.setRxVolume(volume) }
     fun setLocalVolume(volume: Float) {
         // In Yaesu mode, local Thetis audio must stay muted

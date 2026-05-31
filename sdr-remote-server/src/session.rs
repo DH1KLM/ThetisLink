@@ -163,6 +163,10 @@ pub struct ClientSession {
     pub vfo_sync: bool,
     pub yaesu_enabled: bool,
     pub audio_mode: u8, // 255=default(CH0 only), 0=Mono, 1=BIN, 2=Split
+    /// DX-cluster spot stream opt-out — default true (= stream actief).
+    /// Wanneer false stuurt de server geen Spot-frames meer naar deze
+    /// client. Bandbreedte-besparing op metered links.
+    pub dx_spots_enabled: bool,
     /// TL2-1 ctun-auto-recenter: per-client setup-vink "Allow zoom below 2x".
     /// false=default (smear-vrij gegarandeerd, zoom-min 2x). true=opt-in (zoom 1x toegestaan).
     /// Server enforces strictest: zolang één client false heeft, server-zoom-min = 2x.
@@ -304,6 +308,7 @@ impl SessionManager {
             rx2_spectrum_zoom: 1.0, rx2_spectrum_pan: 0.0,
             rx2_spectrum_max_bins: sdr_remote_core::DEFAULT_SPECTRUM_BINS as u16,
             vfo_sync: false, yaesu_enabled: false, audio_mode: 255,
+            dx_spots_enabled: true,
             allow_zoom_below_2x: false,
             smeter_sources: 0x22,
         });
@@ -401,6 +406,7 @@ impl SessionManager {
                 vfo_sync: false,
                 yaesu_enabled: false,
                 audio_mode: 255, // default: CH0 only until client sends AudioMode
+                dx_spots_enabled: true,
                 allow_zoom_below_2x: false,
                 smeter_sources: 0x22,
             });
@@ -560,6 +566,21 @@ impl SessionManager {
     /// Get a client's S-meter source-subscription bitmap (0x22 if unknown).
     pub fn smeter_sources(&self, addr: SocketAddr) -> u16 {
         self.clients.get(&addr).map(|s| s.smeter_sources).unwrap_or(0x22)
+    }
+
+    /// Enable/disable de DX-cluster spot-stream voor een client. Default ON.
+    pub fn set_dx_spots_enabled(&mut self, addr: SocketAddr, enabled: bool) {
+        if let Some(session) = self.clients.get_mut(&addr) {
+            session.dx_spots_enabled = enabled;
+        }
+    }
+
+    /// Addresses van clients die DX-spots willen ontvangen.
+    pub fn dx_spots_addrs(&self) -> Vec<SocketAddr> {
+        self.clients.iter()
+            .filter(|(_, s)| s.dx_spots_enabled && Self::is_active_authed(s))
+            .map(|(addr, _)| *addr)
+            .collect()
     }
 
     pub fn client_audio_mode(&self, addr: SocketAddr) -> u8 {
@@ -783,6 +804,7 @@ mod tests {
             rx2_spectrum_pan: 0.0,
             rx2_spectrum_max_bins: 256,
             vfo_sync: false, yaesu_enabled: false, audio_mode: 255,
+            dx_spots_enabled: true,
             allow_zoom_below_2x: allow,
             smeter_sources: 0x22,
         }

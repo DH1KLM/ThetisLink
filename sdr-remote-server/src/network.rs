@@ -22,7 +22,7 @@ use crate::rf2k::Rf2k;
 use crate::session::SessionManager;
 use crate::spe_expert::SpeExpert;
 use crate::spectrum::{Rx2SpectrumProcessor, SpectrumProcessor};
-use crate::tuner::{TunerInstance, Tuners};
+use crate::tuner::Tuners;
 use crate::dxcluster::DxCluster;
 use crate::rotor::Rotor;
 use crate::ultrabeam::UltraBeam;
@@ -483,6 +483,54 @@ impl NetworkService {
                 let mut prev_tx_profile_names: Vec<String> = Vec::new();
                 let mut prev_equipment: std::collections::HashMap<u8, Vec<u8>> = std::collections::HashMap::new();
                 let mut prev_eq_client_count: usize = 0;
+                // DX-spot dedup + refresh-tracking. Vóór deze fix stuurde de
+                // server élke equipment_tick (200 ms = 5 Hz) alle cached spots
+                // opnieuw naar alle clients — ~90 Kbit/s in steady-state bij
+                // een gevulde cache. Nieuwe spots gaan nu meteen door; de
+                // age-refresh-pass loopt elke 10 s (zichtbaar genoeg voor de
+                // "5m ago"-UI). Bij een nieuwe client wordt prev_spot_keys
+                // geleegd zodat de volgende tick een volledige resync stuurt.
+                let mut prev_spot_keys: std::collections::HashSet<(String, u64, String)> =
+                    std::collections::HashSet::new();
+                let mut last_spot_full_refresh = std::time::Instant::now();
+                let mut prev_spot_client_count: usize = 0;
+                // Reactive RF-power-cap per Amplitec-A positie. Eén instantie
+                // voor de hele broadcast-task; cap-state + snapshot/restore
+                // worden tussen tick-iteraties bewaard. Zie `power_cap.rs`
+                // voor de positie→watts tabel + activatievoorwaarden.
+                let mut power_cap_state = crate::power_cap::PowerCapState::new();
+                // Preventive TX-gate: handle naar de tx_blocked-flag in
+                // PttController. We pushen elke broadcast-iteratie de
+                // actuele "is huidige Amplitec-positie RX-only?" status
+                // hier in zodat alle server-initiated TX-paden
+                // (PTT-packet, ZZTX1, ZZTU1) Thetis nooit een TX-on
+                // commando sturen op een blocked positie.
+                let tx_blocked_gate = ptt.lock().await.tx_blocked_handle();
+                // Diagnose: vorige gate-waarde voor on-change logging.
+                let mut prev_pos_is_blocked = false;
+                // Vorige beschikbaarheid van de rx_only_ex-cap. Wanneer de
+                // operator de ThetisLink-extensions checkbox in Thetis
+                // aanvinkt terwijl de Amplitec al op een RX-only stand staat,
+                // verandert pos_is_blocked niet — dus moeten we op de
+                // cap-transitie (afwezig→aanwezig) de RXOnly opnieuw pushen.
+                let mut prev_had_rx_only_cap = false;
+                // Snapshot van Thetis' RXOnly-staat van vlak vóór TL2 'm
+                // overnam voor een RX-only positie. `Some(prev)` betekent
+                // "TL2 heeft overgenomen, herstel `prev` bij teruggave".
+                // `None` = TL2 heeft RXOnly niet overgenomen. Alleen TL2 kent
+                // deze pre-state, dus de hele snapshot/restore-beslissing zit
+                // hier (de Thetis-fork blijft "dom").
+                let mut rx_only_saved: Option<bool> = None;
+                // Log de tx_blocked + max_w config-staat één keer bij start
+                // van de broadcast-task, zodat we in de log direct zien of de
+                // actieve config de power-cap/RX-only waarden überhaupt heeft.
+                {
+                    let cfg = crate::config::load();
+                    info!(
+                        "TX-gate config at start: amplitec_tx_blocked={:?} amplitec_max_w={:?}",
+                        cfg.amplitec_tx_blocked, cfg.amplitec_max_w
+                    );
+                }
                 loop {
                     tokio::select! {
                         _ = safety_tick.tick() => {
@@ -599,6 +647,30 @@ impl NetworkService {
                                 };
                                 send_if_changed!(DeviceType::Amplitec6x2, pkt, &eq_addrs);
                             }
+                            // Amplitec power-cap tabel — bij wijziging (of nieuwe
+                            // client, via prev_equipment-clear) opnieuw broadcast.
+                            // Hergebruikt `send_if_changed!` met een unieke key
+                            // buiten de DeviceType range (0xFE).
+                            {
+                                let live = crate::config::load();
+                                let pkt = sdr_remote_core::protocol::AmplitecPowerTablePacket {
+                                    max_w: std::array::from_fn(|i| {
+                                        live.amplitec_max_w[i].unwrap_or(0)
+                                    }),
+                                    tx_blocked: live.amplitec_tx_blocked,
+                                };
+                                let mut buf = vec![0u8; sdr_remote_core::protocol::AmplitecPowerTablePacket::SIZE];
+                                let arr: &mut [u8; sdr_remote_core::protocol::AmplitecPowerTablePacket::SIZE] =
+                                    (&mut buf[..]).try_into().unwrap();
+                                pkt.serialize(arr);
+                                let key: u8 = 0xFE; // sentinel buiten DeviceType-range
+                                if prev_equipment.get(&key).map_or(true, |prev| prev != &buf) {
+                                    prev_equipment.insert(key, buf.clone());
+                                    for addr in &eq_addrs {
+                                        let _ = socket.try_send_to(&buf, *addr);
+                                    }
+                                }
+                            }
                             // SPE Expert status broadcast
                             if let Some(ref spe_ref) = spe {
                                 let ss = spe_ref.status();
@@ -685,6 +757,267 @@ impl NetworkService {
                                 };
                                 send_if_changed!(DeviceType::Tuner, pkt, &eq_addrs);
                             }
+
+                            // Generieke RF-power cap per Amplitec-A positie —
+                            // reactieve drive-reductie wanneer de actieve
+                            // antenne-positie een max_w heeft in
+                            // `config.amplitec_max_w` en de PA-meter daar
+                            // boven zit. Ook reactieve TX-block voor
+                            // positions die in `config.amplitec_tx_blocked`
+                            // gemarkeerd zijn (RX-only antennes).
+                            //
+                            // Cap-werking: we sturen de PA-EIGEN drive-knop
+                            // (zelfde commando als de "−" knop in het SPE/RF2K
+                            // tabblad van de client). Niet Thetis ZZPC: de PA
+                            // bepaalt de drive via een TCI-loop terug naar
+                            // Thetis, dus een ZZPC-verlaging vanuit de server
+                            // wordt direct teruggepushed naar de PA-bepaalde
+                            // waarde. Alleen actief op de PA die in
+                            // `config.active_pa` staat.
+                            //
+                            // TX-block: als Thetis in TX gaat op een
+                            // RX-only positie sturen we direct `ZZTX0;`
+                            // (vertaalt naar `trx:0,false;`). Reactief —
+                            // preventieve client-side gating komt later.
+                            {
+                                let live_config = crate::config::load();
+                                let active_pa = live_config.active_pa;
+                                let (pa_in_operate, pa_fwd_watts) = match active_pa {
+                                    1 => spe
+                                        .as_ref()
+                                        .map(|s| {
+                                            let st = s.status();
+                                            (st.state == 2, Some(st.forward_power))
+                                        })
+                                        .unwrap_or((false, None)),
+                                    2 => rf2k
+                                        .as_ref()
+                                        .map(|r| {
+                                            let st = r.status();
+                                            (st.operate, Some(st.forward_w))
+                                        })
+                                        .unwrap_or((false, None)),
+                                    _ => (false, None),
+                                };
+                                let (mode_u8, tx_active) = {
+                                    let p = ptt.lock().await;
+                                    (p.vfo_a_mode(), p.is_transmitting())
+                                };
+                                // Preventieve TX-gate: push de actuele
+                                // "is huidige Amplitec-positie RX-only?"
+                                // status in de Ptt-gate zodat alle
+                                // server-initiated PTT-paden geen TX
+                                // commando naar Thetis kunnen sturen.
+                                let pos_is_blocked = active_amplitec_pos
+                                    .map(|p| {
+                                        live_config
+                                            .amplitec_tx_blocked
+                                            .get((p - 1) as usize)
+                                            .copied()
+                                            .unwrap_or(false)
+                                    })
+                                    .unwrap_or(false);
+                                tx_blocked_gate.store(
+                                    pos_is_blocked,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                // Bij verandering van de RX-only status:
+                                // push Thetis' "Receive only" preventieve
+                                // TX-inhibit via het fork-command `rx_only_ex`.
+                                // Met fork-extensions blokkeert Thetis dan ALLE
+                                // TX-bronnen (MOX/spatiebalk/hardware-PTT/VOX)
+                                // aan de bron — geen TX-window meer. Tegen
+                                // stock Thetis (geen cap) returnt set_rx_only
+                                // false en blijft de reactieve ZZTX0 hieronder
+                                // de enige (best-effort) bescherming.
+                                // Snapshot/restore van Thetis' RXOnly. TL2 is
+                                // de enige die de pre-overname staat kent, dus
+                                // de hele beslissing zit hier; de fork zet
+                                // simpelweg wat we sturen.
+                                //
+                                // - Overname (positie wordt RX-only): bewaar de
+                                //   huidige Thetis-RXOnly als snapshot (alleen
+                                //   bij de eerste overname), zet RXOnly=true.
+                                // - Teruggave (positie niet meer RX-only):
+                                //   herstel de snapshot (NIET blind false) —
+                                //   zo blijft een handmatig gezette RXOnly
+                                //   gerespecteerd.
+                                // - Cap verschijnt (extensions uit→aan terwijl
+                                //   al op RX-only positie): behandel als
+                                //   overname.
+                                // - Cap verdwijnt (extensions uit) terwijl TL2
+                                //   had overgenomen: we kunnen niet meer
+                                //   herstellen (fork negeert rx_only_ex). RXOnly
+                                //   blijft veiligheidshalve aan; waarschuw de
+                                //   operator i.p.v. de bescherming weg te halen.
+                                let has_rx_only_cap =
+                                    ptt.lock().await.has_cap("rx_only_ex");
+                                let cap_just_appeared =
+                                    has_rx_only_cap && !prev_had_rx_only_cap;
+                                let cap_just_disappeared =
+                                    !has_rx_only_cap && prev_had_rx_only_cap;
+                                prev_had_rx_only_cap = has_rx_only_cap;
+
+                                let pos_changed = pos_is_blocked != prev_pos_is_blocked;
+                                prev_pos_is_blocked = pos_is_blocked;
+
+                                if has_rx_only_cap && (pos_changed || cap_just_appeared) {
+                                    let mut p = ptt.lock().await;
+                                    if pos_is_blocked {
+                                        if rx_only_saved.is_none() {
+                                            // Bij bootstrap (cap_just_appeared, eerste detect
+                                            // sinds server-start) is `thetis_rx_only` een
+                                            // onbetrouwbare pre-state: het kan stale residu
+                                            // zijn van een vorige TL-sessie die zelf RXOnly
+                                            // had aangezet en niet opruimde (process-crash,
+                                            // PC-reboot, etc.). Default bij bootstrap is dus
+                                            // `false` — bij teruggave gaat RXOnly netjes uit
+                                            // en blijft Thetis niet vastzitten. Buiten
+                                            // bootstrap (mid-sessie cap-toggle) snapshotten
+                                            // we wel de actuele staat zodat een handmatige
+                                            // RXOnly gerespecteerd blijft.
+                                            rx_only_saved = Some(if cap_just_appeared {
+                                                false
+                                            } else {
+                                                p.thetis_rx_only()
+                                            });
+                                        }
+                                        p.set_rx_only(true).await;
+                                        info!(
+                                            "TX-gate: RX-only takeover pos={:?} (saved pre-state={:?})",
+                                            active_amplitec_pos, rx_only_saved,
+                                        );
+                                    } else if let Some(prev) = rx_only_saved.take() {
+                                        p.set_rx_only(prev).await;
+                                        info!(
+                                            "TX-gate: RX-only release pos={:?} → restored RXOnly={}",
+                                            active_amplitec_pos, prev,
+                                        );
+                                    } else if cap_just_appeared {
+                                        // Bootstrap-edge: cap kwam beschikbaar en TL2 heeft
+                                        // niet overgenomen (rx_only_saved is None) — pos is
+                                        // niet RX-only. Stuur altijd `rx_only_ex:false`,
+                                        // ongeacht `p.thetis_rx_only()`: bij bootstrap komt
+                                        // de echo pas seconden NA de cap-detect, dus
+                                        // `thetis_rx_only` is hier mogelijk nog z'n default
+                                        // `false` terwijl Thetis in werkelijkheid een stale
+                                        // RXOnly van een vorige sessie heeft. Een
+                                        // onvoorwaardelijke reset is idempotent als Thetis
+                                        // al uit was, en ruimt het residu op zonder op de
+                                        // echo-timing te wachten. Eventuele bewust-handmatig-
+                                        // gezette RXOnly wordt overruled; acceptabel volgens
+                                        // de eerdere trade-off — operator kan opnieuw
+                                        // aanvinken.
+                                        p.set_rx_only(false).await;
+                                        info!(
+                                            "TX-gate: cleared possible stale RXOnly at bootstrap (pos={:?})",
+                                            active_amplitec_pos,
+                                        );
+                                    }
+                                } else if has_rx_only_cap && pos_is_blocked {
+                                    // Level-maintain tijdens active takeover. Edge-triggered
+                                    // alleen (pos_changed / cap_just_appeared) zou de
+                                    // preventieve TX-inhibit verlaten als de operator in
+                                    // Thetis handmatig 'Receive only' uitvinkt
+                                    // (setup.cs:6493) of een tweede TCI-client een
+                                    // `rx_only_ex:false;` stuurt — de bescherming zou dan
+                                    // pas bij de volgende positie-wissel terugkomen,
+                                    // tot die tijd terugvallend op de reactieve ZZTX0
+                                    // catch-all (~100 ms TX-window). Re-assert alleen
+                                    // wanneer de TCI-echo aangeeft dat RXOnly daadwerkelijk
+                                    // extern is gewist — voorkomt 5 Hz onnodige
+                                    // TCI-traffic en herhaalde UI-invokes in de Thetis-
+                                    // fork bij stabiele takeover.
+                                    let mut p = ptt.lock().await;
+                                    if !p.thetis_rx_only() {
+                                        p.set_rx_only(true).await;
+                                        log::warn!(
+                                            "TX-gate: RXOnly externally cleared on blocked pos {:?} — re-asserting preventieve TX-inhibit",
+                                            active_amplitec_pos,
+                                        );
+                                    }
+                                }
+
+                                // Extensions uitgezet terwijl TL2 RXOnly had
+                                // overgenomen: bescherming blijft (veilig),
+                                // maar TL2 kan niet meer herstellen → waarschuw.
+                                if cap_just_disappeared {
+                                    if let Some(prev) = rx_only_saved.take() {
+                                        log::warn!(
+                                            "ThetisLink-extensions uitgezet terwijl RX-only actief was (pre-state was {}). \
+                                             Thetis blijft op RXOnly; vink 'Receive only' handmatig uit om te kunnen zenden.",
+                                            prev,
+                                        );
+                                    }
+                                }
+                                // Reactieve catch-all voor Thetis-direct PTT
+                                // (spatiebalk, hardware-PTT op de radio).
+                                // Server-initiated paden zijn al via de
+                                // preventieve gate hierboven afgesloten;
+                                // deze tak vangt alleen TX-events die
+                                // buiten ons om bij Thetis zijn ontstaan.
+                                if pos_is_blocked && tx_active {
+                                    log::warn!(
+                                        "Amplitec pos={:?} is RX-only and Thetis is in TX; forcing TX off",
+                                        active_amplitec_pos
+                                    );
+                                    ptt.lock().await.send_cat("ZZTX0").await;
+                                }
+                                // Switch detector — bij wegschakelen van een
+                                // positie met actieve cap-cyclus sturen we
+                                // evenveel DriveUp commando's als we
+                                // DriveDowns gestuurd hadden, zodat de
+                                // PA-drive terug op de pre-cap positie staat.
+                                if let Some(restore) =
+                                    crate::power_cap::on_position_change(
+                                        &mut power_cap_state,
+                                        active_amplitec_pos,
+                                    )
+                                {
+                                    if let Some(ref s) = spe {
+                                        for _ in 0..restore.spe_drive_up {
+                                            s.send_command(
+                                                crate::spe_expert::SpeCmd::DriveUp,
+                                            );
+                                        }
+                                    }
+                                    if let Some(ref r) = rf2k {
+                                        for _ in 0..restore.rf2k_drive_up {
+                                            r.send_command(
+                                                crate::rf2k::Rf2kCmd::DriveUp,
+                                            );
+                                        }
+                                    }
+                                }
+                                // Reactieve cap-check
+                                if let Some(action) = crate::power_cap::tick(
+                                    &mut power_cap_state,
+                                    active_amplitec_pos,
+                                    &live_config.amplitec_max_w,
+                                    active_pa,
+                                    pa_in_operate,
+                                    pa_fwd_watts,
+                                    mode_u8,
+                                ) {
+                                    match action {
+                                        crate::power_cap::PowerCapAction::SpeDriveDown => {
+                                            if let Some(ref s) = spe {
+                                                s.send_command(
+                                                    crate::spe_expert::SpeCmd::DriveDown,
+                                                );
+                                            }
+                                        }
+                                        crate::power_cap::PowerCapAction::Rf2kDriveDown => {
+                                            if let Some(ref r) = rf2k {
+                                                r.send_command(
+                                                    crate::rf2k::Rf2kCmd::DriveDown,
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
                             // UltraBeam status broadcast
                             if let Some(ref ub_ref) = ultrabeam {
                                 let us = ub_ref.status();
@@ -711,29 +1044,69 @@ impl NetworkService {
                                 };
                                 send_if_changed!(DeviceType::Rotor, pkt, &eq_addrs);
                             }
-                            // DX Cluster spot broadcast
+                            // DX Cluster spot broadcast — dedup + 10 s refresh.
+                            // Per tick: stuur alleen spots waarvan de
+                            // (callsign, freq, mode)-key niet eerder gezien is.
+                            // Elke 10 s en bij client-aantal-wijziging:
+                            // volledige resync zodat age-velden bijgewerkt
+                            // worden en nieuwe clients de cache krijgen.
+                            // Spot-addrs gefilterd op `dx_spots_enabled` —
+                            // clients kunnen de stream opt-out via de
+                            // DxSpotsEnabled control voor metered links.
                             if let Some(ref cluster) = dxcluster {
                                 let spots = cluster.spots_for_bands(last_vfo_freq, last_vfo_b_freq);
-                                let expiry = cluster.expiry_secs() as u16;
-                                let now = std::time::Instant::now();
-                                for spot in &spots {
-                                    let age = now.duration_since(spot.time).as_secs().min(expiry as u64) as u16;
-                                    let pkt = SpotPacket {
-                                        callsign: spot.callsign.clone(),
-                                        frequency_hz: spot.frequency_hz,
-                                        mode: spot.mode.clone(),
-                                        spotter: spot.spotter.clone(),
-                                        comment: spot.comment.clone(),
-                                        age_seconds: age,
-                                        expiry_seconds: expiry,
-                                    };
-                                    let mut buf = Vec::with_capacity(128);
-                                    pkt.serialize(&mut buf);
-                                    for addr in &eq_addrs {
-                                        let _ = socket.try_send_to(&buf, *addr);
+                                let spot_addrs = session.lock().await.dx_spots_addrs();
+                                if !spot_addrs.is_empty() {
+                                    let expiry = cluster.expiry_secs() as u16;
+                                    let now = std::time::Instant::now();
+                                    let do_full_refresh = last_spot_full_refresh.elapsed()
+                                        >= std::time::Duration::from_secs(10)
+                                        || spot_addrs.len() != prev_spot_client_count;
+                                    if do_full_refresh {
+                                        prev_spot_keys.clear();
+                                        last_spot_full_refresh = now;
+                                        prev_spot_client_count = spot_addrs.len();
                                     }
+                                    let current_keys: std::collections::HashSet<(String, u64, String)> =
+                                        spots.iter()
+                                            .map(|s| (s.callsign.clone(), s.frequency_hz, s.mode.clone()))
+                                            .collect();
+                                    // Garbage-collect: verwijder keys die uit
+                                    // de cache zijn verdwenen (geëxpireerd)
+                                    // zodat prev_spot_keys niet onbegrensd groeit.
+                                    prev_spot_keys.retain(|k| current_keys.contains(k));
+                                    for spot in &spots {
+                                        let key = (spot.callsign.clone(), spot.frequency_hz, spot.mode.clone());
+                                        if !prev_spot_keys.insert(key) {
+                                            continue; // al verstuurd in eerdere tick
+                                        }
+                                        let age = now.duration_since(spot.time).as_secs().min(expiry as u64) as u16;
+                                        let pkt = SpotPacket {
+                                            callsign: spot.callsign.clone(),
+                                            frequency_hz: spot.frequency_hz,
+                                            mode: spot.mode.clone(),
+                                            spotter: spot.spotter.clone(),
+                                            comment: spot.comment.clone(),
+                                            age_seconds: age,
+                                            expiry_seconds: expiry,
+                                        };
+                                        let mut buf = Vec::with_capacity(128);
+                                        pkt.serialize(&mut buf);
+                                        for addr in &spot_addrs {
+                                            let _ = socket.try_send_to(&buf, *addr);
+                                        }
+                                    }
+                                } else {
+                                    // Geen abonnerende clients: reset dedup-state
+                                    // zodat een herabonnerende client direct
+                                    // een full sync krijgt.
+                                    prev_spot_keys.clear();
+                                    prev_spot_client_count = 0;
                                 }
-                                // Forward NEW spots to Thetis via TCI SPOT command (only once per spot)
+                                // Forward NEW spots to Thetis via TCI SPOT command (only once per spot).
+                                // Onafhankelijk van TL2-client subscriptions —
+                                // de fork's eigen DX-spot weergave moet altijd
+                                // gevoed worden zolang de DX-cluster aanstaat.
                                 if !spots.is_empty() {
                                     let mut new_spots: Vec<&crate::dxcluster::DxSpot> = Vec::new();
                                     for spot in &spots {
@@ -1626,23 +1999,57 @@ impl NetworkService {
                                 addr, eq_cmd.device_type, eq_cmd.command_id, eq_cmd.data);
                             match eq_cmd.device_type {
                                 DeviceType::Amplitec6x2 => {
-                                    if let Some(ref amp) = self.amplitec {
-                                        match eq_cmd.command_id {
-                                            EquipmentCommandPacket::CMD_SET_SWITCH_A => {
+                                    match eq_cmd.command_id {
+                                        EquipmentCommandPacket::CMD_SET_SWITCH_A => {
+                                            if let Some(ref amp) = self.amplitec {
                                                 if let Some(&pos) = eq_cmd.data.first() {
                                                     info!("Amplitec: requesting Switch A → {}", pos);
                                                     amp.send_command(crate::amplitec::AmplitecCmd::SetSwitchA(pos));
                                                 }
                                             }
-                                            EquipmentCommandPacket::CMD_SET_SWITCH_B => {
+                                        }
+                                        EquipmentCommandPacket::CMD_SET_SWITCH_B => {
+                                            if let Some(ref amp) = self.amplitec {
                                                 if let Some(&pos) = eq_cmd.data.first() {
                                                     info!("Amplitec: requesting Switch B → {}", pos);
                                                     amp.send_command(crate::amplitec::AmplitecCmd::SetSwitchB(pos));
                                                 }
                                             }
-                                            _ => {
-                                                debug!("Unknown amplitec command: 0x{:02X}", eq_cmd.command_id);
+                                        }
+                                        sdr_remote_core::protocol::CMD_AMPLITEC_SET_POWER_TABLE => {
+                                            // 6 × { u16 max_w BE, u8 tx_blocked } = 18 bytes.
+                                            // Hoeft geen amplitec device aanwezig; de tabel
+                                            // is server-config en geldt zodra de Amplitec
+                                            // weer online komt.
+                                            if eq_cmd.data.len() < 18 {
+                                                warn!(
+                                                    "Amplitec power-table command too short: {} bytes",
+                                                    eq_cmd.data.len()
+                                                );
+                                            } else {
+                                                let mut new_max_w = [None::<u16>; 6];
+                                                let mut new_tx_blocked = [false; 6];
+                                                for i in 0..6 {
+                                                    let off = i * 3;
+                                                    let w = u16::from_be_bytes([
+                                                        eq_cmd.data[off],
+                                                        eq_cmd.data[off + 1],
+                                                    ]);
+                                                    new_max_w[i] = if w == 0 { None } else { Some(w) };
+                                                    new_tx_blocked[i] = eq_cmd.data[off + 2] != 0;
+                                                }
+                                                info!(
+                                                    "Amplitec power-table update from {}: max_w={:?} tx_blocked={:?}",
+                                                    addr, new_max_w, new_tx_blocked
+                                                );
+                                                crate::config::modify_config(|cfg| {
+                                                    cfg.amplitec_max_w = new_max_w;
+                                                    cfg.amplitec_tx_blocked = new_tx_blocked;
+                                                });
                                             }
+                                        }
+                                        _ => {
+                                            debug!("Unknown amplitec command: 0x{:02X}", eq_cmd.command_id);
                                         }
                                     }
                                 }
@@ -1891,6 +2298,7 @@ impl NetworkService {
                         | Packet::SmeterRx2Sig(_) | Packet::SmeterRx2MaxBin(_) => {}
                         // Server→client only, ignore if received
                         Packet::Spot(_) | Packet::TxProfiles(_) | Packet::YaesuState(_)
+                        | Packet::AmplitecPowerTable(_)
                         | Packet::AuthChallenge(_) | Packet::AuthResponse(_) | Packet::AuthResult(_)
                         | Packet::TotpChallenge | Packet::TotpResponse(_) => {}
                         Packet::YaesuMemoryData(text) => {
@@ -2093,6 +2501,11 @@ impl NetworkService {
                                     let mask = ctrl.value;
                                     info!("Client {} S-meter sources mask: 0x{:02x}", addr, mask);
                                     self.session.lock().await.set_smeter_sources(addr, mask);
+                                }
+                                ControlId::DxSpotsEnabled => {
+                                    let enabled = ctrl.value != 0;
+                                    info!("Client {} DX spots: {}", addr, if enabled { "ON" } else { "OFF" });
+                                    self.session.lock().await.set_dx_spots_enabled(addr, enabled);
                                 }
                                 ControlId::Rx2SpectrumPan => {
                                     let pan = ctrl.value as f32 / 10000.0 - 0.5;

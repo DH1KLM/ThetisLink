@@ -132,6 +132,17 @@ pub struct RadioState {
     pub buffer_depth: u32,
     pub rx_packets: u64,
     pub loss_percent: u8,
+    /// Inkomende UDP-bandbreedte over het laatste ~500 ms venster (Kbit/s).
+    /// Telt alle ontvangen bytes op de socket; geen breakdown per stream-type.
+    pub down_kbps: u32,
+    /// Uitgaande UDP-bandbreedte over het laatste ~500 ms venster (Kbit/s).
+    /// Telt alle verzonden bytes (audio TX + control + heartbeat).
+    pub up_kbps: u32,
+    /// Per-`PacketType` byte-counter — kbps over het laatste ~5 s window,
+    /// gesorteerd op afnemende waarde. Gevuld door de engine, gelezen
+    /// door de Server-tab UI als expand-detail onder Down. Lege vec =
+    /// geen data nog beschikbaar.
+    pub bw_breakdown: Vec<(u8, u32)>,
 
     // Audio levels
     pub capture_level: f32,
@@ -173,6 +184,9 @@ pub struct RadioState {
     pub thetis_starting: bool,
     pub mon_on: bool,
     pub tx_profile_names: Vec<String>,
+
+    // DX-cluster spot stream — toggle voor metered-link data-saving
+    pub dx_spots_enabled: bool,
 
     // RX2 / VFO-B
     pub rx2_enabled: bool,
@@ -230,6 +244,15 @@ pub struct RadioState {
     pub amplitec_switch_a: u8,  // 0=unknown, 1-6
     pub amplitec_switch_b: u8,
     pub amplitec_labels: String,  // comma-separated: "a1,a2,...,a6,b1,...,b6" (empty = not received)
+    /// Amplitec power-cap table per Amplitec-A positie (index 0 = A-1).
+    /// 0 = geen cap. Server pusht bij connect en bij wijziging.
+    pub amplitec_power_max_w: [u16; 6],
+    /// TX-block per positie. `true` = RX-only.
+    pub amplitec_power_tx_blocked: [bool; 6],
+    /// True zodra de server een AmplitecPowerTable packet heeft gepusht.
+    /// Wordt door de client-UI gebruikt om te wachten met initialiseren
+    /// van de edit-state tot we de echte waardes hebben.
+    pub amplitec_power_loaded: bool,
 
     // JC-4s antenna tuner
     pub tuner_connected: bool,  // Hardware connected
@@ -401,6 +424,9 @@ impl Default for RadioState {
             buffer_depth: 0,
             rx_packets: 0,
             loss_percent: 0,
+            down_kbps: 0,
+            up_kbps: 0,
+            bw_breakdown: Vec::new(),
             capture_level: 0.0,
             playback_level: 0.0,
             playback_level_bin_r: 0.0,
@@ -429,6 +455,7 @@ impl Default for RadioState {
             thetis_starting: false,
             mon_on: false,
             tx_profile_names: Vec::new(),
+            dx_spots_enabled: true,
             rx2_enabled: false,
             vfo_sync: false,
             frequency_rx2_hz: 0,
@@ -473,6 +500,9 @@ impl Default for RadioState {
             amplitec_switch_a: 0,
             amplitec_switch_b: 0,
             amplitec_labels: String::new(),
+            amplitec_power_max_w: [0; 6],
+            amplitec_power_tx_blocked: [false; 6],
+            amplitec_power_loaded: false,
             tuner_connected: false,
             tuner_state: 0,
             tuner_can_tune: false,

@@ -137,6 +137,13 @@ pub struct ServerApp {
     show_rotor_window: bool,
     rotor_window_pos: Option<[f32; 2]>,
     rotor_goto_input: String,
+    // Rotor backend keuze + PstRotator-velden (alternatieve backend
+    // naast EA7HG Visual Rotor).
+    rotor_backend: String,
+    pstrotator_host: String,
+    pstrotator_port: u16,
+    pstrotator_feedback_port: u16,
+    pstrotator_has_elevation: bool,
     // Per-popout "init applied" flags — see mirror impl in
     // sdr-remote-client mod.rs apply_popout_geometry for the rationale.
     // Repeated `with_position()` calls every frame caused the windows to
@@ -291,6 +298,11 @@ impl ServerApp {
             show_rotor_window: config.show_rotor_window,
             rotor_window_pos: config.rotor_window_pos,
             rotor_goto_input: String::new(),
+            rotor_backend: config.rotor_backend,
+            pstrotator_host: config.pstrotator_host,
+            pstrotator_port: config.pstrotator_port,
+            pstrotator_feedback_port: config.pstrotator_feedback_port,
+            pstrotator_has_elevation: config.pstrotator_has_elevation,
             tuner_window_init_applied: false,
             amplitec_window_init_applied: false,
             spe_window_init_applied: false,
@@ -343,6 +355,8 @@ impl ServerApp {
             amplitec_port: if amp_port.is_empty() { None } else { Some(amp_port.clone()) },
             amplitec_enabled: self.amplitec_enabled,
             amplitec_labels: self.amplitec_labels.clone(),
+            amplitec_max_w: crate::config::load().amplitec_max_w,
+            amplitec_tx_blocked: crate::config::load().amplitec_tx_blocked,
             show_amplitec_window: self.show_amplitec_window,
             show_tuner_window: self.show_tuner_window,
             spe_port: if spe_port_str.is_empty() { None } else { Some(spe_port_str.clone()) },
@@ -357,6 +371,11 @@ impl ServerApp {
             rotor_addr: if rotor_addr_str.is_empty() { None } else { Some(rotor_addr_str.clone()) },
             rotor_enabled: self.rotor_enabled,
             show_rotor_window: self.show_rotor_window,
+            rotor_backend: self.rotor_backend.clone(),
+            pstrotator_host: self.pstrotator_host.clone(),
+            pstrotator_port: self.pstrotator_port,
+            pstrotator_feedback_port: self.pstrotator_feedback_port,
+            pstrotator_has_elevation: self.pstrotator_has_elevation,
             tuner_window_pos: self.tuner_window_pos,
             amplitec_window_pos: self.amplitec_window_pos,
             spe_window_pos: self.spe_window_pos,
@@ -507,10 +526,43 @@ impl ServerApp {
             }
         }
 
-        // Create Rotor if configured
-        if !rotor_addr_str.is_empty() && self.rotor_enabled {
-            log::info!("Rotor connecting to {}", rotor_addr_str);
-            self.rotor = Some(Arc::new(crate::rotor::Rotor::new(&rotor_addr_str)));
+        // Create Rotor if configured — backend keuze: EA7HG of PstRotator
+        if self.rotor_enabled {
+            match self.rotor_backend.as_str() {
+                "pstrotator" => {
+                    let host = self.pstrotator_host.trim().to_string();
+                    if host.is_empty() {
+                        log::warn!(
+                            "PstRotator backend selected but host is empty; rotor disabled"
+                        );
+                    } else {
+                        log::info!(
+                            "Rotor (PstRotator) \u{2192} {}:{} (feedback :{}, ele={})",
+                            host,
+                            self.pstrotator_port,
+                            self.pstrotator_feedback_port,
+                            self.pstrotator_has_elevation,
+                        );
+                        let (tx, status) =
+                            crate::pstrotator::spawn(crate::pstrotator::PstRotatorConfig {
+                                host,
+                                port: self.pstrotator_port,
+                                feedback_port: self.pstrotator_feedback_port,
+                                has_elevation: self.pstrotator_has_elevation,
+                            });
+                        self.rotor =
+                            Some(Arc::new(crate::rotor::Rotor::from_handles(tx, status)));
+                    }
+                }
+                _ => {
+                    // EA7HG default (legacy "ea7hg" of leeg)
+                    if !rotor_addr_str.is_empty() {
+                        log::info!("Rotor (EA7HG) connecting to {}", rotor_addr_str);
+                        self.rotor =
+                            Some(Arc::new(crate::rotor::Rotor::new(&rotor_addr_str)));
+                    }
+                }
+            }
         }
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -740,11 +792,72 @@ impl eframe::App for ServerApp {
                     ui.add_space(8.0);
 
                     ui.horizontal(|ui| {
-                        ui.checkbox(&mut self.rotor_enabled, "EA7HG Visual Rotor");
-                        ui.label("adres:");
-                        ui.text_edit_singleline(&mut self.rotor_addr);
+                        ui.checkbox(&mut self.rotor_enabled, "Rotor");
+                        ui.label("backend:");
+                        egui::ComboBox::from_id_salt("rotor_backend_combo")
+                            .selected_text(match self.rotor_backend.as_str() {
+                                "pstrotator" => "PstRotator (XML/UDP)",
+                                _ => "EA7HG Visual Rotor",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.rotor_backend,
+                                    "ea7hg".to_string(),
+                                    "EA7HG Visual Rotor",
+                                );
+                                ui.selectable_value(
+                                    &mut self.rotor_backend,
+                                    "pstrotator".to_string(),
+                                    "PstRotator (XML/UDP)",
+                                );
+                            });
                     });
-                    if !self.rotor_addr.trim().is_empty() {
+                    match self.rotor_backend.as_str() {
+                        "pstrotator" => {
+                            ui.horizontal(|ui| {
+                                ui.label("PstRotator host:");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.pstrotator_host)
+                                        .desired_width(180.0)
+                                        .hint_text("bv. 192.168.1.50"),
+                                );
+                                ui.label("poort:");
+                                ui.add(
+                                    egui::DragValue::new(&mut self.pstrotator_port)
+                                        .range(1u16..=65535)
+                                        .speed(1.0),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Feedback poort (lokaal):");
+                                ui.add(
+                                    egui::DragValue::new(&mut self.pstrotator_feedback_port)
+                                        .range(1u16..=65535)
+                                        .speed(1.0),
+                                );
+                                ui.checkbox(
+                                    &mut self.pstrotator_has_elevation,
+                                    "Heeft elevation",
+                                );
+                            });
+                            ui.label(
+                                egui::RichText::new(
+                                    "PstRotator: in 'Communication \u{2192} UDP Control Port' \
+                                     bovenstaande poort instellen + 'UDP Control' aanvinken. \
+                                     Lokale firewall: inbound UDP feedback-poort toestaan.",
+                                )
+                                .size(10.0)
+                                .color(egui::Color32::from_rgb(160, 160, 160)),
+                            );
+                        }
+                        _ => {
+                            ui.horizontal(|ui| {
+                                ui.label("EA7HG adres:");
+                                ui.text_edit_singleline(&mut self.rotor_addr);
+                            });
+                        }
+                    }
+                    if self.rotor_enabled {
                         ui.checkbox(&mut self.show_rotor_window, "Rotor venster openen bij starten");
                     }
 
@@ -1357,15 +1470,20 @@ impl eframe::App for ServerApp {
             }
         }
 
-        // EA7HG Visual Rotor secondary window
+        // Rotor secondary window. Titel volgt de actieve backend zodat
+        // de owner direct ziet welke driver onder water werkt.
         if matches!(self.mode, Mode::Running) && self.show_rotor_window {
             if let Some(ref rotor_ref) = self.rotor {
                 let status = rotor_ref.status();
                 let rotor_for_window = rotor_ref.clone();
 
                 let rotor_sz = self.rotor_window_size.unwrap_or([340.0, 320.0]);
+                let backend_title = match self.rotor_backend.as_str() {
+                    "pstrotator" => "Rotor — PstRotator",
+                    _ => "Rotor — EA7HG Visual Rotor",
+                };
                 let mut rotor_vb = ViewportBuilder::default()
-                    .with_title("EA7HG Visual Rotor")
+                    .with_title(backend_title)
                     .with_resizable(true);
                 if !self.rotor_window_init_applied {
                     rotor_vb = rotor_vb.with_inner_size(rotor_sz);
@@ -1445,6 +1563,7 @@ impl eframe::App for ServerApp {
                                 ("UltraBeam RCU-06", "Serial"),
                                 ("Amplitec 6/2", "Serial"),
                                 ("EA7HG Visual Rotor", "UDP"),
+                                ("PstRotator (any supported rotor)", "XML over UDP"),
                             ] {
                                 ui.label(dev);
                                 ui.label(RichText::new(iface).color(Color32::GRAY));

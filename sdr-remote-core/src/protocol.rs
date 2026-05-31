@@ -84,6 +84,10 @@ pub enum PacketType {
     SmeterRx2MaxBin = 0x1F,
     /// Yaesu memory data (server → client, tab-separated text)
     YaesuMemoryData = 0x19,
+    /// Amplitec power-cap table (server → client push, client → server update).
+    /// 18-byte payload: 6 × { u16 max_w BE (0 = no cap), u8 tx_blocked (0/1) }.
+    /// Drives the "Power-cap table" section in the client's Amplitec tab.
+    AmplitecPowerTable = 0x20,
     /// Authentication challenge (server → client, 16-byte nonce)
     AuthChallenge = 0x30,
     /// Authentication response (client → server, 32-byte HMAC)
@@ -324,6 +328,10 @@ pub enum ControlId {
     ///   bit 6  = RX2 MaxBin → PacketType::SmeterRx2MaxBin
     /// All other bits reserved.
     SmeterSources = 0x64,
+    /// DX-spot stream opt-out (value 0=off, 1=on). Default ON. Wanneer OFF
+    /// stuurt de server geen `PacketType::Spot`-frames meer naar deze client
+    /// — bandbreedte-besparing op metered links.
+    DxSpotsEnabled = 0x65,
 }
 
 impl ControlId {
@@ -1142,6 +1150,13 @@ impl DeviceType {
 pub const CMD_SERVER_REBOOT: u8 = 0x01;
 pub const CMD_SERVER_SHUTDOWN: u8 = 0x02;
 
+/// Amplitec 6/2 command IDs (client → server via EquipmentCommand).
+/// Switch-positie schakelen heeft geen const — daarvoor zijn
+/// `EquipmentCommandPacket::CMD_SET_SWITCH_A/_B` (pre-existing).
+/// Voor de power-cap tabel: 18 bytes data
+/// (6 × { u16 max_w BE, u8 tx_blocked }).
+pub const CMD_AMPLITEC_SET_POWER_TABLE: u8 = 0x10;
+
 /// Tuner command IDs (client → server via EquipmentCommand)
 pub const CMD_TUNE_START: u8 = 0x01;
 pub const CMD_TUNE_ABORT: u8 = 0x02;
@@ -1279,6 +1294,52 @@ impl EquipmentStatusPacket {
         };
 
         Ok(Self { device_type, switch_a, switch_b, connected, labels })
+    }
+}
+
+/// Amplitec power-cap tabel. Server stuurt de huidige tabel bij
+/// client-connect en bij elke wijziging. Client stuurt dezelfde
+/// struct terug wanneer de operator op "Save" drukt in de Amplitec-tab.
+///
+/// Wire: header(4) + 6 × { u16 max_w BE, u8 tx_blocked } = 22 bytes.
+/// Index 0 = Amplitec-A positie 1, index 5 = positie 6.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmplitecPowerTablePacket {
+    /// Max forward watts per positie. `0` = geen cap (none).
+    pub max_w: [u16; 6],
+    /// TX-block per positie. `true` = RX-only, server staat geen TX toe.
+    pub tx_blocked: [bool; 6],
+}
+
+impl AmplitecPowerTablePacket {
+    pub const SIZE: usize = Header::SIZE + 6 * 3;
+
+    pub fn serialize(&self, buf: &mut [u8; Self::SIZE]) {
+        let header = Header::new(PacketType::AmplitecPowerTable, Flags::NONE);
+        header.serialize(&mut buf[..Header::SIZE]);
+        for i in 0..6 {
+            let off = Header::SIZE + i * 3;
+            buf[off..off + 2].copy_from_slice(&self.max_w[i].to_be_bytes());
+            buf[off + 2] = self.tx_blocked[i] as u8;
+        }
+    }
+
+    pub fn deserialize(buf: &[u8]) -> Result<Self> {
+        if buf.len() < Self::SIZE {
+            bail!("AmplitecPowerTable too short: {} < {}", buf.len(), Self::SIZE);
+        }
+        let header = Header::deserialize(buf)?;
+        if header.packet_type != PacketType::AmplitecPowerTable {
+            bail!("expected AmplitecPowerTable, got {:?}", header.packet_type);
+        }
+        let mut max_w = [0u16; 6];
+        let mut tx_blocked = [false; 6];
+        for i in 0..6 {
+            let off = Header::SIZE + i * 3;
+            max_w[i] = u16::from_be_bytes(buf[off..off + 2].try_into().unwrap());
+            tx_blocked[i] = buf[off + 2] != 0;
+        }
+        Ok(Self { max_w, tx_blocked })
     }
 }
 
@@ -1470,6 +1531,7 @@ pub enum Packet {
     FullSpectrum(SpectrumPacket),
     EquipmentStatus(EquipmentStatusPacket),
     EquipmentCommand(EquipmentCommandPacket),
+    AmplitecPowerTable(AmplitecPowerTablePacket),
     AudioRx2(AudioPacket),
     FrequencyRx2(FrequencyPacket),
     ModeRx2(ModePacket),
@@ -1521,6 +1583,7 @@ impl Packet {
             PacketType::FullSpectrum => Ok(Packet::FullSpectrum(SpectrumPacket::deserialize(buf)?)),
             PacketType::EquipmentStatus => Ok(Packet::EquipmentStatus(EquipmentStatusPacket::deserialize(buf)?)),
             PacketType::EquipmentCommand => Ok(Packet::EquipmentCommand(EquipmentCommandPacket::deserialize(buf)?)),
+            PacketType::AmplitecPowerTable => Ok(Packet::AmplitecPowerTable(AmplitecPowerTablePacket::deserialize(buf)?)),
             PacketType::AudioRx2 => Ok(Packet::AudioRx2(AudioPacket::deserialize(buf)?)),
             PacketType::FrequencyRx2 => Ok(Packet::FrequencyRx2(FrequencyPacket::deserialize(buf)?)),
             PacketType::ModeRx2 => Ok(Packet::ModeRx2(ModePacket::deserialize(buf)?)),

@@ -232,12 +232,21 @@ pub fn render_status_panel(
         )
         .open(Some(current_expanded))
         .show(ui, |ui| {
-            // 7a — per-tuner rows (only when at least one tuner is enabled).
-            if let Some(tuners) = shared.tuners_slot.get() {
-                if !tuners.is_empty() {
-                    for inst in tuners.instances() {
-                        render_tuner_detector_row(ui, inst);
-                    }
+            // 7a — per-tuner rows. We renderen ALTIJD 2 slots (de hardware
+            // ondersteunt maximaal 2 MCP2221A bridges); een nog-niet-
+            // geconfigureerd slot krijgt een lichtere config-row met alleen
+            // de "MCP serial" en "Amplitec pos" dropdowns. Zonder dit kan de
+            // owner bij een schone config de eerste koppeling niet maken
+            // (catch-22: geen mcp_serial → geen running TunerInstance →
+            // geen UI om mcp_serial te kiezen).
+            let active = shared.tuners_slot.get();
+            for slot in 0..2usize {
+                let inst = active.and_then(|t| {
+                    t.instances().iter().find(|i| i.slot_index() == slot)
+                });
+                match inst {
+                    Some(inst) => render_tuner_detector_row(ui, inst),
+                    None => render_tuner_disabled_row(ui, slot),
                 }
             }
             // 7b — board scan: list all MCP2221A devices on the USB bus so
@@ -477,6 +486,141 @@ fn render_tuner_detector_row(
     // interacting. snapshot() rate-limits the actual USB poll to 100 ms so
     // this is cheap.
     ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+}
+
+/// Lichte config-row voor een tuner-slot dat nog niet enabled is. Toont
+/// alleen de MCP-serial en Amplitec-pos dropdowns; de voltage/threshold
+/// sliders zijn weggelaten omdat er geen actieve bridge is om uit te
+/// lezen of te configureren. Zodra de owner een MCP serial selecteert
+/// wordt de tuner enabled gezet en de server geherstart (zelfde
+/// auto-restart pad als de full row).
+fn render_tuner_disabled_row(ui: &mut egui::Ui, slot: usize) {
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("Tuner {}", slot + 1)).strong());
+            ui.colored_label(
+                Color32::from_rgb(160, 160, 160),
+                "Disabled \u{2014} select an MCP serial to enable",
+            );
+        });
+        // MCP serial dropdown — selecteren enabled het slot + auto-restart.
+        ui.horizontal(|ui| {
+            ui.label("MCP serial:");
+            let current_serial: String = crate::config::load()
+                .tuners
+                .get(slot)
+                .map(|c| c.mcp_serial.clone())
+                .unwrap_or_default();
+            let mut chosen = current_serial.clone();
+            let scan_results = cached_scan_serials();
+            egui::ComboBox::from_id_salt(format!("tuner_mcp_serial_disabled_{}", slot))
+                .selected_text(if chosen.is_empty() {
+                    "(select board)".to_string()
+                } else {
+                    chosen.clone()
+                })
+                .show_ui(ui, |ui| {
+                    let mut options: Vec<String> = scan_results
+                        .iter()
+                        .filter(|s| !s.is_empty())
+                        .cloned()
+                        .collect();
+                    if !current_serial.is_empty()
+                        && !options.iter().any(|s| s == &current_serial)
+                    {
+                        options.push(current_serial.clone());
+                    }
+                    options.sort();
+                    options.dedup();
+                    if options.is_empty() {
+                        ui.colored_label(
+                            Color32::from_rgb(180, 180, 180),
+                            "(no boards detected \u{2014} run Scan below)",
+                        );
+                    } else {
+                        for opt in &options {
+                            ui.selectable_value(&mut chosen, opt.clone(), opt);
+                        }
+                    }
+                });
+            if chosen != current_serial && !chosen.is_empty() {
+                let chosen_for_log = chosen.clone();
+                let mut applied = false;
+                crate::config::modify_config(|config| {
+                    if slot < config.tuners.len() {
+                        config.tuners[slot].mcp_serial = chosen.clone();
+                        config.tuners[slot].model = infer_model_from_serial(&chosen);
+                        config.tuners[slot].enabled = true;
+                        applied = true;
+                    }
+                });
+                if applied {
+                    log::info!(
+                        "Tuner {} MCP serial set to \"{}\" \u{2014} auto-restart",
+                        slot + 1,
+                        chosen_for_log,
+                    );
+                    restart_server();
+                }
+            }
+        });
+        // Amplitec pos dropdown — kan al gezet worden vóór het slot enabled
+        // is, maar levert weinig op zonder een actieve tuner; we tonen 'm
+        // toch zodat de owner alles in één veld-sessie kan instellen.
+        ui.horizontal(|ui| {
+            ui.label("Amplitec pos:");
+            let live_config = crate::config::load();
+            let current_pos: Option<u8> = live_config
+                .tuners
+                .get(slot)
+                .and_then(|c| c.amplitec_pos);
+            let labels = live_config.amplitec_labels.clone();
+            let mut chosen: Option<u8> = current_pos;
+            let selected_text = match current_pos {
+                None => "(none)".to_string(),
+                Some(p) if (1..=6).contains(&p) => {
+                    let lbl = &labels[(p - 1) as usize];
+                    if lbl.is_empty() {
+                        format!("{}", p)
+                    } else {
+                        format!("{}: {}", p, lbl)
+                    }
+                }
+                Some(p) => format!("{} (out of range)", p),
+            };
+            egui::ComboBox::from_id_salt(format!("tuner_amplitec_pos_disabled_{}", slot))
+                .selected_text(selected_text)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut chosen, None, "(none)");
+                    for p in 1u8..=6 {
+                        let lbl = &labels[(p - 1) as usize];
+                        let label_text = if lbl.is_empty() {
+                            format!("{}", p)
+                        } else {
+                            format!("{}: {}", p, lbl)
+                        };
+                        ui.selectable_value(&mut chosen, Some(p), label_text);
+                    }
+                });
+            if chosen != current_pos {
+                let mut applied = false;
+                crate::config::modify_config(|config| {
+                    if slot < config.tuners.len() {
+                        config.tuners[slot].amplitec_pos = chosen;
+                        applied = true;
+                    }
+                });
+                if applied {
+                    log::info!(
+                        "Tuner {} amplitec_pos set to {:?} \u{2014} auto-restart",
+                        slot + 1,
+                        chosen,
+                    );
+                    restart_server();
+                }
+            }
+        });
+    });
 }
 
 /// Per-board scratch state for the "Program serial" text input.

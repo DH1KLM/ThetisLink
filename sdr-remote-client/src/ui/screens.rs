@@ -2,6 +2,46 @@
 
 use super::*;
 
+/// Map een `PacketType`-byte naar een leesbare label voor de
+/// Server-tab bandwidth-breakdown. Onbekende types vallen terug op
+/// hex-notatie zodat nieuwe packet-types ook zichtbaar zijn zonder
+/// hier code aan te raken.
+fn packet_type_label(t: u8) -> String {
+    match t {
+        0x01 => "Audio (legacy mono)".into(),
+        0x03 => "HeartbeatAck".into(),
+        0x04 => "Disconnect".into(),
+        0x07 => "Frequency".into(),
+        0x08 => "Mode".into(),
+        0x09 => "S-meter RX1 Avg".into(),
+        0x0A => "Spectrum RX1".into(),
+        0x0B => "Full spectrum RX1".into(),
+        0x0C => "Equipment status".into(),
+        0x0E => "Audio RX2".into(),
+        0x0F => "Frequency RX2".into(),
+        0x10 => "Mode RX2".into(),
+        0x11 => "S-meter RX2 Avg".into(),
+        0x12 => "Spectrum RX2".into(),
+        0x13 => "Full spectrum RX2".into(),
+        0x14 => "DX spot".into(),
+        0x15 => "TX profiles".into(),
+        0x16 => "Audio Yaesu".into(),
+        0x17 => "Yaesu state".into(),
+        0x19 => "Yaesu memory data".into(),
+        0x1A => "Audio BinR (deprecated)".into(),
+        0x1B => "Audio (multi-channel)".into(),
+        0x1C => "S-meter RX1 Sig".into(),
+        0x1D => "S-meter RX1 MaxBin".into(),
+        0x1E => "S-meter RX2 Sig".into(),
+        0x1F => "S-meter RX2 MaxBin".into(),
+        0x20 => "Amplitec power table".into(),
+        0x30 => "Auth challenge".into(),
+        0x32 => "Auth result".into(),
+        0x33 => "TOTP challenge".into(),
+        _ => format!("0x{:02X} unknown", t),
+    }
+}
+
 impl SdrRemoteApp {
     pub(super) fn render_thetis_screen(&mut self, ui: &mut egui::Ui) {
         // Power toggle: click = on/off, long press (2s) = shutdown Thetis (ZZBY)
@@ -259,29 +299,92 @@ impl SdrRemoteApp {
             }
         });
         if !self.catsync.favorites.is_empty() {
+            // Snapshot van de active URL — anders houdt iter_mut() de borrow
+            // op self.catsync vast en kunnen we 'm niet vergelijken in de loop.
+            let active_url = self.catsync.websdr_url.clone();
+            let editing = self.websdr_favorite_editing;
             let mut select_idx = None;
             let mut remove_idx = None;
-            for (i, (label, url)) in self.catsync.favorites.iter().enumerate() {
+            let mut edit_idx: Option<Option<usize>> = None; // outer Option = was set this frame; inner = new editing value
+            let mut label_committed = false;
+            for (i, (label, url)) in self.catsync.favorites.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
-                    let active = *url == self.catsync.websdr_url;
-                    let text = RichText::new(label).size(11.0).color(
-                        if active { Color32::from_rgb(100, 200, 100) } else { Color32::GRAY }
-                    );
-                    if ui.add(egui::Label::new(text).sense(egui::Sense::click())).clicked() {
-                        select_idx = Some(i);
+                    let active = *url == active_url;
+                    let text_color = if active {
+                        Color32::from_rgb(100, 200, 100)
+                    } else {
+                        Color32::GRAY
+                    };
+                    if editing == Some(i) {
+                        // Edit-modus voor deze rij — render TextEdit met focus
+                        // zodat de owner direct kan typen na een Edit-klik.
+                        // Bij Enter of lost_focus committen we de wijziging.
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(label)
+                                .desired_width(180.0)
+                                .font(egui::FontId::proportional(11.0))
+                                .text_color(text_color),
+                        );
+                        if !resp.has_focus() && !resp.gained_focus() {
+                            resp.request_focus();
+                        }
+                        let enter = resp.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if enter || resp.lost_focus() {
+                            edit_idx = Some(None);
+                            label_committed = true;
+                        }
+                    } else {
+                        // Read-only label — klikbaar om te selecteren.
+                        let text = RichText::new(label.as_str())
+                            .size(11.0)
+                            .color(text_color);
+                        if ui
+                            .add(egui::Label::new(text).sense(egui::Sense::click()))
+                            .clicked()
+                        {
+                            select_idx = Some(i);
+                        }
                     }
                     let type_label = if crate::catsync::is_kiwi_url(url) { "kiwi" } else { "wsdr" };
                     ui.label(RichText::new(type_label).size(9.0).color(Color32::DARK_GRAY));
+                    // Edit / Done toggle. In edit-modus toon "Done" zodat de
+                    // gebruiker ziet hoe ze 't veld weer kunnen sluiten zonder
+                    // ergens anders heen te klikken.
+                    let edit_label = if editing == Some(i) { "Done" } else { "Edit" };
+                    if ui
+                        .small_button(edit_label)
+                        .on_hover_text("Rename this favorite")
+                        .clicked()
+                    {
+                        if editing == Some(i) {
+                            edit_idx = Some(None);
+                            label_committed = true;
+                        } else {
+                            edit_idx = Some(Some(i));
+                        }
+                    }
                     if ui.small_button("X").on_hover_text("Remove").clicked() {
                         remove_idx = Some(i);
                     }
                 });
+            }
+            if let Some(new_editing) = edit_idx {
+                self.websdr_favorite_editing = new_editing;
+            }
+            if label_committed {
+                self.save_full_config();
             }
             if let Some(idx) = select_idx {
                 self.catsync.select_favorite(idx);
                 self.save_full_config();
             }
             if let Some(idx) = remove_idx {
+                // Als de gewiste rij in edit-modus stond, edit-state opruimen
+                // anders zou een volgende rij ongewenst editbaar worden.
+                if self.websdr_favorite_editing == Some(idx) {
+                    self.websdr_favorite_editing = None;
+                }
                 self.catsync.remove_favorite(idx);
                 self.save_full_config();
             }
@@ -1667,7 +1770,7 @@ impl SdrRemoteApp {
         // Mic → TX Profile auto-switch mapping
         if !self.tx_profiles.is_empty() && !self.input_devices.is_empty() {
             ui.separator();
-            ui.label("Mic → TX Profile mapping:");
+            ui.label("Mic -> TX Profile mapping:");
             let mut changed = false;
             for dev_name in &self.input_devices {
                 ui.horizontal(|ui| {
@@ -1823,7 +1926,54 @@ impl SdrRemoteApp {
                 ui.label("RX packets:");
                 ui.label(format!("{}", self.rx_packets));
                 ui.end_row();
+
+                // Down (RX) — klikbaar voor per-PacketType breakdown van
+                // de laatste 5 s. Gebruik tekst-prefix i.p.v. Unicode-pijl
+                // (egui's default font kan ↓/↑ niet renderen → tofu-glyph).
+                let arrow = if self.bw_breakdown_expanded { "v" } else { ">" };
+                let label = format!("{} Down (RX):", arrow);
+                if ui.add(egui::Label::new(label).sense(egui::Sense::click())).clicked() {
+                    self.bw_breakdown_expanded = !self.bw_breakdown_expanded;
+                }
+                ui.label(format!("{} Kbit/s", self.down_kbps));
+                ui.end_row();
+
+                ui.label("Up (TX):");
+                ui.label(format!("{} Kbit/s", self.up_kbps));
+                ui.end_row();
             });
+
+        // Per-stream breakdown — alleen tonen wanneer de gebruiker
+        // op "Down" heeft geklikt. Lijst is leeg in de eerste ~5 s
+        // na connect (engine vult 'm bij elke 5 s window-rollover).
+        if self.bw_breakdown_expanded {
+            ui.add_space(2.0);
+            egui::Grid::new("bw_breakdown_grid")
+                .num_columns(2)
+                .spacing([20.0, 2.0])
+                .show(ui, |ui| {
+                    if self.bw_breakdown.is_empty() {
+                        ui.label(egui::RichText::new("  (verzamelen ~5 s ...)").size(11.0).color(egui::Color32::GRAY));
+                        ui.label("");
+                        ui.end_row();
+                    } else {
+                        for (ptype, kbps) in &self.bw_breakdown {
+                            ui.label(egui::RichText::new(format!("  {}", packet_type_label(*ptype))).size(11.0));
+                            ui.label(egui::RichText::new(format!("{} Kbit/s", kbps)).size(11.0));
+                            ui.end_row();
+                        }
+                    }
+                });
+        }
+
+        // Data-saving toggle: zet de DX-cluster spot-stream UIT op metered links.
+        // Bespaart ~6-10 Kbit/s in steady-state. Default ON.
+        ui.add_space(4.0);
+        let mut dx_spots = self.dx_spots_enabled;
+        if ui.checkbox(&mut dx_spots, "DX spots ontvangen").changed() {
+            self.dx_spots_enabled = dx_spots;
+            let _ = self.cmd_tx.send(sdr_remote_logic::commands::Command::SetDxSpotsEnabled(dx_spots));
+        }
 
         // TCI Status
         ui.separator();

@@ -65,6 +65,8 @@ fun AudioStats(
     bufferDepth: Int,
     lossPercent: Int,
     rxPackets: Long,
+    downKbps: Int,
+    upKbps: Int,
 ) {
     Column(modifier = Modifier.fillMaxWidth()) {
         Text("Audio Levels:", fontSize = 14.sp)
@@ -80,6 +82,8 @@ fun AudioStats(
             bufferDepth = bufferDepth,
             lossPercent = lossPercent,
             rxPackets = rxPackets,
+            downKbps = downKbps,
+            upKbps = upKbps,
         )
     }
 }
@@ -174,6 +178,8 @@ private fun StatsGrid(
     bufferDepth: Int,
     lossPercent: Int,
     rxPackets: Long,
+    downKbps: Int,
+    upKbps: Int,
 ) {
     Column(modifier = Modifier.padding(start = 8.dp)) {
         StatRow("RTT", "$rttMs ms")
@@ -181,6 +187,8 @@ private fun StatsGrid(
         StatRow("Buffer", "$bufferDepth frames")
         StatRow("Loss", "$lossPercent%")
         StatRow("RX packets", "$rxPackets")
+        StatRow("↓ Down", "$downKbps Kbit/s")
+        StatRow("↑ Up", "$upKbps Kbit/s")
     }
 }
 

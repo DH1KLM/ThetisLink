@@ -122,6 +122,10 @@ pub enum TciNotification {
     TxFilterBandEx { low: i32, high: i32 },
     TxFrequencyEx { freq: u64, band: String, rx2_enabled: bool, tx_vfob: bool },
     DiversityEnableEx { enabled: bool },
+    /// rx_only_ex echo — Thetis' current "Receive only" state. Used by the
+    /// TL-server to track the live RXOnly so it can snapshot/restore around
+    /// an RX-only Amplitec position.
+    RxOnlyEx { rx_only: bool },
     DiversityRefEx { rx1_ref: bool },
     DiversitySourceEx { source: u32 },
     DiversityGainEx { receiver: u32, gain: u16 },
@@ -736,6 +740,12 @@ pub fn parse_tci_text(cmd: &str) -> Option<TciNotification> {
             if !args.is_empty() {
                 let enabled = args[0].trim() == "true";
                 Some(TciNotification::DiversityEnableEx { enabled })
+            } else { None }
+        }
+        "rx_only_ex" => {
+            if !args.is_empty() {
+                let rx_only = args[0].trim() == "true";
+                Some(TciNotification::RxOnlyEx { rx_only })
             } else { None }
         }
         "diversity_ref_ex" => {

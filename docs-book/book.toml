@@ -1,0 +1,15 @@
+﻿[book]
+title = "ThetisLink Documentatie"
+authors = ["cjenschede"]
+language = "nl"
+
+[preprocessor]
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
+
+[output]
+
+[output.html]
+additional-css = ["custom.css"]
+additional-js = ["mermaid.min.js", "mermaid-init.js"]

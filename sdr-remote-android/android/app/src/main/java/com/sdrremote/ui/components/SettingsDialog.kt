@@ -52,6 +52,8 @@ fun SettingsDialog(
     onTxProfileChange: (Int) -> Unit = {},
     smeterSource: Int = 1,
     onSmeterSourceChange: (Int) -> Unit = {},
+    dxSpotsEnabled: Boolean = true,
+    onDxSpotsEnabledChange: (Boolean) -> Unit = {},
     onReboot: () -> Unit,
     onShutdown: () -> Unit,
     onDismiss: () -> Unit,
@@ -117,6 +119,20 @@ fun SettingsDialog(
                     )
                 }
                 Text("BT page turner or camera remote as PTT", fontSize = 11.sp, color = Color.Gray)
+
+                // DX-cluster spot stream — data-saving toggle voor metered links
+                Spacer(Modifier.height(12.dp))
+                HorizontalDivider()
+                Spacer(Modifier.height(8.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("DX spots:", fontSize = 14.sp)
+                    Spacer(Modifier.weight(1f))
+                    Switch(
+                        checked = dxSpotsEnabled,
+                        onCheckedChange = { onDxSpotsEnabledChange(it) },
+                    )
+                }
+                Text("Ontvang DX-cluster spots (uit = data besparen)", fontSize = 11.sp, color = Color.Gray)
 
                 // Audio routing
                 Spacer(Modifier.height(12.dp))

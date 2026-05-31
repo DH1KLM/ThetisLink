@@ -208,6 +208,10 @@ pub struct SdrRemoteApp {
     jitter_ms: f32,
     buffer_depth: u32,
     rx_packets: u64,
+    down_kbps: u32,
+    up_kbps: u32,
+    bw_breakdown: Vec<(u8, u32)>,
+    bw_breakdown_expanded: bool,
     loss_percent: u8,
     capture_level: f32,
     playback_level: f32,
@@ -325,6 +329,23 @@ pub struct SdrRemoteApp {
     amplitec_switch_b: u8,
     amplitec_labels: String,
     amplitec_log: VecDeque<(String, String)>,  // (timestamp, message)
+    /// Power-cap tabel: actuele waarden van de server (read-only spiegel).
+    amplitec_power_max_w: [u16; 6],
+    amplitec_power_tx_blocked: [bool; 6],
+    amplitec_power_loaded: bool,
+    /// Power-cap edit-state. Wordt geïnitialiseerd uit server-waarden zodra
+    /// `amplitec_power_loaded` true wordt; daarna alleen door de operator
+    /// gewijzigd (DragValue / Checkbox). Save-knop stuurt deze waarden naar
+    /// de server.
+    amplitec_power_edit_max_w: [u16; 6],
+    amplitec_power_edit_tx_blocked: [bool; 6],
+    /// Collapsing-section open/dicht. Persisted in client config.
+    amplitec_power_show: bool,
+    /// Index van de favoriet die nu in inline-edit modus staat (max één
+    /// tegelijk). `None` = alle labels read-only/selectable. Bij verlies
+    /// van focus of Enter wordt deze terug op `None` gezet en de naam
+    /// naar config geschreven.
+    websdr_favorite_editing: Option<usize>,
     // Tuner state
     tuner_connected: bool,
     tuner_state: u8,       // 0=Idle, 1=Tuning, 2=DoneOk, 3=Timeout, 4=Aborted
@@ -501,6 +522,8 @@ pub struct SdrRemoteApp {
     rx2_smooth_display_center_hz: f64, // RX2 smoothed display center
     smooth_alpha: f64,               // shared smoothing alpha for current frame
     last_frame_time: Instant,
+    // DX-cluster spot stream — data-saving toggle (Server-tab)
+    dx_spots_enabled: bool,
     // RX2 / VFO-B
     rx2_enabled: bool,
     rx2_popout: bool,
@@ -811,6 +834,10 @@ impl SdrRemoteApp {
             jitter_ms: 0.0,
             buffer_depth: 0,
             rx_packets: 0,
+            down_kbps: 0,
+            up_kbps: 0,
+            bw_breakdown: Vec::new(),
+            bw_breakdown_expanded: false,
             loss_percent: 0,
             capture_level: 0.0,
             playback_level: 0.0,
@@ -913,6 +940,13 @@ impl SdrRemoteApp {
             amplitec_switch_b: 0,
             amplitec_labels: String::new(),
             amplitec_log: VecDeque::new(),
+            amplitec_power_max_w: [0; 6],
+            amplitec_power_tx_blocked: [false; 6],
+            amplitec_power_loaded: false,
+            amplitec_power_edit_max_w: [0; 6],
+            amplitec_power_edit_tx_blocked: [false; 6],
+            amplitec_power_show: false,
+            websdr_favorite_editing: None,
             tuner_connected: false,
             tuner_state: 0,
             tuner_can_tune: false,
@@ -1083,6 +1117,7 @@ impl SdrRemoteApp {
             rx2_smooth_display_center_hz: 0.0,
             smooth_alpha: 1.0,
             last_frame_time: Instant::now(),
+            dx_spots_enabled: true,
             rx2_enabled: config.rx2_enabled,
             rx2_popout: config.rx2_popout,
             popout_joined: config.popout_joined,
@@ -1641,6 +1676,9 @@ impl SdrRemoteApp {
         self.jitter_ms = state.jitter_ms;
         self.buffer_depth = state.buffer_depth;
         self.rx_packets = state.rx_packets;
+        self.down_kbps = state.down_kbps;
+        self.up_kbps = state.up_kbps;
+        self.bw_breakdown = state.bw_breakdown.clone();
         self.loss_percent = state.loss_percent;
         self.capture_level = state.capture_level;
         self.playback_level = state.playback_level;
@@ -1952,6 +1990,17 @@ impl SdrRemoteApp {
         if !state.amplitec_labels.is_empty() {
             self.amplitec_labels = state.amplitec_labels;
         }
+        // Power-cap tabel: bij eerste push van server initialiseren we
+        // de edit-state. Daarna alleen de read-only spiegel updaten —
+        // de operator's in-progress edits worden niet overschreven.
+        let was_loaded = self.amplitec_power_loaded;
+        self.amplitec_power_max_w = state.amplitec_power_max_w;
+        self.amplitec_power_tx_blocked = state.amplitec_power_tx_blocked;
+        self.amplitec_power_loaded = state.amplitec_power_loaded;
+        if state.amplitec_power_loaded && !was_loaded {
+            self.amplitec_power_edit_max_w = state.amplitec_power_max_w;
+            self.amplitec_power_edit_tx_blocked = state.amplitec_power_tx_blocked;
+        }
         // Log changes
         let now = chrono_time();
         if state.amplitec_connected && !was_connected {
@@ -2141,6 +2190,7 @@ impl SdrRemoteApp {
         self.dx_spots = state.dx_spots.clone();
 
         // RX2 / VFO-B
+        self.dx_spots_enabled = state.dx_spots_enabled;
         self.rx2_enabled = state.rx2_enabled;
         self.vfo_sync = state.vfo_sync;
         self.diversity_enabled = state.diversity_enabled;
@@ -3622,8 +3672,18 @@ impl eframe::App for SdrRemoteApp {
         // Sticky top panel: PTT button + local volume (always visible)
         egui::TopBottomPanel::top("ptt_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
+                // Is de actuele Amplitec-A positie RX-only? De client weet dit
+                // zelf uit de power-cap tabel (switch_a + tx_blocked), dus geen
+                // server-push nodig. Op zo'n positie blokkeren we de PTT-knop
+                // én onderdrukken we spatiebalk/MIDI-PTT (zie new_ptt hieronder).
+                let current_pos_rx_only = (1..=6u8).contains(&self.amplitec_switch_a)
+                    && self.amplitec_power_tx_blocked
+                        [self.amplitec_switch_a.saturating_sub(1) as usize];
+
                 // PTT button (compact for top bar)
-                let (ptt_color, ptt_text, ptt_locked) = if self.other_tx {
+                let (ptt_color, ptt_text, ptt_locked) = if current_pos_rx_only {
+                    (Color32::from_rgb(120, 50, 50), "RX only", true)
+                } else if self.other_tx {
                     (Color32::from_rgb(200, 120, 0), "TX in use", true)
                 } else if self.ptt {
                     (Color32::RED, "TX", false)
@@ -3640,6 +3700,11 @@ impl eframe::App for SdrRemoteApp {
                 let response = ui.push_id("ptt_button", |ui| {
                     ui.add_enabled(!ptt_locked, button)
                 }).inner;
+                if current_pos_rx_only {
+                    response.clone().on_hover_text(
+                        "Active Amplitec antenna is RX-only — transmit is blocked",
+                    );
+                }
 
                 // PTT button: toggle or momentary (push-to-talk) mode
                 if self.ptt_toggle_mode {
@@ -3657,7 +3722,18 @@ impl eframe::App for SdrRemoteApp {
                 }
 
                 let space_held = ui.input(|i| i.key_down(egui::Key::Space));
-                let new_ptt = self.mouse_ptt || space_held || self.midi_ptt;
+                // RX-only Amplitec positie: onderdruk de client-PTT volledig —
+                // ook spatiebalk en MIDI. Reset bovendien de toggle-states
+                // (mouse/MIDI), anders blijft een tijdens RX-only ingedrukte
+                // toggle "aan" hangen en gaat 'ie alsnog zenden zodra we van
+                // de RX-only positie wegschakelen. Spatiebalk is real-time
+                // (key_down) en wordt door de `&&`-conditie afgevangen.
+                if current_pos_rx_only {
+                    self.mouse_ptt = false;
+                    self.midi_ptt = false;
+                }
+                let new_ptt = (self.mouse_ptt || space_held || self.midi_ptt)
+                    && !current_pos_rx_only;
                 if new_ptt != self.ptt {
                     self.midi.send_led(crate::midi::MidiAction::Ptt, new_ptt);
                     self.catsync.update_mute(new_ptt);
@@ -4690,6 +4766,7 @@ impl eframe::App for SdrRemoteApp {
                                 ("UltraBeam RCU-06", "Serial"),
                                 ("Amplitec 6/2", "Serial"),
                                 ("EA7HG Visual Rotor", "UDP"),
+                                ("PstRotator (any supported rotor)", "XML over UDP"),
                             ] {
                                 ui.label(dev);
                                 ui.label(RichText::new(iface).color(Color32::GRAY));

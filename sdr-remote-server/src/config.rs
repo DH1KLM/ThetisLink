@@ -102,6 +102,22 @@ pub struct ServerConfig {
     pub amplitec_enabled: bool,
     /// Labels for Amplitec antenna positions 1-6 (shared by A and B)
     pub amplitec_labels: [String; 6],
+    /// Maximum forward power (W) per Amplitec-A position. `None` = no cap
+    /// (PA drive runs free, identical to pre-v2.0.4 behaviour). When set,
+    /// the power-cap controller sends `SpeCmd::DriveDown` /
+    /// `Rf2kCmd::DriveDown` on the active PA whenever the PA-meter
+    /// reports forward-watts > cap-for-current-mode. Mode multipliers
+    /// (SSB/CW = 1.0, AM = 0.5, FM/DIG = 0.4) are applied uniformly.
+    /// Snapshot is restored via the same number of `DriveUp` commands
+    /// when the Amplitec-A switches to a different position.
+    pub amplitec_max_w: [Option<u16>; 6],
+    /// Per-position TX-blocked flag. When `true`, ANY TX detected while
+    /// the Amplitec-A is on this position is force-cancelled by sending
+    /// `TRX:0,false;` over TCI. Intended for RX-only antennas where any
+    /// RF exposure would damage the front-end. The block is a reactive
+    /// safety-net for Thetis-direct PTT (spacebar) and is independent
+    /// of the power-cap drive-down mechanism.
+    pub amplitec_tx_blocked: [bool; 6],
     /// Show Amplitec control window on start (default true)
     pub show_amplitec_window: bool,
     /// Per-slot StockCorner tuner configuration. Index 0 = tuner 1, index 1 =
@@ -134,6 +150,22 @@ pub struct ServerConfig {
     pub rotor_enabled: bool,
     /// Show Rotor control window on start (default true)
     pub show_rotor_window: bool,
+    /// Welke rotor-backend is actief: `"ea7hg"` (Visual Rotor, default) of
+    /// `"pstrotator"` (XML over UDP naar een externe PstRotator). Leeg of
+    /// onbekend wordt als `"ea7hg"` geïnterpreteerd voor backwards-compat.
+    pub rotor_backend: String,
+    /// PstRotator host — verwacht een numeriek IP-adres (de worker
+    /// parset `host:port` als `SocketAddr` en doet geen DNS-resolutie).
+    /// PstRotator draait vaak op een andere PC in hetzelfde LAN —
+    /// daarom geen hardcoded loopback default.
+    pub pstrotator_host: String,
+    /// PstRotator UDP listener port voor XML-commando's. Default 12000.
+    pub pstrotator_port: u16,
+    /// Lokale UDP poort waarop onze server PstRotator's reply's ontvangt
+    /// (PstRotator stuurt replies naar `port + 1` = standaard 12001).
+    pub pstrotator_feedback_port: u16,
+    /// Polle ook `EL?` voor elevation-rotors. Default `false` (alleen AZ).
+    pub pstrotator_has_elevation: bool,
     /// Saved window positions: [x, y]
     pub tuner_window_pos: Option<[f32; 2]>,
     pub amplitec_window_pos: Option<[f32; 2]>,
@@ -200,6 +232,8 @@ impl Default for ServerConfig {
             amplitec_port: None,
             amplitec_enabled: true,
             amplitec_labels: default_labels("Ant"),
+            amplitec_max_w: [None; 6],
+            amplitec_tx_blocked: [false; 6],
             show_amplitec_window: true,
             tuners: [TunerConfig::default(), TunerConfig::default()],
             show_tuner_window: true,
@@ -215,6 +249,11 @@ impl Default for ServerConfig {
             rotor_addr: None,
             rotor_enabled: true,
             show_rotor_window: true,
+            rotor_backend: "ea7hg".to_string(),
+            pstrotator_host: String::new(),
+            pstrotator_port: 12000,
+            pstrotator_feedback_port: 12001,
+            pstrotator_has_elevation: false,
             tuner_window_pos: None,
             amplitec_window_pos: None,
             spe_window_pos: None,
@@ -374,6 +413,35 @@ fn load_unlocked() -> ServerConfig {
                     "amplitec_window" => {
                         config.show_amplitec_window = value.trim() == "true";
                     }
+                    k if k.starts_with("amplitec_max_w_a") => {
+                        if let Some(idx) = k
+                            .strip_prefix("amplitec_max_w_a")
+                            .and_then(|s| s.parse::<usize>().ok())
+                        {
+                            if (1..=6).contains(&idx) {
+                                let v = value.trim();
+                                // Lege string OF "0" = geen cap (None). Een
+                                // ingestelde 0 W cap is functioneel niet
+                                // bruikbaar (cap-loop zou continu vuren bij
+                                // elke fwd>0) en niet wat de operator bedoelt.
+                                config.amplitec_max_w[idx - 1] = match v.parse::<u16>() {
+                                    Ok(0) => None,
+                                    Ok(n) => Some(n),
+                                    Err(_) => None,
+                                };
+                            }
+                        }
+                    }
+                    k if k.starts_with("amplitec_tx_blocked_a") => {
+                        if let Some(idx) = k
+                            .strip_prefix("amplitec_tx_blocked_a")
+                            .and_then(|s| s.parse::<usize>().ok())
+                        {
+                            if (1..=6).contains(&idx) {
+                                config.amplitec_tx_blocked[idx - 1] = value.trim() == "true";
+                            }
+                        }
+                    }
                     // Legacy v2.0.2 keys silently ignored on load (multi-tuner
                     // runtime supersedes the single serial-port flow):
                     //   `tuner_port`           — COM-port no longer used
@@ -491,6 +559,30 @@ fn load_unlocked() -> ServerConfig {
                     }
                     "rotor_window" => {
                         config.show_rotor_window = value.trim() == "true";
+                    }
+                    "rotor_backend" => {
+                        let v = value.trim().to_lowercase();
+                        config.rotor_backend = if v == "pstrotator" {
+                            "pstrotator".to_string()
+                        } else {
+                            "ea7hg".to_string()
+                        };
+                    }
+                    "pstrotator_host" => {
+                        config.pstrotator_host = value.trim().to_string();
+                    }
+                    "pstrotator_port" => {
+                        if let Ok(v) = value.trim().parse::<u16>() {
+                            if v > 0 { config.pstrotator_port = v; }
+                        }
+                    }
+                    "pstrotator_feedback_port" => {
+                        if let Ok(v) = value.trim().parse::<u16>() {
+                            if v > 0 { config.pstrotator_feedback_port = v; }
+                        }
+                    }
+                    "pstrotator_has_elevation" => {
+                        config.pstrotator_has_elevation = value.trim() == "true";
                     }
                     "rotor_pos_x" => {
                         if let Ok(v) = value.trim().parse::<f32>() {
@@ -730,6 +822,19 @@ fn save_unlocked(config: &ServerConfig) {
         config.rotor_enabled,
         config.show_rotor_window,
     );
+    // Rotor backend keuze + PstRotator-velden. Apart geblokt zodat de
+    // bestaande EA7HG-config-format ongewijzigd blijft bij upgrade.
+    contents.push_str(&format!("rotor_backend={}\n", config.rotor_backend));
+    contents.push_str(&format!("pstrotator_host={}\n", config.pstrotator_host));
+    contents.push_str(&format!("pstrotator_port={}\n", config.pstrotator_port));
+    contents.push_str(&format!(
+        "pstrotator_feedback_port={}\n",
+        config.pstrotator_feedback_port
+    ));
+    contents.push_str(&format!(
+        "pstrotator_has_elevation={}\n",
+        config.pstrotator_has_elevation
+    ));
     // Per-tuner slots — tuner1_* / tuner2_* keys keep the file readable by hand.
     for (i, t) in config.tuners.iter().enumerate() {
         let prefix = format!("tuner{}", i + 1);
@@ -746,6 +851,20 @@ fn save_unlocked(config: &ServerConfig) {
     }
     for i in 0..6 {
         contents.push_str(&format!("amplitec_label{}={}\n", i + 1, config.amplitec_labels[i]));
+    }
+    for i in 0..6 {
+        contents.push_str(&format!(
+            "amplitec_max_w_a{}={}\n",
+            i + 1,
+            config.amplitec_max_w[i].map(|w| w.to_string()).unwrap_or_default()
+        ));
+    }
+    for i in 0..6 {
+        contents.push_str(&format!(
+            "amplitec_tx_blocked_a{}={}\n",
+            i + 1,
+            config.amplitec_tx_blocked[i]
+        ));
     }
     if let Some(pos) = config.tuner_window_pos {
         contents.push_str(&format!("tuner_pos_x={}\ntuner_pos_y={}\n", pos[0], pos[1]));

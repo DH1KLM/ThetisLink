@@ -441,6 +441,21 @@ impl TciConnection {
         }
     }
 
+    /// Set Thetis' "Receive only" flag via the fork's `rx_only_ex` command —
+    /// a preventive transmit-inhibit (MOX/spacebar/hardware-PTT/VOX all refused
+    /// at the source, not reactively flipped back). Only sent when the fork
+    /// advertises the capability; returns `true` if it was sent (extensions
+    /// available), `false` if not (caller falls back to reactive ZZTX0).
+    pub async fn set_rx_only(&mut self, rx_only: bool) -> bool {
+        if self.has_cap("rx_only_ex") {
+            let cmd = format!("rx_only_ex:{};", rx_only);
+            self.send(&cmd).await;
+            true
+        } else {
+            false
+        }
+    }
+
     pub async fn set_diversity_ref(&mut self, rx1_ref: bool) {
         if self.has_cap("diversity_ref_ex") {
             let cmd = format!("diversity_ref_ex:{};", rx1_ref);

@@ -28,6 +28,10 @@ pub enum Command {
     SetSpectrumFftSize(u16),  // FFT size in K (32, 65, 131, 262)
     SetAmplitecSwitchA(u8),  // 1-6
     SetAmplitecSwitchB(u8),  // 1-6
+    /// Set the Amplitec power-cap table. `max_w[i]` = 0 means "no cap"
+    /// for position i+1. `tx_blocked[i]` = true means RX-only (server
+    /// refuses all server-initiated TX paths on that position).
+    SetAmplitecPowerTable { max_w: [u16; 6], tx_blocked: [bool; 6] },
     TunerTune,
     TunerAbort,
     SpeOperate,
@@ -88,6 +92,8 @@ pub enum Command {
     ThetisTune(bool),
     // TX Monitor
     SetMonitor(bool),
+    // DX-cluster spot stream opt-out (data-saving voor metered links)
+    SetDxSpotsEnabled(bool),
     // RX2 / VFO-B
     SetRx2Enabled(bool),
     SetVfoSync(bool),

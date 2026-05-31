@@ -278,6 +278,32 @@ impl ClientEngine {
         let mut current_loss_percent: u8 = 0;
         let mut smoothed_loss: f32 = 0.0;
 
+        // Bandbreedte-monitor (down/up Kbit/s) over een rolling ~500 ms venster.
+        // RX-bytes worden bij elke recv_from() opgeteld; TX-bytes via de
+        // `send_tx!`-macro die elke send_to-call-site omhult. Bij elke
+        // window-rollover wordt de kbps berekend en in `state.down_kbps`/
+        // `up_kbps` geschreven — weergegeven in de Server-tab Statistics-grid.
+        let mut bw_window_start = Instant::now();
+        let mut bw_rx_bytes: u64 = 0;
+        let mut bw_tx_bytes: u64 = 0;
+        // Per-PacketType byte-counter voor de RX-stream — geïndexeerd op
+        // de `packet_type` byte (data[2]). Elke 5 s wordt een top-5
+        // overzicht naar info! gelogd zodat de owner kan zien welke
+        // stream het meeste verbruikt (zonder UI-uitbreiding).
+        let mut bw_by_type: [u64; 256] = [0; 256];
+        let mut bw_breakdown_start = Instant::now();
+        // Lokale macro: wraps socket.send_to(buf, addr).await en telt buf-bytes
+        // bij bw_tx_bytes. Vervangt de 80+ inline call-sites in deze functie
+        // zonder per-site instrumentatie. Identifiers `socket` en `bw_tx_bytes`
+        // worden bij invocation in de huidige scope geresolveerd.
+        macro_rules! send_tx {
+            ($buf:expr, $addr:expr) => {{
+                let __buf: &[u8] = $buf;
+                bw_tx_bytes = bw_tx_bytes.wrapping_add(__buf.len() as u64);
+                socket.send_to(__buf, $addr).await
+            }};
+        }
+
         // Track last audio packet arrival for robust timeout detection
         let mut last_audio_received: Option<Instant> = None;
 
@@ -344,7 +370,7 @@ impl ClientEngine {
                             if let Some(ref old_addr) = server_addr {
                                 let mut buf = [0u8; DisconnectPacket::SIZE];
                                 DisconnectPacket::serialize(&mut buf);
-                                let _ = socket.send_to(&buf, old_addr.as_str()).await;
+                                let _ = send_tx!(&buf, old_addr.as_str());
                                 // Brief settle delay so the server processes the
                                 // disconnect before the new heartbeat arrives.
                                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -431,7 +457,7 @@ impl ClientEngine {
                             header.serialize(&mut buf[..4]);
                             buf[4..6].copy_from_slice(&(code_bytes.len() as u16).to_be_bytes());
                             buf[6..].copy_from_slice(code_bytes);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                             info!("TOTP code sent");
                         }
                     }
@@ -440,7 +466,7 @@ impl ClientEngine {
                         if let Some(ref addr) = server_addr {
                             let mut buf = [0u8; DisconnectPacket::SIZE];
                             DisconnectPacket::serialize(&mut buf);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                             info!("Disconnect (ring={}, jbuf={}, jitter={:.1}ms, rtt={}ms, loss={}%)",
                                 audio.playback_buffer_level(), jitter_buf.depth(),
                                 jitter_buf.jitter_ms(), last_hb_ack_rtt, current_loss_percent);
@@ -461,6 +487,9 @@ impl ClientEngine {
                         state.jitter_ms = 0.0;
                         state.buffer_depth = 0;
                         state.rx_packets = 0;
+                        state.down_kbps = 0;
+                        state.up_kbps = 0;
+                        state.bw_breakdown.clear();
                         state.ptt_denied = false;
                         // Clear stale spectrum data to prevent artifacts on reconnect
                         state.spectrum_bins.clear();
@@ -492,7 +521,7 @@ impl ClientEngine {
                                     };
                                     let mut buf = [0u8; ControlPacket::SIZE];
                                     ctrl.serialize(&mut buf);
-                                    let _ = socket.send_to(&buf, addr.as_str()).await;
+                                    let _ = send_tx!(&buf, addr.as_str());
                                     last_sent_bin = Some(bin_val);
                                 }
                             }
@@ -523,7 +552,7 @@ impl ClientEngine {
                             let pkt = ModePacket { mode };
                             let mut buf = [0u8; ModePacket::SIZE];
                             pkt.serialize(&mut buf);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                         }
                         state.mode = mode;
                     }
@@ -532,7 +561,7 @@ impl ClientEngine {
                             let ctrl = ControlPacket { control_id: id, value };
                             let mut buf = [0u8; ControlPacket::SIZE];
                             ctrl.serialize(&mut buf);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                         }
                         // Track RX2 FFT size locally for reconnect
                         if id == ControlId::Rx2SpectrumFftSize {
@@ -643,7 +672,7 @@ impl ClientEngine {
                                 };
                                 let mut buf = [0u8; ControlPacket::SIZE];
                                 ctrl.serialize(&mut buf);
-                                let _ = socket.send_to(&buf, addr.as_str()).await;
+                                let _ = send_tx!(&buf, addr.as_str());
                             }
                         }
                     }
@@ -657,7 +686,7 @@ impl ClientEngine {
                                 };
                                 let mut buf = [0u8; ControlPacket::SIZE];
                                 ctrl.serialize(&mut buf);
-                                let _ = socket.send_to(&buf, addr.as_str()).await;
+                                let _ = send_tx!(&buf, addr.as_str());
                             }
                         }
                     }
@@ -671,7 +700,7 @@ impl ClientEngine {
                                 };
                                 let mut buf = [0u8; ControlPacket::SIZE];
                                 ctrl.serialize(&mut buf);
-                                let _ = socket.send_to(&buf, addr.as_str()).await;
+                                let _ = send_tx!(&buf, addr.as_str());
                             }
                         }
                     }
@@ -685,7 +714,7 @@ impl ClientEngine {
                                 };
                                 let mut buf = [0u8; ControlPacket::SIZE];
                                 ctrl.serialize(&mut buf);
-                                let _ = socket.send_to(&buf, addr.as_str()).await;
+                                let _ = send_tx!(&buf, addr.as_str());
                             }
                         }
                     }
@@ -699,7 +728,7 @@ impl ClientEngine {
                                 };
                                 let mut buf = [0u8; ControlPacket::SIZE];
                                 ctrl.serialize(&mut buf);
-                                let _ = socket.send_to(&buf, addr.as_str()).await;
+                                let _ = send_tx!(&buf, addr.as_str());
                             }
                         }
                     }
@@ -713,7 +742,7 @@ impl ClientEngine {
                                 };
                                 let mut buf = [0u8; ControlPacket::SIZE];
                                 ctrl.serialize(&mut buf);
-                                let _ = socket.send_to(&buf, addr.as_str()).await;
+                                let _ = send_tx!(&buf, addr.as_str());
                             }
                         }
                     }
@@ -726,7 +755,7 @@ impl ClientEngine {
                             };
                             let mut buf = Vec::with_capacity(8);
                             pkt.serialize(&mut buf);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                         }
                     }
                     Command::SetAmplitecSwitchB(pos) => {
@@ -738,7 +767,24 @@ impl ClientEngine {
                             };
                             let mut buf = Vec::with_capacity(8);
                             pkt.serialize(&mut buf);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
+                        }
+                    }
+                    Command::SetAmplitecPowerTable { max_w, tx_blocked } => {
+                        if let Some(ref addr) = server_addr {
+                            let mut data = Vec::with_capacity(18);
+                            for i in 0..6 {
+                                data.extend_from_slice(&max_w[i].to_be_bytes());
+                                data.push(tx_blocked[i] as u8);
+                            }
+                            let pkt = EquipmentCommandPacket {
+                                device_type: DeviceType::Amplitec6x2,
+                                command_id: sdr_remote_core::protocol::CMD_AMPLITEC_SET_POWER_TABLE,
+                                data,
+                            };
+                            let mut buf = Vec::with_capacity(EquipmentCommandPacket::MIN_SIZE + 18);
+                            pkt.serialize(&mut buf);
+                            let _ = send_tx!(&buf, addr.as_str());
                         }
                     }
                     Command::TunerTune => {
@@ -750,7 +796,7 @@ impl ClientEngine {
                             };
                             let mut buf = Vec::with_capacity(8);
                             pkt.serialize(&mut buf);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                         }
                     }
                     Command::TunerAbort => {
@@ -762,7 +808,7 @@ impl ClientEngine {
                             };
                             let mut buf = Vec::with_capacity(8);
                             pkt.serialize(&mut buf);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                         }
                     }
                     Command::SpeOperate | Command::SpeTune | Command::SpeAntenna
@@ -791,7 +837,7 @@ impl ClientEngine {
                             };
                             let mut buf = Vec::with_capacity(8);
                             pkt.serialize(&mut buf);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                         }
                     }
                     Command::Rf2kOperate(on) => {
@@ -803,7 +849,7 @@ impl ClientEngine {
                             };
                             let mut buf = Vec::with_capacity(8);
                             pkt.serialize(&mut buf);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                         }
                     }
                     Command::Rf2kTunerMode(mode) => {
@@ -815,7 +861,7 @@ impl ClientEngine {
                             };
                             let mut buf = Vec::with_capacity(8);
                             pkt.serialize(&mut buf);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                         }
                     }
                     Command::Rf2kTunerBypass(on) => {
@@ -827,7 +873,7 @@ impl ClientEngine {
                             };
                             let mut buf = Vec::with_capacity(8);
                             pkt.serialize(&mut buf);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                         }
                     }
                     Command::Rf2kTune | Command::Rf2kAnt1 | Command::Rf2kAnt2
@@ -877,7 +923,7 @@ impl ClientEngine {
                             };
                             let mut buf = Vec::with_capacity(8);
                             pkt.serialize(&mut buf);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                         }
                     }
                     Command::Rf2kSetHighPower(on) => {
@@ -889,7 +935,7 @@ impl ClientEngine {
                             };
                             let mut buf = Vec::with_capacity(8);
                             pkt.serialize(&mut buf);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                         }
                     }
                     Command::Rf2kSetTuner6m(on) => {
@@ -901,7 +947,7 @@ impl ClientEngine {
                             };
                             let mut buf = Vec::with_capacity(8);
                             pkt.serialize(&mut buf);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                         }
                     }
                     Command::Rf2kSetBandGap(on) => {
@@ -913,7 +959,7 @@ impl ClientEngine {
                             };
                             let mut buf = Vec::with_capacity(8);
                             pkt.serialize(&mut buf);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                         }
                     }
                     Command::Rf2kSetDriveConfig { category, band, value } => {
@@ -930,7 +976,7 @@ impl ClientEngine {
                             };
                             let mut buf = Vec::with_capacity(10);
                             pkt.serialize(&mut buf);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                         }
                     }
                     Command::UbRetract => {
@@ -942,7 +988,7 @@ impl ClientEngine {
                             };
                             let mut buf = Vec::with_capacity(8);
                             pkt.serialize(&mut buf);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                         }
                     }
                     Command::UbSetFrequency(khz, direction) => {
@@ -954,7 +1000,7 @@ impl ClientEngine {
                             };
                             let mut buf = Vec::with_capacity(10);
                             pkt.serialize(&mut buf);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                         }
                     }
                     Command::UbReadElements => {
@@ -966,7 +1012,7 @@ impl ClientEngine {
                             };
                             let mut buf = Vec::with_capacity(8);
                             pkt.serialize(&mut buf);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                         }
                     }
                     Command::UbModifyElement(index, length_mm) => {
@@ -978,7 +1024,7 @@ impl ClientEngine {
                             };
                             let mut buf = Vec::with_capacity(10);
                             pkt.serialize(&mut buf);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                         }
                     }
                     Command::RotorGoTo(angle) => {
@@ -990,7 +1036,7 @@ impl ClientEngine {
                             };
                             let mut buf = Vec::with_capacity(10);
                             pkt.serialize(&mut buf);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                         }
                     }
                     Command::RotorStop => {
@@ -1002,7 +1048,7 @@ impl ClientEngine {
                             };
                             let mut buf = Vec::with_capacity(8);
                             pkt.serialize(&mut buf);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                         }
                     }
                     Command::RotorCw => {
@@ -1014,7 +1060,7 @@ impl ClientEngine {
                             };
                             let mut buf = Vec::with_capacity(8);
                             pkt.serialize(&mut buf);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                         }
                     }
                     Command::RotorCcw => {
@@ -1026,7 +1072,7 @@ impl ClientEngine {
                             };
                             let mut buf = Vec::with_capacity(8);
                             pkt.serialize(&mut buf);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                         }
                     }
                     Command::ServerReboot => {
@@ -1038,7 +1084,7 @@ impl ClientEngine {
                             };
                             let mut buf = Vec::with_capacity(8);
                             pkt.serialize(&mut buf);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                             info!("Server reboot request sent");
                         }
                     }
@@ -1051,7 +1097,7 @@ impl ClientEngine {
                             };
                             let mut buf = Vec::with_capacity(8);
                             pkt.serialize(&mut buf);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                             info!("Server shutdown request sent");
                         }
                     }
@@ -1070,7 +1116,7 @@ impl ClientEngine {
                             let ctrl = ControlPacket { control_id: ControlId::SmeterSources, value: mask };
                             let mut buf = [0u8; ControlPacket::SIZE];
                             ctrl.serialize(&mut buf);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                         }
                     }
                     Command::StartRecording { rx1, rx2, yaesu, path } => {
@@ -1141,6 +1187,21 @@ impl ClientEngine {
                         state.playing = false;
                         info!("Playback stopped");
                     }
+                    Command::SetDxSpotsEnabled(enabled) => {
+                        state.dx_spots_enabled = enabled;
+                        if let Some(ref addr) = server_addr {
+                            let ctrl = ControlPacket { control_id: ControlId::DxSpotsEnabled, value: enabled as u16 };
+                            let mut buf = [0u8; ControlPacket::SIZE];
+                            ctrl.serialize(&mut buf);
+                            let _ = send_tx!(&buf, addr.as_str());
+                            info!("DX spots enable sent: {}", enabled);
+                        }
+                        if !enabled {
+                            // Lokale UI-cache wissen zodat oude spots niet
+                            // blijven hangen na opt-out.
+                            state.dx_spots.clear();
+                        }
+                    }
                     // RX2 / VFO-B commands
                     Command::SetRx2Enabled(enabled) => {
                         state.rx2_enabled = enabled;
@@ -1148,7 +1209,7 @@ impl ClientEngine {
                             let ctrl = ControlPacket { control_id: ControlId::Rx2Enable, value: enabled as u16 };
                             let mut buf = [0u8; ControlPacket::SIZE];
                             ctrl.serialize(&mut buf);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                             info!("RX2 enable sent: {}", enabled);
                         }
                     }
@@ -1167,7 +1228,7 @@ impl ClientEngine {
                             let pkt = FrequencyPacket { frequency_hz: hz };
                             let mut buf = [0u8; FrequencyPacket::SIZE];
                             pkt.serialize_as_type(&mut buf, PacketType::FrequencyYaesu);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                         }
                     }
                     Command::SetYaesuMenu(menu_num, p2_value) => {
@@ -1184,7 +1245,7 @@ impl ClientEngine {
                             send_buf.extend_from_slice(&hdr_buf);
                             send_buf.extend_from_slice(&(text_bytes.len() as u16).to_be_bytes());
                             send_buf.extend_from_slice(text_bytes);
-                            let _ = socket.send_to(&send_buf, addr.as_str()).await;
+                            let _ = send_tx!(&send_buf, addr.as_str());
                         }
                     }
                     Command::WriteYaesuMemories(tab_text) => {
@@ -1200,13 +1261,13 @@ impl ClientEngine {
                             send_buf.extend_from_slice(&hdr_buf);
                             send_buf.extend_from_slice(&(text_bytes.len() as u16).to_be_bytes());
                             send_buf.extend_from_slice(text_bytes);
-                            let _ = socket.send_to(&send_buf, addr.as_str()).await;
+                            let _ = send_tx!(&send_buf, addr.as_str());
                             // Then trigger the write
                             let ctrl = ControlPacket {
                                 control_id: ControlId::YaesuWriteMemories, value: 0 };
                             let mut buf = [0u8; ControlPacket::SIZE];
                             ctrl.serialize(&mut buf);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                         }
                     }
                     Command::SetYaesuMode(mode) => {
@@ -1214,7 +1275,7 @@ impl ClientEngine {
                             let ctrl = ControlPacket { control_id: ControlId::YaesuMode, value: mode as u16 };
                             let mut buf = [0u8; ControlPacket::SIZE];
                             ctrl.serialize(&mut buf);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                         }
                     }
                     Command::SetYaesuPtt(on) => {
@@ -1230,7 +1291,7 @@ impl ClientEngine {
                             let ctrl = ControlPacket { control_id: ControlId::YaesuPtt, value: on as u16 };
                             let mut buf = [0u8; ControlPacket::SIZE];
                             ctrl.serialize(&mut buf);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                         }
                     }
                     Command::SetYaesuTxGain(v) => {
@@ -1243,7 +1304,7 @@ impl ClientEngine {
                             let ctrl = ControlPacket { control_id: ControlId::MonitorOn, value: on as u16 };
                             let mut buf = [0u8; ControlPacket::SIZE];
                             ctrl.serialize(&mut buf);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                         }
                     }
                     Command::ThetisTune(on) => {
@@ -1251,7 +1312,7 @@ impl ClientEngine {
                             let ctrl = ControlPacket { control_id: ControlId::ThetisTune, value: on as u16 };
                             let mut buf = [0u8; ControlPacket::SIZE];
                             ctrl.serialize(&mut buf);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                         }
                     }
                     Command::CwKey { pressed, duration_ms } => {
@@ -1260,7 +1321,7 @@ impl ClientEngine {
                             let ctrl = ControlPacket { control_id: ControlId::CwKey, value };
                             let mut buf = [0u8; ControlPacket::SIZE];
                             ctrl.serialize(&mut buf);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                         }
                     }
                     Command::CwMacroStop => {
@@ -1268,7 +1329,7 @@ impl ClientEngine {
                             let ctrl = ControlPacket { control_id: ControlId::CwMacroStop, value: 0 };
                             let mut buf = [0u8; ControlPacket::SIZE];
                             ctrl.serialize(&mut buf);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                         }
                     }
                     Command::SetVfoSync(enabled) => {
@@ -1277,7 +1338,7 @@ impl ClientEngine {
                             let ctrl = ControlPacket { control_id: ControlId::VfoSync, value: enabled as u16 };
                             let mut buf = [0u8; ControlPacket::SIZE];
                             ctrl.serialize(&mut buf);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                         }
                     }
                     Command::SetFrequencyRx2(hz) => {
@@ -1288,7 +1349,7 @@ impl ClientEngine {
                             let pkt = ModePacket { mode };
                             let mut buf = [0u8; ModePacket::SIZE];
                             pkt.serialize_as_type(&mut buf, PacketType::ModeRx2);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                         }
                         state.mode_rx2 = mode;
                     }
@@ -1304,7 +1365,7 @@ impl ClientEngine {
                             let ctrl = ControlPacket { control_id: ControlId::Rx2SpectrumEnable, value: enabled as u16 };
                             let mut buf = [0u8; ControlPacket::SIZE];
                             ctrl.serialize(&mut buf);
-                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                            let _ = send_tx!(&buf, addr.as_str());
                             info!("RX2 spectrum enable sent: {}", enabled);
                         }
                     }
@@ -1314,7 +1375,7 @@ impl ClientEngine {
                                 let ctrl = ControlPacket { control_id: ControlId::Rx2SpectrumFps, value: fps as u16 };
                                 let mut buf = [0u8; ControlPacket::SIZE];
                                 ctrl.serialize(&mut buf);
-                                let _ = socket.send_to(&buf, addr.as_str()).await;
+                                let _ = send_tx!(&buf, addr.as_str());
                             }
                         }
                     }
@@ -1325,7 +1386,7 @@ impl ClientEngine {
                                 let ctrl = ControlPacket { control_id: ControlId::Rx2SpectrumZoom, value: (zoom * 10.0) as u16 };
                                 let mut buf = [0u8; ControlPacket::SIZE];
                                 ctrl.serialize(&mut buf);
-                                let _ = socket.send_to(&buf, addr.as_str()).await;
+                                let _ = send_tx!(&buf, addr.as_str());
                             }
                         }
                     }
@@ -1336,7 +1397,7 @@ impl ClientEngine {
                                 let ctrl = ControlPacket { control_id: ControlId::Rx2SpectrumPan, value: ((pan + 0.5) * 10000.0) as u16 };
                                 let mut buf = [0u8; ControlPacket::SIZE];
                                 ctrl.serialize(&mut buf);
-                                let _ = socket.send_to(&buf, addr.as_str()).await;
+                                let _ = send_tx!(&buf, addr.as_str());
                             }
                         }
                     }
@@ -1350,7 +1411,7 @@ impl ClientEngine {
                         let pkt = FrequencyPacket { frequency_hz: hz };
                         let mut buf = [0u8; FrequencyPacket::SIZE];
                         pkt.serialize(&mut buf);
-                        let _ = socket.send_to(&buf, addr.as_str()).await;
+                        let _ = send_tx!(&buf, addr.as_str());
                     }
                     state.frequency_hz = hz;
                     pending_freq = Some(hz);
@@ -1363,7 +1424,7 @@ impl ClientEngine {
                         let pkt = FrequencyPacket { frequency_hz: hz };
                         let mut buf = [0u8; FrequencyPacket::SIZE];
                         pkt.serialize_as_type(&mut buf, PacketType::FrequencyRx2);
-                        let _ = socket.send_to(&buf, addr.as_str()).await;
+                        let _ = send_tx!(&buf, addr.as_str());
                     }
                     state.frequency_rx2_hz = hz;
                     pending_freq_rx2 = Some(hz);
@@ -1388,6 +1449,9 @@ impl ClientEngine {
                 state.jitter_ms = 0.0;
                 state.buffer_depth = 0;
                 state.rx_packets = 0;
+                state.down_kbps = 0;
+                state.up_kbps = 0;
+                state.bw_breakdown.clear();
                 // Clear stale spectrum data to prevent artifacts on reconnect
                 state.spectrum_bins.clear();
                 state.full_spectrum_bins.clear();
@@ -1410,6 +1474,10 @@ impl ClientEngine {
                             continue;
                         }
                     };
+                    bw_rx_bytes += len as u64;
+                    if len >= 3 {
+                        bw_by_type[recv_buf[2] as usize] = bw_by_type[recv_buf[2] as usize].wrapping_add(len as u64);
+                    }
                     let data = &recv_buf[..len];
 
                     match Packet::deserialize(data) {
@@ -1543,14 +1611,14 @@ impl ClientEngine {
                                             value: 1,
                                         };
                                         ctrl.serialize(&mut buf);
-                                        let _ = socket.send_to(&buf, addr.as_str()).await;
+                                        let _ = send_tx!(&buf, addr.as_str());
 
                                         let fps_ctrl = ControlPacket {
                                             control_id: ControlId::SpectrumFps,
                                             value: spectrum_fps as u16,
                                         };
                                         fps_ctrl.serialize(&mut buf);
-                                        let _ = socket.send_to(&buf, addr.as_str()).await;
+                                        let _ = send_tx!(&buf, addr.as_str());
 
                                         // Re-send zoom and pan so server generates correct view
                                         let zoom_ctrl = ControlPacket {
@@ -1558,21 +1626,21 @@ impl ClientEngine {
                                             value: (spectrum_zoom * 10.0) as u16,
                                         };
                                         zoom_ctrl.serialize(&mut buf);
-                                        let _ = socket.send_to(&buf, addr.as_str()).await;
+                                        let _ = send_tx!(&buf, addr.as_str());
 
                                         let pan_ctrl = ControlPacket {
                                             control_id: ControlId::SpectrumPan,
                                             value: ((spectrum_pan + 0.5) * 10000.0) as u16,
                                         };
                                         pan_ctrl.serialize(&mut buf);
-                                        let _ = socket.send_to(&buf, addr.as_str()).await;
+                                        let _ = send_tx!(&buf, addr.as_str());
 
                                         let bins_ctrl = ControlPacket {
                                             control_id: ControlId::SpectrumMaxBins,
                                             value: spectrum_max_bins,
                                         };
                                         bins_ctrl.serialize(&mut buf);
-                                        let _ = socket.send_to(&buf, addr.as_str()).await;
+                                        let _ = send_tx!(&buf, addr.as_str());
 
                                         if spectrum_fft_size_k != 0 {
                                             let fft_ctrl = ControlPacket {
@@ -1580,7 +1648,7 @@ impl ClientEngine {
                                                 value: spectrum_fft_size_k,
                                             };
                                             fft_ctrl.serialize(&mut buf);
-                                            let _ = socket.send_to(&buf, addr.as_str()).await;
+                                            let _ = send_tx!(&buf, addr.as_str());
                                         }
                                     }
 
@@ -1589,28 +1657,28 @@ impl ClientEngine {
                                         let mut rx2_buf = [0u8; ControlPacket::SIZE];
                                         let ctrl = ControlPacket { control_id: ControlId::Rx2Enable, value: 1 };
                                         ctrl.serialize(&mut rx2_buf);
-                                        let _ = socket.send_to(&rx2_buf, addr.as_str()).await;
+                                        let _ = send_tx!(&rx2_buf, addr.as_str());
 
                                         let ctrl = ControlPacket { control_id: ControlId::Rx2SpectrumEnable, value: 1 };
                                         ctrl.serialize(&mut rx2_buf);
-                                        let _ = socket.send_to(&rx2_buf, addr.as_str()).await;
+                                        let _ = send_tx!(&rx2_buf, addr.as_str());
 
                                         let bins_ctrl = ControlPacket { control_id: ControlId::Rx2SpectrumMaxBins, value: spectrum_max_bins };
                                         bins_ctrl.serialize(&mut rx2_buf);
-                                        let _ = socket.send_to(&rx2_buf, addr.as_str()).await;
+                                        let _ = send_tx!(&rx2_buf, addr.as_str());
 
                                         let zoom_ctrl = ControlPacket { control_id: ControlId::Rx2SpectrumZoom, value: (rx2_spectrum_zoom * 10.0) as u16 };
                                         zoom_ctrl.serialize(&mut rx2_buf);
-                                        let _ = socket.send_to(&rx2_buf, addr.as_str()).await;
+                                        let _ = send_tx!(&rx2_buf, addr.as_str());
 
                                         let pan_ctrl = ControlPacket { control_id: ControlId::Rx2SpectrumPan, value: ((rx2_spectrum_pan + 0.5) * 10000.0) as u16 };
                                         pan_ctrl.serialize(&mut rx2_buf);
-                                        let _ = socket.send_to(&rx2_buf, addr.as_str()).await;
+                                        let _ = send_tx!(&rx2_buf, addr.as_str());
 
                                         if rx2_spectrum_fft_size_k != 0 {
                                             let fft_ctrl = ControlPacket { control_id: ControlId::Rx2SpectrumFftSize, value: rx2_spectrum_fft_size_k };
                                             fft_ctrl.serialize(&mut rx2_buf);
-                                            let _ = socket.send_to(&rx2_buf, addr.as_str()).await;
+                                            let _ = send_tx!(&rx2_buf, addr.as_str());
                                         }
                                         info!("RX2 state re-sent on reconnect");
                                     }
@@ -1618,7 +1686,7 @@ impl ClientEngine {
                                     let ctrl = ControlPacket { control_id: ControlId::AudioMode, value: audio_mode };
                                     let mut am_buf = [0u8; ControlPacket::SIZE];
                                     ctrl.serialize(&mut am_buf);
-                                    let _ = socket.send_to(&am_buf, addr.as_str()).await;
+                                    let _ = send_tx!(&am_buf, addr.as_str());
                                     // Re-send S-meter source subscription. Server's per-client
                                     // session resets to default 0x22 (Avg-only) on every new
                                     // ClientSession insert, so we must restore the user's choice
@@ -1632,7 +1700,18 @@ impl ClientEngine {
                                     let ctrl = ControlPacket { control_id: ControlId::SmeterSources, value: mask };
                                     let mut sm_buf = [0u8; ControlPacket::SIZE];
                                     ctrl.serialize(&mut sm_buf);
-                                    let _ = socket.send_to(&sm_buf, addr.as_str()).await;
+                                    let _ = send_tx!(&sm_buf, addr.as_str());
+                                    // Re-send DX-spots opt-out — server's ClientSession resets
+                                    // to default ON on every new insert, dus zonder dit pad
+                                    // zou de client visueel OFF tonen terwijl de server na
+                                    // reconnect weer Spot-frames stuurt.
+                                    let ctrl = ControlPacket {
+                                        control_id: ControlId::DxSpotsEnabled,
+                                        value: state.dx_spots_enabled as u16,
+                                    };
+                                    let mut dx_buf = [0u8; ControlPacket::SIZE];
+                                    ctrl.serialize(&mut dx_buf);
+                                    let _ = send_tx!(&dx_buf, addr.as_str());
                                 }
                                 state.connected = true;
                                 was_connected = true;
@@ -1869,6 +1948,7 @@ impl ClientEngine {
                                 ControlId::MonitorVolume => state.mon_volume = ctrl.value as i16 as i8,
                                 ControlId::ThetisSwr => state.thetis_swr_x100 = ctrl.value,
                                 ControlId::VfoSync => state.vfo_sync = ctrl.value != 0,
+                                ControlId::DxSpotsEnabled => state.dx_spots_enabled = ctrl.value != 0,
                                 ControlId::Rx2SpectrumEnable | ControlId::Rx2SpectrumFps
                                 | ControlId::Rx2SpectrumZoom | ControlId::Rx2SpectrumPan
                                 | ControlId::Rx2SpectrumMaxBins
@@ -1897,7 +1977,7 @@ impl ClientEngine {
                                     if let Some(ref addr) = server_addr {
                                         let mut buf = [0u8; ControlPacket::SIZE];
                                         ctrl.serialize(&mut buf);
-                                        let _ = socket.send_to(&buf, addr.as_str()).await;
+                                        let _ = send_tx!(&buf, addr.as_str());
                                     }
                                 }
                                 ControlId::DiversityRef => state.diversity_ref = ctrl.value as u8,
@@ -2098,6 +2178,11 @@ impl ClientEngine {
                             }
                         }
                         Ok(Packet::EquipmentCommand(_)) => {} // client-only packet, ignore from server
+                        Ok(Packet::AmplitecPowerTable(table)) => {
+                            state.amplitec_power_max_w = table.max_w;
+                            state.amplitec_power_tx_blocked = table.tx_blocked;
+                            state.amplitec_power_loaded = true;
+                        }
                         Ok(Packet::Spot(spot_pkt)) => {
                             let now = std::time::Instant::now();
                             // Update existing spot or add new one
@@ -2187,7 +2272,7 @@ impl ClientEngine {
                                 header.serialize(&mut hdr);
                                 buf[..4].copy_from_slice(&hdr);
                                 buf[4..36].copy_from_slice(&hmac);
-                                let _ = socket.send_to(&buf, addr.as_str()).await;
+                                let _ = send_tx!(&buf, addr.as_str());
                                 info!("Auth response sent");
                             } else {
                                 warn!("Auth challenge received but no password configured");
@@ -2721,7 +2806,7 @@ impl ClientEngine {
                         };
                         let mut buf = [0u8; ControlPacket::SIZE];
                         ctrl.serialize(&mut buf);
-                        let _ = socket.send_to(&buf, addr.as_str()).await;
+                        let _ = send_tx!(&buf, addr.as_str());
                         last_sent_volume = af_gain;
                     }
 
@@ -2737,7 +2822,7 @@ impl ClientEngine {
                         };
                         let mut buf = [0u8; ControlPacket::SIZE];
                         ctrl.serialize(&mut buf);
-                        let _ = socket.send_to(&buf, addr.as_str()).await;
+                        let _ = send_tx!(&buf, addr.as_str());
                         last_sent_rx2_volume = rx2_af_gain;
                         rx2_volume_user_changed = false;
                     }
@@ -2768,6 +2853,34 @@ impl ClientEngine {
                         loss_window_received = 0;
                         loss_window_max_seq = None;
 
+                        // Bandbreedte-window flush — synchroon met de heartbeat-
+                        // tick (~500 ms). bytes × 8 / venster_ms = bits/ms = kbps.
+                        let win_ms = bw_window_start.elapsed().as_millis().max(1) as u64;
+                        state.down_kbps = (bw_rx_bytes.saturating_mul(8) / win_ms) as u32;
+                        state.up_kbps = (bw_tx_bytes.saturating_mul(8) / win_ms) as u32;
+                        bw_rx_bytes = 0;
+                        bw_tx_bytes = 0;
+                        bw_window_start = Instant::now();
+
+                        // Per-PacketType breakdown elke 5 s — gepublishd naar
+                        // `state.bw_breakdown` zodat de Server-tab in de UI
+                        // een uitklap-detail kan tonen zonder logspam.
+                        if bw_breakdown_start.elapsed() >= Duration::from_secs(5) {
+                            let win_s = bw_breakdown_start.elapsed().as_secs_f64().max(0.001);
+                            let mut by_type: Vec<(u8, u32)> = bw_by_type.iter().enumerate()
+                                .filter(|(_, &b)| b > 0)
+                                .map(|(t, &b)| {
+                                    let kbps = ((b as f64 * 8.0) / (win_s * 1000.0)) as u32;
+                                    (t as u8, kbps)
+                                })
+                                .filter(|(_, kbps)| *kbps > 0)
+                                .collect();
+                            by_type.sort_by(|a, b| b.1.cmp(&a.1));
+                            state.bw_breakdown = by_type;
+                            bw_by_type = [0; 256];
+                            bw_breakdown_start = Instant::now();
+                        }
+
                         let hb = Heartbeat {
                             flags: Flags::NONE.with_ptt(thetis_ptt),
                             sequence: hb_sequence,
@@ -2781,7 +2894,7 @@ impl ClientEngine {
 
                         let mut buf = [0u8; Heartbeat::SIZE];
                         hb.serialize(&mut buf);
-                        let _ = socket.send_to(&buf, addr.as_str()).await;
+                        let _ = send_tx!(&buf, addr.as_str());
                         last_hb_sent = Instant::now();
 
                         // PATCH-1 review finding (B1, part 4): NoUdpResponse
@@ -2874,7 +2987,7 @@ impl ClientEngine {
                                         tx_sequence = tx_sequence.wrapping_add(1);
                                         let mut buf = Vec::with_capacity(MAX_PACKET_SIZE);
                                         pkt.serialize(&mut buf);
-                                        let _ = socket.send_to(&buf, addr.as_str()).await;
+                                        let _ = send_tx!(&buf, addr.as_str());
                                     }
                                     Err(e) => warn!("WAV TX encode error: {}", e),
                                 }
@@ -2943,7 +3056,7 @@ impl ClientEngine {
 
                                     let mut buf = Vec::with_capacity(MAX_PACKET_SIZE);
                                     pkt.serialize(&mut buf);
-                                    let _ = socket.send_to(&buf, addr.as_str()).await;
+                                    let _ = send_tx!(&buf, addr.as_str());
 
                                     if !logged_first_tx {
                                         info!("TX: first audio packet sent to {} (seq={}, accum_remain={})",
@@ -2953,7 +3066,7 @@ impl ClientEngine {
 
                                     if ptt_burst_remaining > 0 {
                                         ptt_burst_remaining -= 1;
-                                        let _ = socket.send_to(&buf, addr.as_str()).await;
+                                        let _ = send_tx!(&buf, addr.as_str());
                                     }
                                     sent_any = true;
                                 }
@@ -2985,7 +3098,7 @@ impl ClientEngine {
 
                         let mut buf = Vec::with_capacity(64);
                         pkt.serialize(&mut buf);
-                        let _ = socket.send_to(&buf, addr.as_str()).await;
+                        let _ = send_tx!(&buf, addr.as_str());
                     }
 
                     // === Yaesu TX: completely separate mic audio path ===
@@ -3024,7 +3137,7 @@ impl ClientEngine {
                                         yaesu_tx_sequence = yaesu_tx_sequence.wrapping_add(1);
                                         let mut buf = Vec::with_capacity(256);
                                         pkt.serialize_as_type(&mut buf, PacketType::AudioYaesu);
-                                        let _ = socket.send_to(&buf, addr.as_str()).await;
+                                        let _ = send_tx!(&buf, addr.as_str());
                                     }
                                 }
                             }
@@ -3041,7 +3154,7 @@ impl ClientEngine {
                     if let Some(ref addr) = server_addr {
                         let mut buf = [0u8; DisconnectPacket::SIZE];
                         DisconnectPacket::serialize(&mut buf);
-                        let _ = socket.send_to(&buf, addr.as_str()).await;
+                        let _ = send_tx!(&buf, addr.as_str());
                         info!("Sent disconnect to server");
                     }
                     break;

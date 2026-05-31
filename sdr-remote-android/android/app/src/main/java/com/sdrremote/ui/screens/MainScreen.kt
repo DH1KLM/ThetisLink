@@ -500,6 +500,8 @@ fun MainScreen(viewModel: SdrViewModel = viewModel()) {
                 }
                 viewModel.setControl(0x64, mask)
             },
+            dxSpotsEnabled = state.dxSpotsEnabled,
+            onDxSpotsEnabledChange = { viewModel.setDxSpotsEnabled(it) },
             onReboot = { viewModel.serverReboot() },
             onShutdown = { viewModel.serverShutdown() },
             onDismiss = { showSettings = false },
@@ -1028,6 +1030,8 @@ fun MainScreen(viewModel: SdrViewModel = viewModel()) {
                         bufferDepth = state.bufferDepth,
                         lossPercent = state.lossPercent,
                         rxPackets = state.rxPackets,
+                        downKbps = state.downKbps,
+                        upKbps = state.upKbps,
                     )
                 }
 

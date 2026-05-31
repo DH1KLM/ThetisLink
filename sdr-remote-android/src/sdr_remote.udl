@@ -23,6 +23,9 @@ dictionary BridgeRadioState {
     u32 buffer_depth;
     u64 rx_packets;
     u8 loss_percent;
+    u32 down_kbps;
+    u32 up_kbps;
+    boolean dx_spots_enabled;
     f32 capture_level;
     f32 playback_level;
     u64 frequency_hz;
@@ -160,6 +163,7 @@ interface SdrBridge {
     void disconnect();
     void set_language(string lang);
     void set_ptt(boolean active);
+    void set_dx_spots_enabled(boolean enabled);
     void set_rx_volume(f32 volume);
     void set_local_volume(f32 volume);
     void set_tx_gain(f32 gain);

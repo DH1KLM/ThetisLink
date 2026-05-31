@@ -3,6 +3,8 @@
 #![allow(dead_code)]
 
 use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use futures_util::{SinkExt, StreamExt};
@@ -186,6 +188,10 @@ pub struct TciConnection {
     pub tx_filter_low_hz: i32,
     pub tx_filter_high_hz: i32,
     pub diversity_enabled: bool,
+    /// Last-known Thetis "Receive only" (RXOnly) state, tracked via the
+    /// `rx_only_ex` echo. The TL-server snapshots this before taking over
+    /// (RX-only Amplitec position) and restores it on release.
+    pub rx_only: bool,
     pub diversity_ref: u8,
     pub diversity_source: u8,
     pub diversity_gain_rx1: u16,
@@ -235,12 +241,26 @@ pub struct TciConnection {
     /// kunnen starten tijdens TX. Deze flag mirrort het TRX-event zodat de
     /// trigger-eval kan kiezen `tx_active OR thetis_tx_active`.
     pub thetis_tx_active: bool,
+    /// Gedeelde "huidige Amplitec-A positie is RX-only" flag (clone van de
+    /// flag in `PttController::tx_blocked`). Wordt door de broadcast-loop in
+    /// `network.rs` geüpdate; gebruikt in de TRX-notification handler om
+    /// Thetis-direct PTT (spatiebalk, hardware-PTT) onmiddellijk te stoppen
+    /// — daar pakken de server-initiated PTT-paden niet bij (die hebben hun
+    /// eigen preventieve gate). Default: dummy Arc die altijd `false` is.
+    tx_blocked: Arc<AtomicBool>,
 }
 
 /// Parsed TCI notifications from the reader task
 // TciNotification enum defined in tci_parser.rs (imported via `use crate::tci_parser::*`)
 
 impl TciConnection {
+    /// Injecteer de gedeelde TX-blocked flag van `PttController`. Wordt
+    /// gebruikt in de TRX-notification handler om Thetis-direct PTT op
+    /// een RX-only positie onmiddellijk te annuleren.
+    pub fn set_tx_blocked_handle(&mut self, flag: Arc<AtomicBool>) {
+        self.tx_blocked = flag;
+    }
+
     pub fn new(addr: Option<&str>) -> Self {
         // Cold-boot defensiveness: on Windows, Instant::now() reflects QPC ticks
         // since system boot. If the server starts within ~60s of cold-boot, the
@@ -358,6 +378,7 @@ impl TciConnection {
             ddc_sample_rate_rx2: 0,
             ddc_sample_rates: Vec::new(),
             diversity_enabled: false,
+            rx_only: false,
             diversity_ref: 0,
             diversity_source: 0,
             diversity_gain_rx1: 1000,
@@ -375,6 +396,7 @@ impl TciConnection {
             effective_zoom_rx1_cache: None,
             effective_zoom_rx2_cache: None,
             thetis_tx_active: false,
+            tx_blocked: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -811,8 +833,23 @@ impl TciConnection {
                 }
             }
             TciNotification::Trx { receiver: _, active } => {
-                // Note: we don't update tx_active here — PTT controller manages that
-                // But we log it for debugging.
+                // RX-only Amplitec gate: server-initiated PTT-paden zijn al
+                // preventief afgesloten in `PttController`, maar Thetis-eigen
+                // PTT (spatiebalk, footswitch, hardware-PTT op de radio)
+                // bereikt Thetis zonder dat de server het ziet aankomen. Hier
+                // pakken we de incoming TRX-notif en sturen direct
+                // `TRX:0,false;` terug — sub-100 ms reactietijd vergeleken
+                // met de ~200 ms broadcast-tick check.
+                let blocked = self.tx_blocked.load(Ordering::Relaxed);
+                debug!("TCI TRX recv: active={} tx_blocked={}", active, blocked);
+                if active && blocked {
+                    warn!("Thetis-direct TX detected on RX-only Amplitec position; forcing TRX off");
+                    self.send("TRX:0,false;").await;
+                    // Niet self.thetis_tx_active updaten — Thetis stuurt
+                    // direct hierna een TRX:0,false; notif waar deze handler
+                    // alsnog op reageert.
+                    return;
+                }
                 // TL2-1 ctun-auto-recenter: mirror TRX-state in separate
                 // `thetis_tx_active` so external-PTT (Thetis-self, footswitch,
                 // VOX, etc.) ook ctun-recenter defer veroorzaakt.
@@ -1199,6 +1236,17 @@ impl TciConnection {
                 self.diversity_enabled = enabled;
                 info!("TCI: Diversity = {}", enabled);
             }
+            TciNotification::RxOnlyEx { rx_only } => {
+                // Dedup: TL2-3 fork pushes on every transition AND the SET-handler
+                // still echoes inline (handleRxOnlyEx, TCIServer.cs ~2867), so the
+                // TL-server can see two notifies for the same value on a SET. Log
+                // only when the value actually changes; the broadcast vs handler-
+                // echo race remains harmless because both carry identical state.
+                if self.rx_only != rx_only {
+                    self.rx_only = rx_only;
+                    info!("TCI: RXOnly = {}", rx_only);
+                }
+            }
             TciNotification::DiversityRefEx { rx1_ref } => {
                 self.diversity_ref = if rx1_ref { 0 } else { 1 };
                 info!("TCI: Diversity ref = RX{}", if rx1_ref { 1 } else { 2 });
@@ -1358,6 +1406,11 @@ impl TciConnection {
         }
         if self.has_cap("diversity_gain_multi_ex") {
             self.send("diversity_gain_multi_ex;").await;
+        }
+        // Read Thetis' current RXOnly state so the TL-server knows the
+        // pre-takeover value before it ever sets RX-only for an antenna.
+        if self.has_cap("rx_only_ex") {
+            self.send("rx_only_ex;").await;
         }
 
         info!("TCI: init commands sent (audio 48kHz float32, {} batches with {}ms delay)",

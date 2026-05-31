@@ -11,6 +11,7 @@ mod ctun_recenter;
 mod dxcluster;
 mod macros;
 mod network;
+mod power_cap;
 mod ptt;
 mod rf2k;
 mod session;
@@ -23,6 +24,7 @@ mod tuner;
 mod yaesu;
 mod ultrabeam;
 mod rotor;
+mod pstrotator;
 mod ui;
 
 use std::collections::VecDeque;
@@ -337,6 +339,8 @@ fn main() -> Result<()> {
             yaesu_audio_device: defaults.yaesu_audio_device,
             amplitec_port: amplitec_port.or(defaults.amplitec_port),
             amplitec_labels: defaults.amplitec_labels,
+            amplitec_max_w: defaults.amplitec_max_w,
+            amplitec_tx_blocked: defaults.amplitec_tx_blocked,
             show_amplitec_window: false, // no GUI in CLI mode
             show_tuner_window: false, // no GUI in CLI mode
             spe_port: spe_port.or(defaults.spe_port),
@@ -347,6 +351,11 @@ fn main() -> Result<()> {
             show_ultrabeam_window: false, // no GUI in CLI mode
             rotor_addr: defaults.rotor_addr,
             show_rotor_window: false, // no GUI in CLI mode
+            rotor_backend: defaults.rotor_backend,
+            pstrotator_host: defaults.pstrotator_host,
+            pstrotator_port: defaults.pstrotator_port,
+            pstrotator_feedback_port: defaults.pstrotator_feedback_port,
+            pstrotator_has_elevation: defaults.pstrotator_has_elevation,
             tuner_window_pos: None,
             amplitec_window_pos: None,
             spe_window_pos: None,
@@ -679,13 +688,44 @@ pub async fn run_server_async(
         None
     };
 
-    // EA7HG Visual Rotor — use prebuilt (from GUI) or create here (CLI mode)
+    // Rotor — use prebuilt (from GUI) or create here (CLI mode).
+    // Backend keuze: EA7HG Visual Rotor (default) of PstRotator XML/UDP.
     let rotor_inst = if rotor_prebuilt.is_some() {
         rotor_prebuilt
-    } else if config.rotor_enabled && config.rotor_addr.is_some() {
-        let addr = config.rotor_addr.as_ref().unwrap();
-        info!("Rotor connecting to {}", addr);
-        Some(Arc::new(rotor::Rotor::new(addr)))
+    } else if config.rotor_enabled {
+        match config.rotor_backend.as_str() {
+            "pstrotator" => {
+                if config.pstrotator_host.is_empty() {
+                    log::warn!(
+                        "PstRotator backend selected but host is empty; rotor disabled"
+                    );
+                    None
+                } else {
+                    info!(
+                        "Rotor (PstRotator) → {}:{} (feedback :{}, ele={})",
+                        config.pstrotator_host,
+                        config.pstrotator_port,
+                        config.pstrotator_feedback_port,
+                        config.pstrotator_has_elevation,
+                    );
+                    let (tx, status) = pstrotator::spawn(pstrotator::PstRotatorConfig {
+                        host: config.pstrotator_host.clone(),
+                        port: config.pstrotator_port,
+                        feedback_port: config.pstrotator_feedback_port,
+                        has_elevation: config.pstrotator_has_elevation,
+                    });
+                    Some(Arc::new(rotor::Rotor::from_handles(tx, status)))
+                }
+            }
+            _ => {
+                if let Some(addr) = config.rotor_addr.as_ref() {
+                    info!("Rotor (EA7HG) connecting to {}", addr);
+                    Some(Arc::new(rotor::Rotor::new(addr)))
+                } else {
+                    None
+                }
+            }
+        }
     } else {
         None
     };

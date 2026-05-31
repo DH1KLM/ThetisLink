@@ -2,7 +2,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use log::{error, info, warn};
 
@@ -165,6 +165,16 @@ pub struct PttController {
     thetis_path: Option<String>,
     pending_power_on: bool,
     thetis_launch_time: Option<Instant>,
+    /// Hard TX-gate. `true` = de huidige Amplitec-A positie is in
+    /// `config.amplitec_tx_blocked` als RX-only gemarkeerd; alle
+    /// server-initiated TX-paden weigeren in dat geval een TX-commando
+    /// naar Thetis te sturen. Updated vanuit de broadcast-loop in
+    /// `network.rs` op elke positie-status iteratie (en direct bij
+    /// positie-wissel via `update_tx_blocked()`).
+    tx_blocked: Arc<AtomicBool>,
+    /// Throttle voor de WARN-log wanneer een PTT-request wordt
+    /// geweigerd — anders krijgt iedere audio-frame (50/sec) een log.
+    last_blocked_log: Option<Instant>,
     // --- Latency metrics ---
     ptt_prefill_start: Option<Instant>,
     ptt_release_start: Option<Instant>,
@@ -175,7 +185,7 @@ pub struct PttController {
 impl PttController {
     /// Create PTT controller (TL2 v2: TCI-only).
     pub fn new_tci(tci_addr: Option<&str>, thetis_path: Option<String>) -> Self {
-        Self {
+        let mut ctl = Self {
             state: PttState::Rx,
             last_ptt_packet: None,
             last_heartbeat: None,
@@ -187,11 +197,29 @@ impl PttController {
             thetis_path,
             pending_power_on: false,
             thetis_launch_time: None,
+            tx_blocked: Arc::new(AtomicBool::new(false)),
+            last_blocked_log: None,
             ptt_prefill_start: None,
             ptt_release_start: None,
             ptt_prefill_latencies: Vec::new(),
             ptt_tail_latencies: Vec::new(),
-        }
+        };
+        // Share dezelfde tx_blocked Arc met de TCI-connection, zodat de
+        // tci-notification handler óók Thetis-direct PTT kan blokkeren.
+        // (Zonder dit: server-initiated paden zijn dicht, maar spatiebalk
+        // op Thetis-PC wordt pas via de 200 ms broadcast catch-all
+        // afgevangen — te laat voor RX-amp bescherming.)
+        let blocked_clone = ctl.tx_blocked.clone();
+        ctl.tci.set_tx_blocked_handle(blocked_clone);
+        ctl
+    }
+
+    /// Handle naar de TX-blocked flag. Gebruikt door `network.rs` om
+    /// vanuit de broadcast-loop de actuele Amplitec-status door te
+    /// pushen. Lock-vrije atomic; alle TX-paden in `PttController`
+    /// lezen 'm uit op de hot-path.
+    pub fn tx_blocked_handle(&self) -> Arc<AtomicBool> {
+        self.tx_blocked.clone()
     }
 
     fn prefill_ms(&self) -> u64 {
@@ -213,6 +241,23 @@ impl PttController {
     }
 
     pub fn activate_from_playout(&mut self) {
+        // Hard gate: bij een RX-only Amplitec-positie mag er onder
+        // geen enkele omstandigheid een TX-commando naar Thetis gaan.
+        // Drop de PTT-request volledig (geen prefill, geen TRX:0,true;)
+        // en log throttled (max 1× per 2 sec) zodat de audio-frame
+        // stream (50/sec) geen log-spam veroorzaakt.
+        if self.tx_blocked.load(Ordering::Relaxed) {
+            let should_log = self
+                .last_blocked_log
+                .map(|t| t.elapsed() >= Duration::from_secs(2))
+                .unwrap_or(true);
+            if should_log {
+                warn!("PTT request blocked: current Amplitec position is RX-only");
+                self.last_blocked_log = Some(Instant::now());
+            }
+            return;
+        }
+        self.last_blocked_log = None;
         if self.pending_release.take().is_some() {
             info!("PTT re-keyed during tail delay, release cancelled");
         }
@@ -328,6 +373,22 @@ impl PttController {
     }
 
     async fn set_state(&mut self, new_state: PttState) {
+        // Hard gate: laatste defensieve check vóór TRX:0,true,tci de
+        // tci-link op gaat. `activate_from_playout` blokkeert al
+        // preventief, maar een toekomstige direct-naar-Tx caller komt
+        // hier ook door. Bij blocked: blijf op Rx en stuur niets.
+        if new_state == PttState::Tx && self.tx_blocked.load(Ordering::Relaxed) {
+            warn!("set_state(Tx) blocked: current Amplitec position is RX-only");
+            // Zorg dat we Rx zijn (was vermoedelijk al, want
+            // activate_from_playout zou ons hebben tegengehouden).
+            if self.state == PttState::Tx {
+                self.state = PttState::Rx;
+                self.ptt_active.store(false, Ordering::Relaxed);
+                self.tci.set_tx_active(false);
+                self.tci.send("TRX:0,false;").await;
+            }
+            return;
+        }
         let old = self.state;
         self.state = new_state;
         let is_tx = new_state == PttState::Tx;
@@ -395,13 +456,46 @@ impl PttController {
     // --- Delegated accessors ---
 
     pub async fn send_cat(&mut self, cmd: &str) {
-        // ZZ* commands need TCI translation via cat_to_tci; alles anders gaat as-is.
+        // Hard gate voor TX-startende CAT-commando's wanneer de actuele
+        // Amplitec-A positie als RX-only is gemarkeerd. ZZTX1 schakelt
+        // direct de zender, ZZTU1 start de tune-carrier — beide gaan
+        // niet naar Thetis. ZZTX0/ZZTU0 (uitschakelen) blijven uiteraard
+        // wel werken zodat we een lopende TX kunnen afsluiten.
+        let trimmed = cmd.trim_end_matches(';');
+        if (trimmed.eq_ignore_ascii_case("ZZTX1") || trimmed.eq_ignore_ascii_case("ZZTU1"))
+            && self.tx_blocked.load(Ordering::Relaxed)
+        {
+            warn!("CAT {} blocked: current Amplitec position is RX-only", trimmed);
+            return;
+        }
+        // ZZ* commando's hebben drie niveaus van bediening:
+        //   1. Native TCI mapping via `cat_to_tci` (snelste pad voor de
+        //      meest-gebruikte ZZ-commando's zoals ZZFA/ZZMD/ZZTX).
+        //   2. TCI `run_cat_ex:ZZxxx;` passthrough — Thetis voert het ZZ
+        //      commando uit op zijn eigen interne CAT-parser zonder dat
+        //      we een aparte CAT-verbinding nodig hebben. Werkt voor elk
+        //      ZZ-commando dat Thetis kent (ZZPC, ZZCN, ZZCO, ZZFI, …).
+        //   3. Vroeger ook: auxiliary CAT TCP-socket. Vanaf v2.0.0 is dat
+        //      pad verwijderd (TCI-only architectuur), dus niveau 3 is
+        //      een no-op.
+        //
+        // Voorheen werd niveau 2 alleen direct vanuit specifieke call
+        // sites (CTUN-recenter, filter-preset polls) gebruikt, en hier
+        // werden onbekende ZZ-commando's gedropt met een WARN. Dat
+        // maakte features die ZZ-commando's zonder `cat_to_tci`-mapping
+        // gebruiken stilzwijgend no-op. Nu vallen onbekende ZZ-cmds
+        // terug op `tci.run_cat()` zodat álle ZZ-commando's via dezelfde
+        // single-TCI link hun pad vinden.
         if cmd.starts_with("ZZ") {
             if let Some(tci_cmd) = Self::cat_to_tci(cmd) {
                 log::debug!("CAT→TCI: {} → {}", cmd.trim_end_matches(';'), tci_cmd.trim_end_matches(';'));
                 self.radio_send(&tci_cmd).await;
             } else {
-                log::warn!("CAT command dropped (no aux CAT, no TCI translation): {}", cmd.trim_end_matches(';'));
+                // Fallback: TCI run_cat_ex passthrough. Vraagt Thetis om
+                // het ZZ-commando op zijn eigen CAT-parser uit te voeren.
+                let zz = cmd.trim_end_matches(';');
+                log::debug!("CAT→TCI run_cat_ex: {}", zz);
+                self.tci.run_cat(zz).await;
             }
         } else {
             // TCI command (bv. TUNE:0,true;) → direct via WebSocket
@@ -853,6 +947,22 @@ impl PttController {
         }
         let cmd = format!("ZZDE{};", if enabled { 1 } else { 0 });
         self.send_cat(&cmd).await;
+    }
+
+    /// Push Thetis' "Receive only" preventive transmit-inhibit via the fork's
+    /// `rx_only_ex` command. Returns `true` if the fork accepted it (extensions
+    /// present) — meaning TX is now preventively blocked at the Thetis source.
+    /// Returns `false` when running against stock Thetis (no cap): the caller
+    /// must keep using the reactive `ZZTX0` catch-all instead.
+    pub async fn set_rx_only(&mut self, rx_only: bool) -> bool {
+        self.tci.set_rx_only(rx_only).await
+    }
+
+    /// Last-known Thetis "Receive only" state (from the `rx_only_ex` echo).
+    /// Used by the broadcast loop to snapshot the pre-takeover value before
+    /// forcing RX-only on an RX-only Amplitec position.
+    pub fn thetis_rx_only(&self) -> bool {
+        self.tci.rx_only
     }
 
     pub async fn set_diversity_ref(&mut self, rx1_ref: bool) {

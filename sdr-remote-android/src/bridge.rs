@@ -38,6 +38,9 @@ pub struct BridgeRadioState {
     pub buffer_depth: u32,
     pub rx_packets: u64,
     pub loss_percent: u8,
+    pub down_kbps: u32,
+    pub up_kbps: u32,
+    pub dx_spots_enabled: bool,
     pub capture_level: f32,
     pub playback_level: f32,
     pub frequency_hz: u64,
@@ -222,6 +225,9 @@ impl From<RadioState> for BridgeRadioState {
             buffer_depth: s.buffer_depth,
             rx_packets: s.rx_packets,
             loss_percent: s.loss_percent,
+            down_kbps: s.down_kbps,
+            up_kbps: s.up_kbps,
+            dx_spots_enabled: s.dx_spots_enabled,
             capture_level: s.capture_level,
             playback_level: s.playback_level,
             frequency_hz: s.frequency_hz,
@@ -482,6 +488,10 @@ impl SdrBridge {
 
     pub fn set_ptt(&self, active: bool) {
         let _ = self.cmd_tx.send(Command::SetPtt(active));
+    }
+
+    pub fn set_dx_spots_enabled(&self, enabled: bool) {
+        let _ = self.cmd_tx.send(Command::SetDxSpotsEnabled(enabled));
     }
 
     pub fn set_rx_volume(&self, volume: f32) {

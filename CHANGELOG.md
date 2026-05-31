@@ -16,6 +16,125 @@ hardware notes, see `docs-book/src/technical-reference.md` and
 
 ---
 
+## [2.0.4] — 2026-05 (bandwidth toolkit, preventive TX-inhibit, power-cap, PstRotator)
+
+> **Backwards-compatible with 2.0.3.** Wire-protocol additive only —
+> one new control ID (`DxSpotsEnabled`); older clients ignore it,
+> older servers default the new behaviour to ON. Mix v2.0.3 and
+> v2.0.4 freely while you roll out, but pair v2.0.4 with the
+> matching Thetis-fork build to unlock the full feature-set.
+
+### Added — Preventive RX-only TX-inhibit (Thetis-fork TL2-3 required)
+
+A new chokepoint between ThetisLink and Thetis stops the radio from
+transmitting on an antenna position marked as **RX-only**, before TX
+can briefly come up. When the fork-side ThetisLink extensions are
+enabled, ThetisLink drives Thetis' "Receive only" flag directly via
+the new `rx_only_ex` TCI command — MOX, spacebar, hardware-PTT and
+VOX are all refused at the source instead of being flipped back
+reactively. The reactive ZZTX0 catch-all remains the safety floor
+for stock Thetis (no fork extensions) and for any path the
+preventive gate cannot reach.
+
+- Server-side state machine handles takeover, level-maintain and
+  release, including a bootstrap-stale clear so a leftover
+  `RXOnly=true` from a previous session is wiped within ~1 ms after
+  the cap is detected.
+- The Thetis-fork `RXOnly` setter now broadcasts a TCI push-notify on
+  every real transition, so external Setup → "Receive only" toggles
+  are visible to ThetisLink in real time (was: only on TCI SET/GET
+  echoes, which left ThetisLink with a stale cache).
+- Server-side dedup on the `rx_only_ex` notification keeps the log
+  clean when fork-broadcast and handler-echo arrive together.
+
+Requires Thetis fork **PA3GHM TL2-3** or newer for the full
+preventive path. Stock Thetis falls back to the reactive ZZTX0
+catch-all without any user action.
+
+### Added — Reactive RF power-cap per antenna position
+
+Per-Amplitec-A position the server enforces a maximum forward-power
+(`amplitec_max_w`) by sending the PA's own `DriveDown` button (SPE
+Expert or RF2K-S) — not ZZPC, which the PA pushes back through the
+TCI loop. Mode-multipliers are applied universally: SSB/CW × 1.0,
+AM × 0.5, FM/DIG × 0.4. A counter remembers how many DriveDowns
+were sent on the active position and restores them as DriveUps when
+the user switches to a different position.
+
+- New first-class GUI editor in the Amplitec tab (6 rows × max W
+  + TX-blocked checkbox) replaces the previous file-edit workflow.
+- Rate-limited to one DriveDown per second to let the PA-meter
+  settle; brief CW-bursts under that interval may pass the cap
+  (reactive only — preventive coverage exists on RX-only positions).
+- Tuner first-config: the server UI now shows tuner slots without
+  requiring an existing instance, breaking the catch-22 for new
+  installs.
+
+### Added — PstRotator UDP/XML rotor backend
+
+Native PstRotator support alongside the existing rotctl-TCP backend.
+Per-installation choice via `rotor_backend = pstrotator` in the
+server config. Integer-degree AZIMUTH commands; AZ/EL replies parsed
+fallible; offline-timeout marks status `false` cleanly. Host field
+is a **numeric IP address** — no DNS resolution. mDNS troubleshooting
+notes added to the manuals.
+
+### Added — Editable WebSDR favorite names
+
+Favorites in the WebSDR list now have an explicit Edit-toggle so a
+rename commits on Done / loss of focus and survives reconnect.
+
+### Added — Server-tab bandwidth monitor + DX-spots opt-out
+
+The desktop Server tab now shows the live UDP bandwidth in both
+directions:
+
+- **Down (RX)** and **Up (TX)** in Kbit/s, updated every 500 ms.
+- Click on Down to expand a per-stream breakdown (audio, spectrum,
+  S-meter, DX-spots, …) refreshed every 5 s.
+- A **DX spots ontvangen** checkbox lets you opt out of the DX-cluster
+  spot stream on metered links. The Android client has the same
+  switch in Settings.
+
+The monitor counts UDP application-payload bytes; the operating-
+system network meter typically reads 1.5–2× higher because it
+includes IP/UDP/Ethernet headers. The Android DX-spots toggle
+resets to ON when the app restarts (no preference persistence).
+
+### Fixed — DX-cluster spot broadcast storm (~90 Kbit/s → ~6 Kbit/s)
+
+The server used to re-send all cached DX-cluster spots to every
+client on every equipment-tick (5 Hz). With ~100 spots in cache this
+consumed ~90 Kbit/s steady-state on each client. The broadcast now
+sends only new spots per tick and triggers a full age-refresh every
+10 s — about 15× less data without a user-visible change.
+
+### Fixed — Server log spam
+
+Two periodic log sources became state-change-driven:
+
+- `PowerCap state` only logs when `(pos, mode, pa_in_operate, cap)`
+  transitions — used to fire every 2 s regardless. PA-meter fluctuations
+  are intentionally excluded from the snapshot so they don't reintroduce
+  the spam.
+- `DX Cluster` reconnect now emits one line per failure plus one
+  line on recovery (`reconnected after N failed attempts`) instead of
+  the previous three lines per backoff cycle.
+
+### Notes for upgraders
+
+- A v2.0.3 client connects to a v2.0.4 server without problems; the
+  new `DxSpotsEnabled` control is simply unused, default = ON.
+- A v2.0.4 client connects to a v2.0.3 server without problems; the
+  opt-out toggle is harmless (server ignores the unknown control)
+  but you cannot turn off the spot stream on the older server.
+- The new preventive TX-inhibit only activates when paired with a
+  **Thetis fork build PA3GHM TL2-3 or newer**. Stock Thetis remains
+  fully supported via the reactive ZZTX0 fallback that already
+  existed in v2.0.3.
+
+---
+
 ## [2.0.3] — 2026-05 (multi-tuner + wire-protocol breaking change)
 
 > **Breaking change — wire-protocol version bumped from 2 → 3.**

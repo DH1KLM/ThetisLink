@@ -120,6 +120,77 @@ impl SdrRemoteApp {
         ui.add_space(8.0);
         ui.separator();
 
+        // Power-cap tabel (collapsing section). Server pusht de actuele
+        // tabel via AmplitecPowerTablePacket; edit-state wordt lokaal
+        // bijgehouden en pas op "Save to server" naar de server gestuurd.
+        let header_label = if self.amplitec_power_show {
+            "Power-cap table \u{25BC}"
+        } else {
+            "Power-cap table \u{25B6}"
+        };
+        if ui.selectable_label(self.amplitec_power_show, RichText::new(header_label).strong()).clicked() {
+            self.amplitec_power_show = !self.amplitec_power_show;
+        }
+        if self.amplitec_power_show {
+            ui.indent("amplitec_power_table", |ui| {
+                if !self.amplitec_power_loaded {
+                    ui.colored_label(
+                        Color32::from_rgb(180, 180, 180),
+                        "Waiting for server\u{2026}",
+                    );
+                } else {
+                    egui::Grid::new("amplitec_power_grid")
+                        .striped(true)
+                        .min_col_width(40.0)
+                        .show(ui, |ui| {
+                            ui.label(RichText::new("Pos").strong());
+                            ui.label(RichText::new("Label").strong());
+                            ui.label(RichText::new("Max W").strong());
+                            ui.label(RichText::new("RX-only").strong());
+                            ui.end_row();
+                            for i in 0..6 {
+                                let pos = (i as u8) + 1;
+                                ui.label(format!("A-{}", pos));
+                                ui.label(self.amplitec_label_a(pos));
+                                let mut val = self.amplitec_power_edit_max_w[i] as i32;
+                                let drag = egui::DragValue::new(&mut val)
+                                    .range(0..=3000)
+                                    .suffix(" W")
+                                    .speed(1.0);
+                                if ui.add(drag).changed() {
+                                    self.amplitec_power_edit_max_w[i] =
+                                        val.clamp(0, 3000) as u16;
+                                }
+                                ui.checkbox(&mut self.amplitec_power_edit_tx_blocked[i], "");
+                                ui.end_row();
+                            }
+                        });
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        let dirty = self.amplitec_power_edit_max_w != self.amplitec_power_max_w
+                            || self.amplitec_power_edit_tx_blocked != self.amplitec_power_tx_blocked;
+                        if ui.add_enabled(dirty, egui::Button::new("Save to server")).clicked() {
+                            let _ = self.cmd_tx.send(Command::SetAmplitecPowerTable {
+                                max_w: self.amplitec_power_edit_max_w,
+                                tx_blocked: self.amplitec_power_edit_tx_blocked,
+                            });
+                        }
+                        if ui.add_enabled(dirty, egui::Button::new("Revert")).clicked() {
+                            self.amplitec_power_edit_max_w = self.amplitec_power_max_w;
+                            self.amplitec_power_edit_tx_blocked = self.amplitec_power_tx_blocked;
+                        }
+                        ui.label(
+                            RichText::new("0 W = no cap")
+                                .size(10.0)
+                                .color(Color32::from_rgb(160, 160, 160)),
+                        );
+                    });
+                }
+            });
+            ui.add_space(8.0);
+            ui.separator();
+        }
+
         // Log
         ui.label(RichText::new("Log").strong());
         egui::ScrollArea::vertical()

@@ -77,6 +77,13 @@ impl Rotor {
     pub fn status(&self) -> RotorStatus {
         self.status.lock().unwrap().clone()
     }
+
+    /// Build a `Rotor` facade around an externally-spawned worker. Used
+    /// by the PstRotator backend (see `pstrotator.rs`) so its thread
+    /// can share the same client-facing interface as the EA7HG path.
+    pub fn from_handles(cmd_tx: mpsc::Sender<RotorCmd>, status: Arc<Mutex<RotorStatus>>) -> Self {
+        Self { cmd_tx, status }
+    }
 }
 
 fn rotor_thread(
