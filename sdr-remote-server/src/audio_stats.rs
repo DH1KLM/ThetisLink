@@ -103,6 +103,10 @@ pub struct StatusPanelShared {
     /// Status panel can render per-tuner rows (Live yellow voltage,
     /// threshold + hysteresis sliders) without needing a separate channel.
     pub tuners_slot: Arc<std::sync::OnceLock<Arc<crate::tuner::Tuners>>>,
+    /// Live Yaesu-rotor instance (PATCH-yaesu-rotor-mcp2221 fase 3).
+    /// `None` zolang er geen `rot_*` MCP2221A in `config.rotors` zit,
+    /// of zolang server-start nog niet de poll-thread heeft opgestart.
+    pub rotor_slot: Arc<std::sync::OnceLock<Arc<crate::mcp2221_yaesu_rotor::RotorInstance>>>,
 }
 
 /// Outcome of the UDP bind attempt — surfaced in the Status panel.
@@ -121,6 +125,7 @@ impl StatusPanelShared {
             server_start: Instant::now(),
             bind_status: Arc::new(std::sync::OnceLock::new()),
             tuners_slot: Arc::new(std::sync::OnceLock::new()),
+            rotor_slot: Arc::new(std::sync::OnceLock::new()),
         }
     }
 }

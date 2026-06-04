@@ -93,6 +93,10 @@ pub(crate) struct ClientConfig {
     pub(crate) rx2_auto_ref_enabled: bool,
     pub(crate) rx2_waterfall_contrast: f32,
     pub(crate) rx2_enabled: bool,
+    /// Opt-in voor wideband Thetis-audio (RX1/RX2/BinR 16 kHz i.p.v.
+    /// 8 kHz default). Verdubbelt RX-bandbreedte per kanaal ongeveer,
+    /// dus default false; aan-zetten via Settings → Audio.
+    pub(crate) thetis_wideband_audio: bool,
     pub(crate) popout_joined: bool,
     pub(crate) popout_meter_analog: bool,
     pub(crate) spectrum_popout: bool,
@@ -108,7 +112,8 @@ pub(crate) struct ClientConfig {
     pub(crate) yaesu_enabled: bool,
     pub(crate) yaesu_volume: f32,
     pub(crate) yaesu_popout: bool,
-    pub(crate) yaesu_eq_profiles: Vec<(String, bool, [f32; 5])>,
+    // Tuple: (name, enabled, eq-gains, mic_gain)
+    pub(crate) yaesu_eq_profiles: Vec<(String, bool, [f32; 5], f32)>,
     pub(crate) yaesu_eq_active: String,
     pub(crate) yaesu_mem_file: String,
     pub(crate) band_mem: HashMap<String, BandMemory>,
@@ -186,6 +191,7 @@ impl Default for ClientConfig {
             rx2_auto_ref_enabled: true,
             rx2_waterfall_contrast: 1.2,
             rx2_enabled: false,
+            thetis_wideband_audio: false,
             popout_joined: false,
             device_tab: 0,
             yaesu_enabled: false,
@@ -442,21 +448,32 @@ pub(crate) fn load_config() -> ClientConfig {
         } else if let Some(val) = line.strip_prefix("yaesu_eq_active=") {
             config.yaesu_eq_active = val.trim().to_string();
         } else if let Some(val) = line.strip_prefix("yaesu_eq_profile=") {
-            // Format: name|enabled|g0,g1,g2,g3,g4
-            let parts: Vec<&str> = val.trim().splitn(3, '|').collect();
-            if parts.len() == 3 {
+            // Format: name|enabled|g0,g1,g2,g3,g4[|mic_gain]
+            // mic_gain (4e veld) is optioneel — oude profielen zonder
+            // mic_gain vallen terug op default 0.5 zodat upgrades niet
+            // breken.
+            let parts: Vec<&str> = val.trim().splitn(4, '|').collect();
+            if parts.len() >= 3 {
                 let name = parts[0].to_string();
                 let enabled = parts[1] == "1";
                 let gains: Vec<f32> = parts[2].split(',')
                     .filter_map(|s| s.trim().parse().ok()).collect();
                 if gains.len() == 5 {
-                    config.yaesu_eq_profiles.push((name, enabled, [gains[0], gains[1], gains[2], gains[3], gains[4]]));
+                    let mic_gain = parts.get(3)
+                        .and_then(|s| s.trim().parse::<f32>().ok())
+                        .unwrap_or(0.5);
+                    config.yaesu_eq_profiles.push((name, enabled,
+                        [gains[0], gains[1], gains[2], gains[3], gains[4]],
+                        mic_gain));
                 }
             }
         } else if let Some(val) = line.strip_prefix("yaesu_mem_file=") {
             config.yaesu_mem_file = val.trim().to_string();
         } else if let Some(val) = line.strip_prefix("rx2_enabled=") {
             config.rx2_enabled = val.trim() == "true";
+            has_keys = true;
+        } else if let Some(val) = line.strip_prefix("thetis_wideband_audio=") {
+            config.thetis_wideband_audio = val.trim() == "true";
             has_keys = true;
         } else if let Some(val) = line.strip_prefix("popout_joined=") {
             config.popout_joined = val.trim() == "true";
@@ -659,6 +676,7 @@ pub(crate) fn save_config(
     rx2_auto_ref_enabled: bool,
     rx2_waterfall_contrast: f32,
     rx2_enabled: bool,
+    thetis_wideband_audio: bool,
     popout_joined: bool,
     popout_meter_analog: bool,
     spectrum_popout: bool,
@@ -675,7 +693,7 @@ pub(crate) fn save_config(
     yaesu_volume: f32,
     yaesu_popout: bool,
     yaesu_eq_active: &str,
-    yaesu_eq_profiles: &[(String, bool, [f32; 5])],
+    yaesu_eq_profiles: &[(String, bool, [f32; 5], f32)],
     yaesu_mem_file: &str,
     band_mem: &HashMap<String, BandMemory>,
     window_w: f32,
@@ -746,6 +764,7 @@ pub(crate) fn save_config(
         content.push_str(&format!("rx2_auto_ref_enabled={}\n", rx2_auto_ref_enabled));
         content.push_str(&format!("rx2_waterfall_contrast={:.2}\n", rx2_waterfall_contrast));
         content.push_str(&format!("rx2_enabled={}\n", rx2_enabled));
+        content.push_str(&format!("thetis_wideband_audio={}\n", thetis_wideband_audio));
         content.push_str(&format!("popout_joined={}\n", popout_joined));
         content.push_str(&format!("popout_meter_analog={}\n", popout_meter_analog));
         content.push_str(&format!("spectrum_popout={}\n", spectrum_popout));
@@ -764,10 +783,10 @@ pub(crate) fn save_config(
         content.push_str(&format!("yaesu_volume={:.3}\n", yaesu_volume));
         content.push_str(&format!("yaesu_popout={}\n", yaesu_popout));
         content.push_str(&format!("yaesu_eq_active={}\n", yaesu_eq_active));
-        for (name, enabled, gains) in yaesu_eq_profiles {
-            content.push_str(&format!("yaesu_eq_profile={}|{}|{:.1},{:.1},{:.1},{:.1},{:.1}\n",
+        for (name, enabled, gains, mic_gain) in yaesu_eq_profiles {
+            content.push_str(&format!("yaesu_eq_profile={}|{}|{:.1},{:.1},{:.1},{:.1},{:.1}|{:.3}\n",
                 name, if *enabled { "1" } else { "0" },
-                gains[0], gains[1], gains[2], gains[3], gains[4]));
+                gains[0], gains[1], gains[2], gains[3], gains[4], mic_gain));
         }
         for (mic, profile) in mic_profile_map {
             content.push_str(&format!("mic_profile={}|{}\n", mic, profile));

@@ -336,6 +336,29 @@ fn ultrabeam_thread(
     }
     seq = seq.wrapping_add(1);
 
+    // Initial element-lengths read at connect-time, so the Menu panel can
+    // render Element Lengths immediately when the operator opens the
+    // UltraBeam window with `ultrabeam_show_menu = true` from config.
+    // Without this the elements_mm[] stays zeroed until the operator
+    // toggles Menu off and on (which sends a ReadElements as side-effect).
+    match send_and_receive(&mut port, seq, CMD_READ_ELEMENTS, &[]) {
+        Ok((_s, _c, data)) => {
+            if data.len() >= 12 {
+                let mut elements = [0u16; 6];
+                for i in 0..6 {
+                    elements[i] = u16::from_le_bytes([data[i * 2], data[i * 2 + 1]]);
+                }
+                let mut s = status.lock().unwrap();
+                s.elements_mm = elements;
+                debug!("UltraBeam initial elements: {:?}", elements);
+            } else {
+                warn!("UltraBeam initial elements: short response ({} bytes)", data.len());
+            }
+        }
+        Err(e) => warn!("UltraBeam initial elements read failed: {}", e),
+    }
+    seq = seq.wrapping_add(1);
+
     loop {
         // Check for user commands (non-blocking with 500ms timeout for polling)
         match cmd_rx.recv_timeout(Duration::from_millis(500)) {

@@ -12,9 +12,12 @@ use tokio::net::UdpSocket;
 use tokio::sync::{watch, Mutex};
 use tokio::time::{interval, Duration};
 
-use sdr_remote_core::codec::OpusEncoder;
+use sdr_remote_core::codec::{OpusEncoder, OpusEncoderWideband};
 use sdr_remote_core::protocol::*;
-use sdr_remote_core::{FRAME_SAMPLES, MAX_PACKET_SIZE, NETWORK_SAMPLE_RATE};
+use sdr_remote_core::{
+    FRAME_SAMPLES, FRAME_SAMPLES_WIDEBAND, MAX_PACKET_SIZE, NETWORK_SAMPLE_RATE,
+    NETWORK_SAMPLE_RATE_WIDEBAND,
+};
 
 use crate::ptt::PttController;
 use crate::session::SessionManager;
@@ -75,12 +78,10 @@ pub async fn tci_multichannel_audio_loop(
     let tci_rate = 48000u32;
     let tci_frame_samples = (tci_rate * 20 / 1000) as usize; // 960
 
-    // Per-channel mono encoders
+    // Per-channel mono encoders + resamplers — narrowband (8 kHz).
     let mut enc_rx1 = OpusEncoder::new()?;
     let mut enc_bin_r = OpusEncoder::new()?;
     let mut enc_rx2 = OpusEncoder::new()?;
-
-    // Per-channel mono resamplers: 48kHz → 8kHz
     let mk_resampler = || rubato::SincFixedIn::<f32>::new(
         NETWORK_SAMPLE_RATE as f64 / tci_rate as f64, 1.0,
         hq_sinc_params(), tci_frame_samples, 1,
@@ -88,6 +89,21 @@ pub async fn tci_multichannel_audio_loop(
     let mut res_rx1 = mk_resampler().context("RX1 resampler")?;
     let mut res_bin_r = mk_resampler().context("BinR resampler")?;
     let mut res_rx2 = mk_resampler().context("RX2 resampler")?;
+
+    // Wideband (16 kHz) parallel-encoders — alleen actief gevoed wanneer
+    // ten minste één client de Thetis-wideband-audio opt-in heeft staan.
+    // De resamplers blijven idle (geen `process()` call) zolang geen
+    // client wideband wil — geen merkbare CPU-impact.
+    let mut enc_rx1_wb = OpusEncoderWideband::new()?;
+    let mut enc_bin_r_wb = OpusEncoderWideband::new()?;
+    let mut enc_rx2_wb = OpusEncoderWideband::new()?;
+    let mk_resampler_wb = || rubato::SincFixedIn::<f32>::new(
+        NETWORK_SAMPLE_RATE_WIDEBAND as f64 / tci_rate as f64, 1.0,
+        hq_sinc_params(), tci_frame_samples, 1,
+    );
+    let mut res_rx1_wb = mk_resampler_wb().context("RX1 WB resampler")?;
+    let mut res_bin_r_wb = mk_resampler_wb().context("BinR WB resampler")?;
+    let mut res_rx2_wb = mk_resampler_wb().context("RX2 WB resampler")?;
 
     let mut sequence: u32 = 0;
     let mut rx1_accum: Vec<f32> = Vec::with_capacity(tci_frame_samples * 4);
@@ -173,28 +189,60 @@ pub async fn tci_multichannel_audio_loop(
                     had_clients = true;
                 }
 
-                // Encode each available channel as mono Opus and bundle
-                let mut channels: Vec<(u8, Vec<u8>)> = Vec::with_capacity(3);
+                // Encode each available channel as mono Opus and bundle.
+                // Sinds wideband-opt-in: ook een tweede payload-set per
+                // channel (16 kHz Opus) wanneer ten minste één actieve
+                // client de optie aan heeft staan. NB-pad blijft de
+                // default voor alle huidige clients.
+                let any_wb = session.lock().await.any_client_wants_thetis_wideband();
+                let mut channels_nb: Vec<(u8, Vec<u8>)> = Vec::with_capacity(3);
+                let mut channels_wb: Vec<(u8, Vec<u8>)> = Vec::with_capacity(3);
+
+                // Helper: encodeer een 48-kHz frame in beide kanalen
+                // (NB altijd, WB conditioneel).
+                fn pcm_to_i16(samples: &[f32]) -> Vec<i16> {
+                    samples.iter()
+                        .map(|&s| (s * 32767.0).clamp(-32768.0, 32767.0) as i16)
+                        .collect()
+                }
 
                 // CH0: RX1 (always present)
                 let rx1_frame: Vec<f32> = rx1_accum.drain(..tci_frame_samples).collect();
                 let rx1_8k = resample_to_network(&mut res_rx1, &rx1_frame);
-                let rx1_i16: Vec<i16> = rx1_8k.iter().map(|&s| (s * 32767.0).clamp(-32768.0, 32767.0) as i16).collect();
+                let rx1_i16 = pcm_to_i16(&rx1_8k);
                 if rx1_i16.len() >= FRAME_SAMPLES {
                     if let Ok(opus) = enc_rx1.encode(&rx1_i16[..FRAME_SAMPLES]) {
-                        channels.push((0, opus)); // CH_RX1
+                        channels_nb.push((0, opus));
                         audio_stats.rx1.tick(server_start);
+                    }
+                }
+                if any_wb {
+                    let rx1_16k = resample_to_network(&mut res_rx1_wb, &rx1_frame);
+                    let rx1_i16_wb = pcm_to_i16(&rx1_16k);
+                    if rx1_i16_wb.len() >= FRAME_SAMPLES_WIDEBAND {
+                        if let Ok(opus) = enc_rx1_wb.encode(&rx1_i16_wb[..FRAME_SAMPLES_WIDEBAND]) {
+                            channels_wb.push((0, opus));
+                        }
                     }
                 }
 
                 // CH1: BinR (only when Thetis binaural active)
                 if bin_r_accum.len() >= tci_frame_samples {
                     let frame: Vec<f32> = bin_r_accum.drain(..tci_frame_samples).collect();
-                    let pcm_8k = resample_to_network(&mut res_bin_r, &frame);
-                    let i16s: Vec<i16> = pcm_8k.iter().map(|&s| (s * 32767.0).clamp(-32768.0, 32767.0) as i16).collect();
-                    if i16s.len() >= FRAME_SAMPLES {
-                        if let Ok(opus) = enc_bin_r.encode(&i16s[..FRAME_SAMPLES]) {
-                            channels.push((1, opus)); // CH_BIN_R
+                    let bin_8k = resample_to_network(&mut res_bin_r, &frame);
+                    let bin_i16 = pcm_to_i16(&bin_8k);
+                    if bin_i16.len() >= FRAME_SAMPLES {
+                        if let Ok(opus) = enc_bin_r.encode(&bin_i16[..FRAME_SAMPLES]) {
+                            channels_nb.push((1, opus));
+                        }
+                    }
+                    if any_wb {
+                        let bin_16k = resample_to_network(&mut res_bin_r_wb, &frame);
+                        let bin_i16_wb = pcm_to_i16(&bin_16k);
+                        if bin_i16_wb.len() >= FRAME_SAMPLES_WIDEBAND {
+                            if let Ok(opus) = enc_bin_r_wb.encode(&bin_i16_wb[..FRAME_SAMPLES_WIDEBAND]) {
+                                channels_wb.push((1, opus));
+                            }
                         }
                     }
                 }
@@ -202,12 +250,21 @@ pub async fn tci_multichannel_audio_loop(
                 // CH2: RX2 (when RX2 audio available)
                 if rx2_accum.len() >= tci_frame_samples {
                     let frame: Vec<f32> = rx2_accum.drain(..tci_frame_samples).collect();
-                    let pcm_8k = resample_to_network(&mut res_rx2, &frame);
-                    let i16s: Vec<i16> = pcm_8k.iter().map(|&s| (s * 32767.0).clamp(-32768.0, 32767.0) as i16).collect();
-                    if i16s.len() >= FRAME_SAMPLES {
-                        if let Ok(opus) = enc_rx2.encode(&i16s[..FRAME_SAMPLES]) {
-                            channels.push((2, opus)); // CH_RX2
+                    let rx2_8k = resample_to_network(&mut res_rx2, &frame);
+                    let rx2_i16 = pcm_to_i16(&rx2_8k);
+                    if rx2_i16.len() >= FRAME_SAMPLES {
+                        if let Ok(opus) = enc_rx2.encode(&rx2_i16[..FRAME_SAMPLES]) {
+                            channels_nb.push((2, opus));
                             audio_stats.rx2.tick(server_start);
+                        }
+                    }
+                    if any_wb {
+                        let rx2_16k = resample_to_network(&mut res_rx2_wb, &frame);
+                        let rx2_i16_wb = pcm_to_i16(&rx2_16k);
+                        if rx2_i16_wb.len() >= FRAME_SAMPLES_WIDEBAND {
+                            if let Ok(opus) = enc_rx2_wb.encode(&rx2_i16_wb[..FRAME_SAMPLES_WIDEBAND]) {
+                                channels_wb.push((2, opus));
+                            }
                         }
                     }
                 }
@@ -221,23 +278,28 @@ pub async fn tci_multichannel_audio_loop(
                 }
 
                 // Send per-client filtered multi-channel packets
-                if !channels.is_empty() {
+                if !channels_nb.is_empty() {
                     let timestamp = start.elapsed().as_millis() as u32;
-                    // Read per-client modes + rx2_enabled flag under short
-                    // lock, then release. `rx2_enabled` gates CH2 even when
-                    // `audio_mode` would otherwise allow it — the desktop
-                    // client UI's "RX2 enabled" toggle must mute the
-                    // upstream RX2 stream entirely, not just the local
-                    // playback (bandwidth bug uncovered 2026-05-13).
-                    let client_modes: Vec<(std::net::SocketAddr, u8, bool)> = {
+                    // Read per-client modes + rx2_enabled flag + WB-opt-in
+                    // under short lock, then release. `rx2_enabled` gates
+                    // CH2 even when `audio_mode` would otherwise allow it
+                    // — the desktop client UI's "RX2 enabled" toggle must
+                    // mute the upstream RX2 stream entirely, not just the
+                    // local playback (bandwidth bug uncovered 2026-05-13).
+                    let client_modes: Vec<(std::net::SocketAddr, u8, bool, bool)> = {
                         let sess = session.lock().await;
                         addrs
                             .iter()
-                            .map(|&a| (a, sess.client_audio_mode(a), sess.client_rx2_enabled(a)))
+                            .map(|&a| (
+                                a,
+                                sess.client_audio_mode(a),
+                                sess.client_rx2_enabled(a),
+                                sess.client_thetis_wideband(a),
+                            ))
                             .collect()
                     };
 
-                    for (addr, mode, rx2_enabled) in &client_modes {
+                    for (addr, mode, rx2_enabled, want_wb) in &client_modes {
                         // Filter channels based on client's audio mode.
                         // Then drop CH2 (RX2) for clients that have RX2
                         // turned off — those bytes would otherwise reach
@@ -247,7 +309,12 @@ pub async fn tci_multichannel_audio_loop(
                         // mode 0 (Mono): CH0 + CH2  (gated by rx2_enabled)
                         // mode 1 (BIN): CH0 + CH1 + CH2  (CH2 gated)
                         // mode 2 (Split): CH0 + CH2  (CH2 gated)
-                        let client_chs: Vec<(u8, Vec<u8>)> = channels.iter()
+                        // Kies juiste payload-set: WB als client opt-in heeft
+                        // én er een WB-payload beschikbaar is voor dit frame;
+                        // anders narrowband (default voor alle huidige clients).
+                        let use_wb = *want_wb && !channels_wb.is_empty();
+                        let src: &Vec<(u8, Vec<u8>)> = if use_wb { &channels_wb } else { &channels_nb };
+                        let client_chs: Vec<(u8, Vec<u8>)> = src.iter()
                             .filter(|(ch_id, _)| {
                                 let allowed = match *mode {
                                     255 => *ch_id == 0,                    // Android: RX1 only
@@ -268,6 +335,7 @@ pub async fn tci_multichannel_audio_loop(
                                 sequence,
                                 timestamp,
                                 channels: client_chs,
+                                flags: if use_wb { Flags::AUDIO_WIDEBAND } else { Flags::NONE },
                             };
                             let mut send_buf = Vec::with_capacity(MAX_PACKET_SIZE);
                             packet.serialize(&mut send_buf);

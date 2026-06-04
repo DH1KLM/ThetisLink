@@ -2,6 +2,106 @@
 
 use super::*;
 
+/// Visuele toestand voor `antenna_button`.
+#[derive(Clone, Copy)]
+enum AntennaState {
+    Active,
+    Blocked,
+    Inactive,
+}
+
+/// Twee-regelige antenne-knop — visueel identiek aan de server-versie
+/// (`sdr-remote-server::ui::amplitec::antenna_button`) zodat client en
+/// server hetzelfde uiterlijk hebben. Geen rename-context-menu hier:
+/// labels worden alleen op de server beheerd, clients tonen de huidige
+/// CSV-broadcast.
+fn antenna_button(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    pos: u8,
+    alias: &str,
+    state: AntennaState,
+    max_width: f32,
+) -> egui::Response {
+    use egui::{vec2, Align2, FontId, Sense, Stroke};
+
+    let pos_text = format!("Ant{}", pos);
+    let alias_text = alias.trim();
+
+    let style = ui.style().clone();
+    let pos_font: FontId = egui::TextStyle::Small.resolve(&style);
+    let alias_font: FontId = egui::TextStyle::Button.resolve(&style);
+
+    let pos_galley = ui.painter().layout_no_wrap(
+        pos_text.clone(),
+        pos_font.clone(),
+        Color32::TEMPORARY_COLOR,
+    );
+    let alias_galley = ui.painter().layout_no_wrap(
+        alias_text.to_string(),
+        alias_font.clone(),
+        Color32::TEMPORARY_COLOR,
+    );
+
+    let pad_x = 10.0_f32;
+    let pad_y = 4.0_f32;
+    let gap = 1.0_f32;
+    let natural_w = pos_galley.size().x.max(alias_galley.size().x) + pad_x * 2.0;
+    let width = natural_w.min(max_width).max(24.0);
+    let height = pos_galley.size().y + alias_galley.size().y + pad_y * 2.0 + gap;
+
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let (rect, response) = ui.allocate_exact_size(vec2(width, height), sense);
+
+    let visuals = ui.visuals();
+    let (mut fill, stroke_color) = match state {
+        AntennaState::Active => (Color32::from_rgb(100, 160, 230), visuals.widgets.active.fg_stroke.color),
+        AntennaState::Blocked => (
+            Color32::from_rgb(180, 180, 180),
+            visuals.widgets.inactive.fg_stroke.color,
+        ),
+        AntennaState::Inactive => (
+            visuals.widgets.inactive.bg_fill,
+            visuals.widgets.inactive.fg_stroke.color,
+        ),
+    };
+    if enabled && response.hovered() {
+        fill = fill.linear_multiply(1.15);
+    }
+
+    let painter = ui.painter();
+    painter.rect_filled(rect, 4.0, fill);
+    painter.rect_stroke(rect, 4.0, Stroke::new(1.0, stroke_color));
+
+    let (pos_color, alias_color) = match state {
+        AntennaState::Active => (Color32::WHITE, Color32::from_rgb(220, 230, 245)),
+        AntennaState::Blocked => (Color32::from_rgb(120, 120, 120), Color32::from_rgb(160, 160, 160)),
+        AntennaState::Inactive => (Color32::from_rgb(20, 20, 30), Color32::from_rgb(90, 90, 100)),
+    };
+
+    let center_x = rect.center().x;
+    let top_y = rect.top() + pad_y + pos_galley.size().y * 0.5;
+    let bottom_y = rect.bottom() - pad_y - alias_galley.size().y * 0.5;
+    painter.text(
+        egui::pos2(center_x, top_y),
+        Align2::CENTER_CENTER,
+        &pos_text,
+        pos_font,
+        pos_color,
+    );
+    if !alias_text.is_empty() {
+        painter.text(
+            egui::pos2(center_x, bottom_y),
+            Align2::CENTER_CENTER,
+            alias_text,
+            alias_font,
+            alias_color,
+        );
+    }
+
+    response
+}
+
 impl SdrRemoteApp {
     pub(super) fn render_devices_screen(&mut self, ui: &mut egui::Ui) {
         let amber = Color32::from_rgb(255, 170, 40);
@@ -62,24 +162,26 @@ impl SdrRemoteApp {
             }
         });
         ui.horizontal(|ui| {
+            let available = ui.available_width();
+            let spacing = ui.spacing().item_spacing.x;
+            let max_btn_w = ((available - 5.0 * spacing) / 6.0).max(24.0);
             for pos in 1..=6u8 {
                 let is_active = self.amplitec_switch_a == pos;
                 let is_blocked = self.amplitec_switch_b == pos;
                 let label = self.amplitec_label_a(pos);
-                let btn = if is_active {
-                    egui::Button::new(RichText::new(format!(" {} ", label)).strong())
-                        .fill(Color32::from_rgb(100, 160, 230))
+                let state = if is_active {
+                    AntennaState::Active
                 } else if is_blocked {
-                    egui::Button::new(RichText::new(format!(" {} ", label)).color(Color32::from_rgb(140, 140, 140)))
+                    AntennaState::Blocked
                 } else {
-                    egui::Button::new(format!(" {} ", label))
+                    AntennaState::Inactive
                 };
-                let resp = ui.add_enabled(self.amplitec_connected, btn);
+                let resp = antenna_button(ui, self.amplitec_connected, pos, &label, state, max_btn_w);
                 if resp.clicked() {
                     let _ = self.cmd_tx.send(Command::SetAmplitecSwitchA(pos));
                 }
                 if is_blocked {
-                    resp.on_hover_text(format!("{} \u{2014} bezet door Poort B", label));
+                    resp.on_hover_text(format!("Ant{} ({}) \u{2014} bezet door Poort B", pos, label));
                 }
             }
         });
@@ -95,24 +197,26 @@ impl SdrRemoteApp {
             }
         });
         ui.horizontal(|ui| {
+            let available = ui.available_width();
+            let spacing = ui.spacing().item_spacing.x;
+            let max_btn_w = ((available - 5.0 * spacing) / 6.0).max(24.0);
             for pos in 1..=6u8 {
                 let is_active = self.amplitec_switch_b == pos;
                 let is_blocked = self.amplitec_switch_a == pos;
                 let label = self.amplitec_label_b(pos);
-                let btn = if is_active {
-                    egui::Button::new(RichText::new(format!(" {} ", label)).strong())
-                        .fill(Color32::from_rgb(100, 160, 230))
+                let state = if is_active {
+                    AntennaState::Active
                 } else if is_blocked {
-                    egui::Button::new(RichText::new(format!(" {} ", label)).color(Color32::from_rgb(140, 140, 140)))
+                    AntennaState::Blocked
                 } else {
-                    egui::Button::new(format!(" {} ", label))
+                    AntennaState::Inactive
                 };
-                let resp = ui.add_enabled(self.amplitec_connected, btn);
+                let resp = antenna_button(ui, self.amplitec_connected, pos, &label, state, max_btn_w);
                 if resp.clicked() {
                     let _ = self.cmd_tx.send(Command::SetAmplitecSwitchB(pos));
                 }
                 if is_blocked {
-                    resp.on_hover_text(format!("{} \u{2014} bezet door Poort A", label));
+                    resp.on_hover_text(format!("Ant{} ({}) \u{2014} bezet door Poort A", pos, label));
                 }
             }
         });
@@ -123,12 +227,13 @@ impl SdrRemoteApp {
         // Power-cap tabel (collapsing section). Server pusht de actuele
         // tabel via AmplitecPowerTablePacket; edit-state wordt lokaal
         // bijgehouden en pas op "Save to server" naar de server gestuurd.
-        let header_label = if self.amplitec_power_show {
-            "Power-cap table \u{25BC}"
-        } else {
-            "Power-cap table \u{25B6}"
-        };
-        if ui.selectable_label(self.amplitec_power_show, RichText::new(header_label).strong()).clicked() {
+        if super::helpers::chevron_label(
+            ui,
+            self.amplitec_power_show,
+            RichText::new("Power-cap table").strong(),
+        )
+        .clicked()
+        {
             self.amplitec_power_show = !self.amplitec_power_show;
         }
         if self.amplitec_power_show {
@@ -1029,8 +1134,7 @@ impl SdrRemoteApp {
                     ui.label(format!("FW {}.{}", self.ub_fw_major, self.ub_fw_minor));
                 }
                 ui.separator();
-                let menu_label = if self.ub_show_menu { "Menu \u{25BC}" } else { "Menu \u{25B6}" };
-                if ui.button(menu_label).clicked() {
+                if super::helpers::chevron_label(ui, self.ub_show_menu, "Menu").clicked() {
                     self.ub_show_menu = !self.ub_show_menu;
                     if self.ub_show_menu {
                         let _ = self.cmd_tx.send(Command::UbReadElements);
@@ -1586,11 +1690,18 @@ impl SdrRemoteApp {
         ui.separator();
 
         // 5-band Equalizer
-        let eq_initial = self.collapse_yaesu_eq;
-        let eq_resp = egui::CollapsingHeader::new(RichText::new("Equalizer").strong().size(14.0))
-            .id_salt("collapse_yaesu_eq")
-            .default_open(eq_initial)
-            .show(ui, |ui| {
+        if super::helpers::chevron_label(
+            ui,
+            self.collapse_yaesu_eq,
+            RichText::new("Equalizer").strong().size(14.0),
+        )
+        .clicked()
+        {
+            self.collapse_yaesu_eq = !self.collapse_yaesu_eq;
+            self.save_full_config();
+        }
+        if self.collapse_yaesu_eq {
+            ui.indent("yaesu_eq_body", |ui| {
                 ui.horizontal(|ui| {
                     let mut eq_on = self.yaesu_eq_enabled;
                     if ui.checkbox(&mut eq_on, "EQ").changed() {
@@ -1598,7 +1709,7 @@ impl SdrRemoteApp {
                         let _ = self.cmd_tx.send(Command::SetYaesuEqEnabled(eq_on));
                     }
                     // Profile selector
-                    let profile_names: Vec<String> = self.yaesu_eq_profiles.iter().map(|(n, _, _)| n.clone()).collect();
+                    let profile_names: Vec<String> = self.yaesu_eq_profiles.iter().map(|(n, _, _, _)| n.clone()).collect();
                     egui::ComboBox::from_id_salt("eq_profile")
                         .selected_text(if self.yaesu_eq_active_profile.is_empty() { "---" } else { &self.yaesu_eq_active_profile })
                         .width(100.0)
@@ -1606,13 +1717,15 @@ impl SdrRemoteApp {
                             for name in &profile_names {
                                 if ui.selectable_label(&self.yaesu_eq_active_profile == name, name).clicked() {
                                     self.yaesu_eq_active_profile = name.clone();
-                                    if let Some((_, en, g)) = self.yaesu_eq_profiles.iter().find(|(n, _, _)| n == name) {
+                                    if let Some((_, en, g, mg)) = self.yaesu_eq_profiles.iter().find(|(n, _, _, _)| n == name) {
                                         self.yaesu_eq_enabled = *en;
                                         self.yaesu_eq_gains = *g;
+                                        self.yaesu_mic_gain = *mg;
                                         let _ = self.cmd_tx.send(Command::SetYaesuEqEnabled(*en));
                                         for i in 0..5 {
                                             let _ = self.cmd_tx.send(Command::SetYaesuEqBand(i as u8, g[i]));
                                         }
+                                        let _ = self.cmd_tx.send(Command::SetYaesuTxGain(*mg));
                                     }
                                     self.save_full_config();
                                 }
@@ -1620,16 +1733,17 @@ impl SdrRemoteApp {
                         });
                     if ui.small_button("Save").clicked() && !self.yaesu_eq_active_profile.is_empty() {
                         let name = self.yaesu_eq_active_profile.clone();
-                        if let Some(p) = self.yaesu_eq_profiles.iter_mut().find(|(n, _, _)| *n == name) {
+                        if let Some(p) = self.yaesu_eq_profiles.iter_mut().find(|(n, _, _, _)| *n == name) {
                             p.1 = self.yaesu_eq_enabled;
                             p.2 = self.yaesu_eq_gains;
+                            p.3 = self.yaesu_mic_gain;
                         } else {
-                            self.yaesu_eq_profiles.push((name, self.yaesu_eq_enabled, self.yaesu_eq_gains));
+                            self.yaesu_eq_profiles.push((name, self.yaesu_eq_enabled, self.yaesu_eq_gains, self.yaesu_mic_gain));
                         }
                         self.save_full_config();
                     }
                     if ui.small_button("Del").clicked() && !self.yaesu_eq_active_profile.is_empty() {
-                        self.yaesu_eq_profiles.retain(|(n, _, _)| n != &self.yaesu_eq_active_profile);
+                        self.yaesu_eq_profiles.retain(|(n, _, _, _)| n != &self.yaesu_eq_active_profile);
                         self.yaesu_eq_active_profile.clear();
                         self.save_full_config();
                     }
@@ -1639,7 +1753,7 @@ impl SdrRemoteApp {
                     ui.add(egui::TextEdit::singleline(&mut self.yaesu_eq_new_name).desired_width(100.0));
                     if ui.small_button("+").clicked() && !self.yaesu_eq_new_name.is_empty() {
                         let name = self.yaesu_eq_new_name.clone();
-                        self.yaesu_eq_profiles.push((name.clone(), self.yaesu_eq_enabled, self.yaesu_eq_gains));
+                        self.yaesu_eq_profiles.push((name.clone(), self.yaesu_eq_enabled, self.yaesu_eq_gains, self.yaesu_mic_gain));
                         self.yaesu_eq_active_profile = name;
                         self.yaesu_eq_new_name.clear();
                         self.save_full_config();
@@ -1662,22 +1776,25 @@ impl SdrRemoteApp {
                     }
                 });
             });
-        let eq_now = eq_resp.openness >= 0.5;
-        if eq_now != self.collapse_yaesu_eq {
-            self.collapse_yaesu_eq = eq_now;
-            self.save_full_config();
         }
 
         ui.separator();
 
         // Memory channels — visible body height is user-resizable so it
         // doesn't push the Radio Settings header off the bottom of the window.
-        let mem_initial = self.collapse_yaesu_memories;
-        let mem_max_h = self.yaesu_memories_h;
-        let mem_resp = egui::CollapsingHeader::new(RichText::new("Memory Channels").strong().size(14.0))
-            .id_salt("collapse_yaesu_memories")
-            .default_open(mem_initial)
-            .show(ui, |ui| {
+        if super::helpers::chevron_label(
+            ui,
+            self.collapse_yaesu_memories,
+            RichText::new("Memory Channels").strong().size(14.0),
+        )
+        .clicked()
+        {
+            self.collapse_yaesu_memories = !self.collapse_yaesu_memories;
+            self.save_full_config();
+        }
+        if self.collapse_yaesu_memories {
+            let mem_max_h = self.yaesu_memories_h;
+            ui.indent("yaesu_memories_body", |ui| {
                 egui::ScrollArea::vertical()
                     .id_salt("yaesu_memories_scroll")
                     .max_height(mem_max_h)
@@ -1686,10 +1803,6 @@ impl SdrRemoteApp {
                         self.render_yaesu_memories(ui);
                     });
             });
-        let mem_now = mem_resp.openness >= 0.5;
-        if mem_now != self.collapse_yaesu_memories {
-            self.collapse_yaesu_memories = mem_now;
-            self.save_full_config();
         }
         // Drag-handle below memories — only visible when memories expanded
         // so it can resize the visible portion of the channel list.
@@ -1729,17 +1842,20 @@ impl SdrRemoteApp {
             }
         }
 
-        let menu_initial = self.collapse_yaesu_menu;
-        let menu_resp = egui::CollapsingHeader::new(RichText::new("Radio Settings (EX Menu)").strong().size(14.0))
-            .id_salt("collapse_yaesu_menu")
-            .default_open(menu_initial)
-            .show(ui, |ui| {
+        if super::helpers::chevron_label(
+            ui,
+            self.collapse_yaesu_menu,
+            RichText::new("Radio Settings (EX Menu)").strong().size(14.0),
+        )
+        .clicked()
+        {
+            self.collapse_yaesu_menu = !self.collapse_yaesu_menu;
+            self.save_full_config();
+        }
+        if self.collapse_yaesu_menu {
+            ui.indent("yaesu_menu_body", |ui| {
                 self.render_yaesu_menu(ui);
             });
-        let menu_now = menu_resp.openness >= 0.5;
-        if menu_now != self.collapse_yaesu_menu {
-            self.collapse_yaesu_menu = menu_now;
-            self.save_full_config();
         }
     }
 

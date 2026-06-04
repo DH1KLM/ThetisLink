@@ -1,16 +1,20 @@
 # ThetisLink
 
-> **Current release: [v2.0.4](https://github.com/cjenschede/ThetisLink/releases/tag/v2.0.4)** —
-> preventive RX-only TX-inhibit via the new Thetis-fork `rx_only_ex` command
-> (MOX, spacebar, hardware-PTT and VOX refused at the source on an RX-only
-> Amplitec position), reactive RF power-cap per antenna position with PA-native
-> DriveDown (SPE + RF2K-S), PstRotator UDP/XML rotor backend, server-tab
-> bandwidth monitor with per-stream breakdown, per-client DX-spots opt-out
-> (~90 Kbit/s broadcast storm fixed → ~6 Kbit/s steady-state).
-> **Backwards-compatible with v2.0.3** — wire-protocol additive only;
-> pair with **Thetis fork PA3GHM TL2-3** for the full feature-set, stock
-> Thetis falls back gracefully to the reactive `ZZTX0` catch-all that
-> already existed. Download `ThetisLink-2.0.4.zip` from the
+> **Current release: [v2.1.0](https://github.com/cjenschede/ThetisLink/releases/tag/v2.1.0)** —
+> direct Yaesu G-1000DXC rotor control via an Adafruit MCP2221A breakout
+> (third rotor backend alongside EA7HG and PstRotator), with soft-start /
+> soft-stop ramp, adaptive ADC sample rate (30 Hz motion / 1 Hz idle),
+> shortest-route option for rotors with overlap range, and a full
+> calibration wizard. Plus: opt-in wideband Thetis RX audio (when paired
+> with the matching fork), modular multi-tuner wizard with per-slot
+> add/rename/delete, Amplitec 6/2 reconnect after power-cycle (and
+> server-start with the device offline), Yaesu RX2 mode-switch filter
+> restore and per-channel filter-drag isolation, plus a flurry of UI
+> polish (chevron headers, settings-tab ScrollArea, Amplitec antenna
+> rename, status-panel scroll stability). **Backwards-compatible with
+> v2.0.4** — wire-protocol unchanged; pair with **Thetis fork PA3GHM
+> TL2-4** for the full feature-set, stock Thetis remains supported.
+> Download `ThetisLink-2.1.0.zip` from the
 > [Releases page](https://github.com/cjenschede/ThetisLink/releases) — the ZIP
 > contains both Windows binaries, the Android APK, all six PDF manuals,
 > `LICENSE` and `SHA256SUMS.txt`. SBOM and third-party license artefacts are
@@ -30,7 +34,7 @@ radio control over the network via TCI WebSocket.
 - Real-time bidirectional audio (Opus codec, minimal latency)
 - Spectrum and waterfall display (up to 1536 kHz with the PA3GHM Thetis fork)
 - Full RX2/VFO-B support with diversity reception
-- External device control: Amplitec 6/2, two StockCorner JC-4s/JC-3s tuners in parallel (MCP2221A USB-HID), SPE Expert 1.3K-FA, RF2K-S, UltraBeam RCU-06, EA7HG Visual Rotor
+- External device control: Amplitec 6/2 (auto-reconnect over USB), two StockCorner JC-4s/JC-3s tuners in parallel (MCP2221A USB-HID), SPE Expert 1.3K-FA, RF2K-S, UltraBeam RCU-06, and three rotor backends — EA7HG Visual Rotor, PstRotator, and direct Yaesu G-1000DXC via MCP2221A (5 V breakout, BST82 gate switches, position-feedback ADC)
 - Yaesu FT-991A as second radio (CAT + USB audio)
 - MIDI controller support (desktop + Android)
 - DX Cluster with spectrum overlay
@@ -51,8 +55,9 @@ ThetisLink talks to the radio through Thetis. It targets **Thetis v2.10.3.15**
 (the latest official release by ramdor) and works with stock Thetis out of the
 box. Optionally use the [PA3GHM Thetis fork](https://github.com/cjenschede/Thetis/tree/thetislink-tl2)
 (branch `thetislink-tl2`) for the additional `_ex` TCI extensions used by
-ThetisLink v2.0.4 (capability broadcast, per-RX filter preset, diversity
-control suite, server-side DDC recenter, relaxed IQ-stream rate cap). All
+ThetisLink v2.1.0 (capability broadcast, per-RX filter preset, diversity
+control suite, server-side DDC recenter, relaxed IQ-stream rate cap,
+wideband RX audio, modulation-change filter fan-out). All
 extensions are gated behind the **ThetisLink extensions** checkbox in Setup
 > Network > IQ Stream; with the checkbox unchecked the fork behaves like
 stock Thetis.

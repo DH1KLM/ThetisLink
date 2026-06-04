@@ -492,7 +492,7 @@ pub struct SdrRemoteApp {
     yaesu_mic_gain: f32, // multiplier for Yaesu USB TX audio (default 20x)
     yaesu_eq_enabled: bool,
     yaesu_eq_gains: [f32; 5], // -12..+12 dB per band
-    yaesu_eq_profiles: Vec<(String, bool, [f32; 5])>, // (name, enabled, gains)
+    yaesu_eq_profiles: Vec<(String, bool, [f32; 5], f32)>, // (name, enabled, gains, mic_gain)
     yaesu_eq_active_profile: String,
     yaesu_eq_new_name: String,
     yaesu_squelch: u16,       // 0-255
@@ -526,6 +526,12 @@ pub struct SdrRemoteApp {
     dx_spots_enabled: bool,
     // RX2 / VFO-B
     rx2_enabled: bool,
+    /// Opt-in: Thetis RX1/RX2/BinR audio in wideband Opus (16 kHz)
+    /// i.p.v. narrowband (8 kHz). Default false; gestuurd naar server
+    /// via `ControlId::ThetisWidebandAudio`. Zie memory
+    /// `reference_thetis_audio_paths` voor wanneer welke pad welk
+    /// sample-rate gebruikt.
+    thetis_wideband_audio: bool,
     rx2_popout: bool,
     popout_joined: bool,
     popout_meter_analog: bool,
@@ -728,11 +734,13 @@ impl SdrRemoteApp {
         let _ = cmd_tx.send(Command::SetVfoBVolume(config.vfo_b_volume));
         let _ = cmd_tx.send(Command::SetLocalVolume(config.local_volume));
         let _ = cmd_tx.send(Command::SetRx2Volume(config.rx2_volume));
-        // Restore EQ from active profile
-        if let Some((_, en, gains)) = config.yaesu_eq_profiles.iter()
-            .find(|(n, _, _)| n == &config.yaesu_eq_active) {
+        let _ = cmd_tx.send(Command::SetThetisWidebandAudio(config.thetis_wideband_audio));
+        // Restore EQ + mic gain from active profile
+        if let Some((_, en, gains, mic_gain)) = config.yaesu_eq_profiles.iter()
+            .find(|(n, _, _, _)| n == &config.yaesu_eq_active) {
             let _ = cmd_tx.send(Command::SetYaesuEqEnabled(*en));
             for i in 0..5 { let _ = cmd_tx.send(Command::SetYaesuEqBand(i as u8, gains[i])); }
+            let _ = cmd_tx.send(Command::SetYaesuTxGain(*mic_gain));
         }
         let _ = cmd_tx.send(Command::SetAgcEnabled(config.agc_enabled));
         if config.rx2_enabled {
@@ -1070,17 +1078,21 @@ impl SdrRemoteApp {
             yaesu_popout_init_applied: false,
             yaesu_popout_first_frame: true,
             yaesu_enable_sent: false,
-            yaesu_mic_gain: 0.5,
+            // Initialise mic gain from active profile; fallback 0.5 voor
+            // verse install of als geen profile actief is.
+            yaesu_mic_gain: config.yaesu_eq_profiles.iter()
+                .find(|(n, _, _, _)| n == &config.yaesu_eq_active)
+                .map(|(_, _, _, m)| *m).unwrap_or(0.5),
             yaesu_eq_enabled: {
                 // Load active EQ profile from config
                 config.yaesu_eq_profiles.iter()
-                    .find(|(n, _, _)| n == &config.yaesu_eq_active)
-                    .map(|(_, e, _)| *e).unwrap_or(false)
+                    .find(|(n, _, _, _)| n == &config.yaesu_eq_active)
+                    .map(|(_, e, _, _)| *e).unwrap_or(false)
             },
             yaesu_eq_gains: {
                 config.yaesu_eq_profiles.iter()
-                    .find(|(n, _, _)| n == &config.yaesu_eq_active)
-                    .map(|(_, _, g)| *g).unwrap_or([0.0; 5])
+                    .find(|(n, _, _, _)| n == &config.yaesu_eq_active)
+                    .map(|(_, _, g, _)| *g).unwrap_or([0.0; 5])
             },
             yaesu_eq_profiles: config.yaesu_eq_profiles.clone(),
             yaesu_eq_active_profile: config.yaesu_eq_active.clone(),
@@ -1119,6 +1131,7 @@ impl SdrRemoteApp {
             last_frame_time: Instant::now(),
             dx_spots_enabled: true,
             rx2_enabled: config.rx2_enabled,
+            thetis_wideband_audio: config.thetis_wideband_audio,
             rx2_popout: config.rx2_popout,
             popout_joined: config.popout_joined,
             popout_meter_analog: config.popout_meter_analog,
@@ -1414,6 +1427,7 @@ impl SdrRemoteApp {
             self.rx2_auto_ref_enabled,
             self.rx2_waterfall_contrast,
             self.rx2_enabled,
+            self.thetis_wideband_audio,
             self.popout_joined,
             self.popout_meter_analog,
             self.spectrum_popout,
@@ -3124,6 +3138,17 @@ impl SdrRemoteApp {
         );
         if let Some((click, true)) = mode_action {
             self.rx2_mode = click.mode;
+            // PATCH-tl2-rx2-mode-switch-filter-restore: spiegel RX1-gedrag
+            // (regel 2786-2790). Bij click op een RX2-mode-knop accepteren
+            // we server-side filter-updates weer (server's rx_filter_band
+            // na mode-switch overschrijft de lokaal-aangepaste filter-
+            // grenzen die voor het oude mode-profiel golden). Zonder deze
+            // reset valt de sync-loop-compare op `state.mode_rx2 !=
+            // self.rx2_mode` false omdat de optimistic `self.rx2_mode =
+            // click.mode` hierboven al was uitgevoerd; daardoor blijft
+            // `rx2_filter_changed_at = Some(...)` staan en negeert de
+            // sync-loop de inkomende Rx2FilterLow/High ControlIds.
+            self.rx2_filter_changed_at = None;
         }
 
         // -- Frequency step buttons (via controls::render_freq_step_controls) --
@@ -3298,6 +3323,29 @@ impl SdrRemoteApp {
                     mem.data.remove::<u64>(egui::Id::new(key));
                 });
             }
+        }
+        // PATCH-tl2-rx2-spectrum-filter-drag-isolation: RX2 filter-edge drag
+        // reader, spiegelt het RX1-pad (regel ~3290). Schreef voorheen naar
+        // dezelfde globale "spectrum_filter_low/high" keys waardoor de
+        // RX1-reader de update als RX1-filter doorgaf; nu per-channel
+        // keys via SpectrumPlotConfig. Server expects de andere edge mee
+        // in elke filter-update (low+high pair).
+        use sdr_remote_core::protocol::ControlId;
+        let drag_lo: Option<i32> = ctx.memory(|mem| mem.data.get_temp(egui::Id::new("rx2_spectrum_filter_low")));
+        let drag_hi: Option<i32> = ctx.memory(|mem| mem.data.get_temp(egui::Id::new("rx2_spectrum_filter_high")));
+        if let Some(hz) = drag_lo {
+            self.rx2_filter_low_hz = hz;
+            let _ = self.cmd_tx.send(Command::SetControl(ControlId::Rx2FilterLow, hz as i16 as u16));
+            let _ = self.cmd_tx.send(Command::SetControl(ControlId::Rx2FilterHigh, self.rx2_filter_high_hz as i16 as u16));
+            self.rx2_filter_changed_at = Some(std::time::Instant::now());
+            ctx.memory_mut(|mem| { mem.data.remove::<i32>(egui::Id::new("rx2_spectrum_filter_low")); });
+        }
+        if let Some(hz) = drag_hi {
+            self.rx2_filter_high_hz = hz;
+            let _ = self.cmd_tx.send(Command::SetControl(ControlId::Rx2FilterLow, self.rx2_filter_low_hz as i16 as u16));
+            let _ = self.cmd_tx.send(Command::SetControl(ControlId::Rx2FilterHigh, hz as i16 as u16));
+            self.rx2_filter_changed_at = Some(std::time::Instant::now());
+            ctx.memory_mut(|mem| { mem.data.remove::<i32>(egui::Id::new("rx2_spectrum_filter_high")); });
         }
     }
 
@@ -4381,16 +4429,20 @@ impl eframe::App for SdrRemoteApp {
 
             // Diversity
             ui.separator();
-            let div_resp = egui::CollapsingHeader::new(RichText::new("Diversity").strong().size(14.0))
-                .id_salt("collapse_diversity")
-                .default_open(self.collapse_diversity)
-                .show(ui, |ui| {
+            if helpers::chevron_label(
+                ui,
+                self.collapse_diversity,
+                RichText::new("Diversity").strong().size(14.0),
+            )
+            .clicked()
+            {
+                self.collapse_diversity = !self.collapse_diversity;
+                self.save_full_config();
+            }
+            if self.collapse_diversity {
+                ui.indent("diversity_body", |ui| {
                     self.render_diversity(ui);
                 });
-            let now_open = div_resp.openness >= 0.5;
-            if now_open != self.collapse_diversity {
-                self.collapse_diversity = now_open;
-                self.save_full_config();
             }
 
             }); // end of Radio-tab ScrollArea

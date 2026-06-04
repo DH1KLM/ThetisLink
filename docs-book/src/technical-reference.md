@@ -1,10 +1,10 @@
-# ThetisLink v2.0.4 - Technical Reference
+# ThetisLink v2.1.0 - Technical Reference
 
 ## 1. Overview
 
 ThetisLink is a system for remote operation of an ANAN 7000DLE + Thetis SDR receiver and a Yaesu FT-991A transceiver over a network connection. It provides bidirectional real-time audio streaming, PTT control, DDC spectrum/waterfall display, full RX2/VFO-B support, diversity, Yaesu memory channel management and radio settings editor over UDP with Opus codec.
 
-**Version:** v2.0.4 (shared version number in `sdr-remote-core::VERSION`)
+**Version:** v2.1.0 (shared version number in `sdr-remote-core::VERSION`)
 **Development language:** Rust + Kotlin (Android UI)
 **Target platform:** Windows 10/11, macOS (Intel/Apple Silicon), Android 8+ (arm64)
 **Design priority:** latency > bandwidth > features
@@ -26,9 +26,26 @@ All extensions are behind the **"ThetisLink extensions"** checkbox in Setup → 
 The default IQ sample rate is 384 kHz. With ThetisLink extensions the user can choose from: 48, 96, 192, 384, 768 or **1536 kHz** — selectable per receiver via the DDC sample rate dropdown in the client.
 
 **Repos:**
-- ThetisLink: [cjenschede/ThetisLink](https://github.com/cjenschede/ThetisLink) (public release repo, tag `v2.0.4`)
+- ThetisLink: [cjenschede/ThetisLink](https://github.com/cjenschede/ThetisLink) (public release repo, tag `v2.1.0`)
 - Thetis fork: [cjenschede/Thetis](https://github.com/cjenschede/Thetis) (branch `thetislink-tl2`)
 - Original Thetis: [ramdor/Thetis](https://github.com/ramdor/Thetis)
+
+### v2.1.0 highlights
+
+**Yaesu G-1000DXC rotor via MCP2221A, opt-in wideband Thetis RX, Amplitec reconnect, RX2 filter fixes.** Backwards-compatible with v2.0.4 — wire protocol unchanged; all extensions are server-side and visible through the existing Rotor / Amplitec / TCI channels. Server, desktop client and Android client carry the same `VERSION = "2.1.0"`; pair with **Thetis fork PA3GHM TL2-4** for the full feature-set, fall back to stock Thetis without losing safety guarantees.
+
+- **Yaesu G-1000DXC rotor via Adafruit MCP2221A** — third rotor backend alongside EA7HG and PstRotator. Direct control of the Yaesu EXT CONTROL DIN-7 connector through an MCP2221A breakout in **5 V mode** (3 V solder-jumper cut, 5 V pad bridged on the Adafruit underside). GPIO0/1 → BST82 SOT-23 low-side switches on pin 1 (R/CW) and pin 2 (L/CCW), with 100 kΩ gate pull-down to prevent spurious rotation during USB reset. GP2 (5-bit DAC) → speed pin 3 with DAC-Vref = Vdd. GP3 (10-bit ADC, internal Vrm = 4.096 V) ← position-feedback pin 4 through a **1.8 kΩ + 2.2 kΩ** divider (ratio 1.818, max measurable ~7.45 V — some G-1000DXC units exceed the schema-spec of 4.5 V and reach ~7.3 V on pin 4 at 450°). The server-side poll thread combines adaptive sample rate (30 Hz motion / 1 Hz idle, median filter rejecting 50/100 Hz mains ripple), soft-start / soft-stop ramp (`ramp_pct_per_sec`, 1-200 %/s, default 50), 1° GoTo deadband with deceleration-distance-based landing, shortest-route option for `max_deg > 360°` (target ± 360 evaluated against the mechanical distance), and a manual-mode override that lets the server-UI test buttons + speed slider win over the ramp loop. The driver publishes the same `Rotor` facade as the other backends, so the existing Rotor window on both clients works without modification.
+- **Opt-in wideband Thetis RX audio** — checkbox in the Server tab raises the RX audio sample rate above the stock 48 kHz when the Thetis-fork extension is present. Default off; stock-Thetis path unchanged. Requires Thetis fork **PA3GHM TL2-4** for the wideband-IQ command.
+- **Modular multi-tuner wizard** — `Vec<TunerConfig>` schema replaces the previous 2-tuner-hardcoded path. Per-slot Add via board-scan + classification (Tuner / Rotor / Unprogrammed) + EEPROM write of the chosen function. Per-slot Rename, Delete (with server restart) and threshold/hysteresis slider. The MCP2221A block in the Status panel is collapsible; open/closed state persists across restarts.
+- **Amplitec 6/2 reconnect + offline start** — serial worker thread has a 5-second retry loop. On a power-cycle of the Amplitec the driver marks `connected = false` and keeps retrying until the device returns — no server restart needed. On server start with the Amplitec offline the instance is still created so the window appears; the connection follows automatically once the port becomes available.
+- **RX2 mode-switch filter restore** — the client's `handleModulation` path now honours the server's filter-band update during a mode switch (USB → CW, etc.) instead of carrying over the stale filter edges of the previous mode.
+- **RX2 spectrum filter-drag isolation** — per-channel filter-edge drag-state keys decouple RX1 and RX2; a drag on RX2 no longer pulls RX1's filter along.
+- **Yaesu EQ profile mic-gain persistence** — the mic-gain slider is now saved with the band/treble values when an EQ profile is stored.
+- **Yaesu TX resampler anti-alias** — sharper filter curve on the client TX resampler reduces aliasing artefacts in the transmitted audio.
+- **Status panel scroll stability** — `try_lock` contention on the SessionManager previously rendered a 1-line "snapshot busy…" placeholder, which made the ScrollArea clamp its scroll position whenever a parent section briefly shrank. A snapshot cache now absorbs lock failures and keeps the section height constant.
+- **Graceful server auto-restart** — Drop handlers on all hardware Arcs (Yaesu, Amplitec, Tuner, SPE, RF2K, UltraBeam) now run before the child process spawns, so cpal audio streams and the TCI WebSocket release cleanly. Audio on the new instance works on the first attempt without a manual stop+start cycle.
+- **UI polish** — all CollapsingHeader widgets replaced by `chevron_label` with a geometric triangle glyph (ASCII-only, no egui-default-font tofu). Server Settings tab wrapped in a ScrollArea for smaller displays. Amplitec antenna rename via right-click context menu, plus auto-scale buttons for long names. Client frequency-digit hover blocks the parent ScrollArea so mouse-wheel digit edits no longer scroll the surrounding panel. Rotor-poll log spam (per-tick `set_direction` + 5-second ADC stats) demoted to `debug!`.
+- **Hardware note — Yaesu rotor printje** — builders reproducing the same setup: use **1.8 kΩ + 2.2 kΩ** for the position-feedback divider (ratio 1.818). The initial 1.8 kΩ + 10 kΩ design (ratio 1.18) clipped above ~365° on some G-1000DXC units where pin 4 climbs above 4.8 V. A 10 µF capacitor in parallel with the 2.2 kΩ resistor suppresses the 100 Hz mains-rectifier ripple on the position signal. After any divider change **recalibrate** via Park CCW + Park CW — the stored `v_at_0deg` / `v_at_max_deg` values depend on the ratio.
 
 ### v2.0.4 highlights
 
@@ -96,7 +113,7 @@ The v2.0.0 release is a major step compared to the v0.x line. Key changes:
 
 ## 2. Architecture
 
-ThetisLink v2.0.4 uses a single TCI WebSocket connection to Thetis for audio, IQ and all radio commands. With the PA3GHM fork the additional `_ex` commands extend the surface (CTUN auto-recenter, diversity, per-RX DDC sample rate, `rx_only_ex` preventive TX-inhibit). No parallel CAT connection is required against either stock v2.10.3.15 or the fork.
+ThetisLink v2.1.0 uses a single TCI WebSocket connection to Thetis for audio, IQ and all radio commands. With the PA3GHM fork the additional `_ex` commands extend the surface (CTUN auto-recenter, diversity, per-RX DDC sample rate, `rx_only_ex` preventive TX-inhibit). No parallel CAT connection is required against either stock v2.10.3.15 or the fork.
 
 ```mermaid
 flowchart LR
@@ -744,7 +761,7 @@ TCI (Transceiver Control Interface) is a WebSocket-based protocol built into The
 
 ### Stock vs fork TCI sub-protocol
 
-ThetisLink v2.0.4 talks TCI to both **stock Thetis v2.10.3.15** and the **PA3GHM fork (TL2-3)**. The base protocol is identical — but the fork adds an `_ex` extension layer that ThetisLink uses when available, including the v2.0.4 `rx_only_ex` preventive TX-inhibit.
+ThetisLink v2.1.0 talks TCI to both **stock Thetis v2.10.3.15** and the **PA3GHM fork (TL2-4)**. The base protocol is identical — but the fork adds an `_ex` extension layer that ThetisLink uses when available, including the `rx_only_ex` preventive TX-inhibit (TL2-3+) and the wideband-IQ extension (TL2-4).
 
 **Capability negotiation:** at connect time the client requests `tci_caps_ex;`. With the fork (and the "ThetisLink extensions" Setup checkbox enabled) Thetis responds with a list of supported `_ex` capabilities (`auto_recenter_ex`, `rx_filter_preset_ex`, `ddc_sample_rate_ex`, `diversity_ex`, ...). Stock Thetis does not implement `tci_caps_ex` and the request times out → ThetisLink falls back to stock-mode behaviour.
 
@@ -1232,19 +1249,19 @@ The RX Volume (RX1 AF Gain) is bidirectionally synchronized between Thetis and a
 
 ## 15. External Devices
 
-ThetisLink supports 7 external devices via the server. Status is read and forwarded to all connected clients. Each device can be individually enabled/disabled in the server settings.
+ThetisLink defines 7 wire-protocol `DeviceType` values (0x01..0x07). Status is read by the server and forwarded to all connected clients. Each device can be individually enabled/disabled in the server settings. The `Rotor` value (0x06) covers three different rotor backends, mutually exclusive via the `rotor_backend` setting in the server config.
 
 ### DeviceType enum
 
 | Value | Device | Connection |
 |-------|--------|------------|
 | 0x01 | Amplitec 6/2 Antenna Switch | Serial USB-TTL, 9600 baud |
-| 0x02 | JC-4s / JC-3s Antenna Tuner (×2) | Adafruit MCP2221A USB-HID |
+| 0x02 | JC-4s / JC-3s Antenna Tuner (up to 2 in parallel) | Adafruit MCP2221A USB-HID |
 | 0x03 | SPE Expert 1.3K-FA Linear Amplifier | Serial USB, 115200 baud |
 | 0x04 | RF2K-S Linear Amplifier | TCP/IP |
 | 0x05 | UltraBeam RCU-06 Antenna Controller | Serial USB, 19200 baud |
-| 0x06 | EA7HG Visual Rotor | UDP, port 2570 |
-| 0x07 | RemoteServer | Internal |
+| 0x06 | Rotor (3 backends, one active at a time): EA7HG Visual Rotor / PstRotator (XML/UDP) / Yaesu G-1000DXC (MCP2221A, v2.1.0+) | UDP / UDP-XML / USB-HID depending on backend |
+| 0x07 | RemoteServer | Internal (no external hardware — server-side reboot/shutdown control) |
 
 ### Amplitec 6/2 Antenna Switch
 

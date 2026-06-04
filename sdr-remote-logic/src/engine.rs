@@ -9,7 +9,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{interval, Duration};
 
-use sdr_remote_core::codec::{OpusDecoder, OpusEncoderWideband};
+use sdr_remote_core::codec::{OpusDecoder, OpusDecoderWideband, OpusEncoderWideband};
 use sdr_remote_core::jitter::{BufferedFrame, JitterBuffer, JitterResult};
 use sdr_remote_core::protocol::*;
 use sdr_remote_core::{FRAME_SAMPLES, FRAME_SAMPLES_WIDEBAND, MAX_PACKET_SIZE, NETWORK_SAMPLE_RATE, NETWORK_SAMPLE_RATE_WIDEBAND};
@@ -123,6 +123,13 @@ impl ClientEngine {
         let mut dec_rx1 = OpusDecoder::new()?;
         let mut dec_bin_r = OpusDecoder::new()?;
         let mut dec_rx2 = OpusDecoder::new()?;
+        // Wideband parallel-decoders. Worden gebruikt zodra een
+        // multi-channel packet binnenkomt met `Flags::AUDIO_WIDEBAND`
+        // (opt-in via Settings → Audio). Default unused; geen
+        // runtime-impact zolang server NB streamt.
+        let mut dec_rx1_wb = OpusDecoderWideband::new()?;
+        let mut dec_bin_r_wb = OpusDecoderWideband::new()?;
+        let mut dec_rx2_wb = OpusDecoderWideband::new()?;
 
         // Yaesu (FT-991A) codec + jitter buffer â€" independent third audio channel
         let mut yaesu_decoder = OpusDecoder::new()?;
@@ -133,10 +140,17 @@ impl ClientEngine {
         let mut yaesu_tx_sequence: u32 = 0;
         let mut yaesu_tx_accum: Vec<f32> = Vec::new();
         let mut yaesu_tx_encoder = OpusEncoderWideband::new()?;
+        // Anti-alias filter: sinc_len 128 + f_cutoff 0.95 (identiek aan
+        // server-side Yaesu TX resampler). De korte filter (sinc_len 32)
+        // liet NT-USB content >8 kHz onvoldoende afsnijden, waardoor die
+        // frequenties bij de 48→16 kHz decimatie terug-aliassen in
+        // 0-8 kHz en op de RF-uitgang als "raar klinkende" hoge tonen
+        // hoorbaar waren (owner-bevinding 2026-06-02). ~4 ms extra
+        // filter delay — verwaarloosbaar voor mic→Yaesu pad.
         let mut yaesu_tx_resampler = rubato::SincFixedIn::<f32>::new(
             NETWORK_SAMPLE_RATE_WIDEBAND as f64 / capture_rate as f64, 1.0,
             rubato::SincInterpolationParameters {
-                sinc_len: 32, f_cutoff: 0.90, oversampling_factor: 32,
+                sinc_len: 128, f_cutoff: 0.95, oversampling_factor: 128,
                 interpolation: rubato::SincInterpolationType::Cubic,
                 window: rubato::WindowFunction::Blackman,
             },
@@ -161,6 +175,18 @@ impl ClientEngine {
         let mut res_rx2_out = rubato::SincFixedIn::<f32>::new(
             playback_rate as f64 / NETWORK_SAMPLE_RATE as f64, 1.0, mk_sinc(), FRAME_SAMPLES, 1,
         ).context("RX2 8k->device resampler")?;
+        // Wideband (16 kHz → playback_rate) parallel-resamplers voor de
+        // opt-in WB Thetis-audio pad. Idle zolang geen WB-getagde packet
+        // binnenkomt.
+        let mut res_rx1_out_wb = rubato::SincFixedIn::<f32>::new(
+            playback_rate as f64 / NETWORK_SAMPLE_RATE_WIDEBAND as f64, 1.0, mk_sinc(), FRAME_SAMPLES_WIDEBAND, 1,
+        ).context("RX1 16k->device WB resampler")?;
+        let mut res_bin_r_out_wb = rubato::SincFixedIn::<f32>::new(
+            playback_rate as f64 / NETWORK_SAMPLE_RATE_WIDEBAND as f64, 1.0, mk_sinc(), FRAME_SAMPLES_WIDEBAND, 1,
+        ).context("BinR 16k->device WB resampler")?;
+        let mut res_rx2_out_wb = rubato::SincFixedIn::<f32>::new(
+            playback_rate as f64 / NETWORK_SAMPLE_RATE_WIDEBAND as f64, 1.0, mk_sinc(), FRAME_SAMPLES_WIDEBAND, 1,
+        ).context("RX2 16k->device WB resampler")?;
 
         let sinc_params_yaesu = rubato::SincInterpolationParameters {
             sinc_len: 32, f_cutoff: 0.90, oversampling_factor: 32,
@@ -176,10 +202,17 @@ impl ClientEngine {
         )
         .context("create Yaesu 8k->device resampler")?;
 
+        // Anti-alias parameters voor de TX-capture decimatie 48 → 16 kHz.
+        // Sinds build 29: identiek aan yaesu_tx_resampler — brede USB-mics
+        // (NT-USB e.d.) hebben content tot 16 kHz die anders terug-alias
+        // in 0-8 kHz en op de ANAN/Thetis TX-uitgang hoorbaar wordt
+        // bij FM/AM-TX (SSB blijft binnen 3 kHz dus subtieler).
+        // Comment-naam (`device->8k`) blijft historisch; pad encodeert
+        // wel naar 16 kHz wideband Opus (zie `OpusEncoderWideband`).
         let sinc_params_in = rubato::SincInterpolationParameters {
-            sinc_len: 32,
-            f_cutoff: 0.90,
-            oversampling_factor: 32,
+            sinc_len: 128,
+            f_cutoff: 0.95,
+            oversampling_factor: 128,
             interpolation: rubato::SincInterpolationType::Cubic,
             window: rubato::WindowFunction::Blackman,
         };
@@ -190,7 +223,7 @@ impl ClientEngine {
             capture_frame_samples,
             1,
         )
-        .context("create device->8k resampler")?;
+        .context("create device->16k resampler")?;
 
         // State
         let mut state = RadioState::default();
@@ -602,12 +635,25 @@ impl ClientEngine {
                                             interpolation: rubato::SincInterpolationType::Cubic,
                                             window: rubato::WindowFunction::Blackman,
                                         };
+                                        // Yaesu TX heeft een scherpere anti-alias filter nodig
+                                        // dan de RX-resamplers: brede USB-mics (NT-USB) hebben
+                                        // content tot 16 kHz die anders terug-alias in 0-8 kHz.
+                                        // Zie initial create van yaesu_tx_resampler boven.
+                                        let mksp_aa = || rubato::SincInterpolationParameters {
+                                            sinc_len: 128, f_cutoff: 0.95, oversampling_factor: 128,
+                                            interpolation: rubato::SincInterpolationType::Cubic,
+                                            window: rubato::WindowFunction::Blackman,
+                                        };
                                         if let Ok(r) = rubato::SincFixedIn::new(playback_rate as f64 / NETWORK_SAMPLE_RATE as f64, 1.0, mksp(), FRAME_SAMPLES, 1) { res_rx1_out = r; }
                                         if let Ok(r) = rubato::SincFixedIn::new(playback_rate as f64 / NETWORK_SAMPLE_RATE as f64, 1.0, mksp(), FRAME_SAMPLES, 1) { res_bin_r_out = r; }
                                         if let Ok(r) = rubato::SincFixedIn::new(playback_rate as f64 / NETWORK_SAMPLE_RATE as f64, 1.0, mksp(), FRAME_SAMPLES, 1) { res_rx2_out = r; }
                                         if let Ok(r) = rubato::SincFixedIn::new(playback_rate as f64 / NETWORK_SAMPLE_RATE as f64, 1.0, mksp(), FRAME_SAMPLES, 1) { yaesu_resampler_out = r; }
-                                        if let Ok(r) = rubato::SincFixedIn::new(NETWORK_SAMPLE_RATE_WIDEBAND as f64 / capture_rate as f64, 1.0, mksp(), capture_frame_samples, 1) { resampler_in = r; }
-                                        if let Ok(r) = rubato::SincFixedIn::new(NETWORK_SAMPLE_RATE_WIDEBAND as f64 / capture_rate as f64, 1.0, mksp(), capture_frame_samples, 1) { yaesu_tx_resampler = r; }
+                                        if let Ok(r) = rubato::SincFixedIn::new(NETWORK_SAMPLE_RATE_WIDEBAND as f64 / capture_rate as f64, 1.0, mksp_aa(), capture_frame_samples, 1) { resampler_in = r; }
+                                        if let Ok(r) = rubato::SincFixedIn::new(NETWORK_SAMPLE_RATE_WIDEBAND as f64 / capture_rate as f64, 1.0, mksp_aa(), capture_frame_samples, 1) { yaesu_tx_resampler = r; }
+                                        // Rebuild WB Thetis-RX resamplers (opt-in pad).
+                                        if let Ok(r) = rubato::SincFixedIn::new(playback_rate as f64 / NETWORK_SAMPLE_RATE_WIDEBAND as f64, 1.0, mksp(), FRAME_SAMPLES_WIDEBAND, 1) { res_rx1_out_wb = r; }
+                                        if let Ok(r) = rubato::SincFixedIn::new(playback_rate as f64 / NETWORK_SAMPLE_RATE_WIDEBAND as f64, 1.0, mksp(), FRAME_SAMPLES_WIDEBAND, 1) { res_bin_r_out_wb = r; }
+                                        if let Ok(r) = rubato::SincFixedIn::new(playback_rate as f64 / NETWORK_SAMPLE_RATE_WIDEBAND as f64, 1.0, mksp(), FRAME_SAMPLES_WIDEBAND, 1) { res_rx2_out_wb = r; }
                                         info!("Resamplers rebuilt: capture {}Hz, playback {}Hz", capture_rate, playback_rate);
                                     }
                                     // Reset all jitter buffers to prevent stale frame buildup
@@ -642,12 +688,22 @@ impl ClientEngine {
                                             interpolation: rubato::SincInterpolationType::Cubic,
                                             window: rubato::WindowFunction::Blackman,
                                         };
+                                        // Yaesu TX scherpere anti-alias (zie initial create).
+                                        let mksp_aa = || rubato::SincInterpolationParameters {
+                                            sinc_len: 128, f_cutoff: 0.95, oversampling_factor: 128,
+                                            interpolation: rubato::SincInterpolationType::Cubic,
+                                            window: rubato::WindowFunction::Blackman,
+                                        };
                                         if let Ok(r) = rubato::SincFixedIn::new(playback_rate as f64 / NETWORK_SAMPLE_RATE as f64, 1.0, mksp(), FRAME_SAMPLES, 1) { res_rx1_out = r; }
                                         if let Ok(r) = rubato::SincFixedIn::new(playback_rate as f64 / NETWORK_SAMPLE_RATE as f64, 1.0, mksp(), FRAME_SAMPLES, 1) { res_bin_r_out = r; }
                                         if let Ok(r) = rubato::SincFixedIn::new(playback_rate as f64 / NETWORK_SAMPLE_RATE as f64, 1.0, mksp(), FRAME_SAMPLES, 1) { res_rx2_out = r; }
                                         if let Ok(r) = rubato::SincFixedIn::new(playback_rate as f64 / NETWORK_SAMPLE_RATE as f64, 1.0, mksp(), FRAME_SAMPLES, 1) { yaesu_resampler_out = r; }
-                                        if let Ok(r) = rubato::SincFixedIn::new(NETWORK_SAMPLE_RATE_WIDEBAND as f64 / capture_rate as f64, 1.0, mksp(), capture_frame_samples, 1) { resampler_in = r; }
-                                        if let Ok(r) = rubato::SincFixedIn::new(NETWORK_SAMPLE_RATE_WIDEBAND as f64 / capture_rate as f64, 1.0, mksp(), capture_frame_samples, 1) { yaesu_tx_resampler = r; }
+                                        if let Ok(r) = rubato::SincFixedIn::new(NETWORK_SAMPLE_RATE_WIDEBAND as f64 / capture_rate as f64, 1.0, mksp_aa(), capture_frame_samples, 1) { resampler_in = r; }
+                                        if let Ok(r) = rubato::SincFixedIn::new(NETWORK_SAMPLE_RATE_WIDEBAND as f64 / capture_rate as f64, 1.0, mksp_aa(), capture_frame_samples, 1) { yaesu_tx_resampler = r; }
+                                        // Rebuild WB Thetis-RX resamplers (opt-in pad).
+                                        if let Ok(r) = rubato::SincFixedIn::new(playback_rate as f64 / NETWORK_SAMPLE_RATE_WIDEBAND as f64, 1.0, mksp(), FRAME_SAMPLES_WIDEBAND, 1) { res_rx1_out_wb = r; }
+                                        if let Ok(r) = rubato::SincFixedIn::new(playback_rate as f64 / NETWORK_SAMPLE_RATE_WIDEBAND as f64, 1.0, mksp(), FRAME_SAMPLES_WIDEBAND, 1) { res_bin_r_out_wb = r; }
+                                        if let Ok(r) = rubato::SincFixedIn::new(playback_rate as f64 / NETWORK_SAMPLE_RATE_WIDEBAND as f64, 1.0, mksp(), FRAME_SAMPLES_WIDEBAND, 1) { res_rx2_out_wb = r; }
                                         info!("Resamplers rebuilt: capture {}Hz, playback {}Hz", capture_rate, playback_rate);
                                     }
                                     jitter_buf.reset();
@@ -1202,6 +1258,15 @@ impl ClientEngine {
                             state.dx_spots.clear();
                         }
                     }
+                    Command::SetThetisWidebandAudio(on) => {
+                        if let Some(ref addr) = server_addr {
+                            let ctrl = ControlPacket { control_id: ControlId::ThetisWidebandAudio, value: on as u16 };
+                            let mut buf = [0u8; ControlPacket::SIZE];
+                            ctrl.serialize(&mut buf);
+                            let _ = send_tx!(&buf, addr.as_str());
+                            info!("Thetis wideband audio sent: {}", on);
+                        }
+                    }
                     // RX2 / VFO-B commands
                     Command::SetRx2Enabled(enabled) => {
                         state.rx2_enabled = enabled;
@@ -1506,6 +1571,7 @@ impl ClientEngine {
                                     timestamp: pkt.timestamp,
                                     opus_data: blob,
                                     ptt: false,
+                                    wideband: pkt.flags.wideband(),
                                 },
                                 arrival_ms,
                             );
@@ -1785,6 +1851,7 @@ impl ClientEngine {
                                     timestamp: pkt.timestamp,
                                     opus_data: blob,
                                     ptt: false,
+                                    wideband: pkt.flags.wideband(),
                                 },
                                 arrival_ms,
                             );
@@ -1949,6 +2016,7 @@ impl ClientEngine {
                                 ControlId::ThetisSwr => state.thetis_swr_x100 = ctrl.value,
                                 ControlId::VfoSync => state.vfo_sync = ctrl.value != 0,
                                 ControlId::DxSpotsEnabled => state.dx_spots_enabled = ctrl.value != 0,
+                                ControlId::ThetisWidebandAudio => {} // client→server only; server echoes ignored
                                 ControlId::Rx2SpectrumEnable | ControlId::Rx2SpectrumFps
                                 | ControlId::Rx2SpectrumZoom | ControlId::Rx2SpectrumPan
                                 | ControlId::Rx2SpectrumMaxBins
@@ -2255,6 +2323,9 @@ impl ClientEngine {
                                     timestamp: pkt.timestamp,
                                     opus_data: pkt.opus_data,
                                     ptt: false,
+                                    // Yaesu RX-pad is narrowband (zie OpusDecoder::new()
+                                    // verderop). Wideband-flag past niet op deze stream.
+                                    wideband: false,
                                 },
                                 arrival_ms,
                             );
@@ -2424,11 +2495,15 @@ impl ClientEngine {
                                     break;
                                 }
 
-                                // Pull multi-channel frame from jitter buffer
-                                let frame_data: Option<Vec<u8>> = match jitter_buf.pull() {
+                                // Pull multi-channel frame from jitter buffer.
+                                // Tuple-payload `(blob, wideband)` zodat de decoder bij
+                                // pop weet op welk pad het frame thuishoort (WB = 16 kHz
+                                // Opus i.p.v. 8 kHz). Default false voor frames die
+                                // door FEC/PLC zijn opgevuld — die paden blijven NB.
+                                let frame_data: Option<(Vec<u8>, bool)> = match jitter_buf.pull() {
                                     JitterResult::Frame(frame) => {
                                         frames_this_tick += 1;
-                                        if !frame.opus_data.is_empty() { Some(frame.opus_data) } else { None }
+                                        if !frame.opus_data.is_empty() { Some((frame.opus_data, frame.wideband)) } else { None }
                                     }
                                     JitterResult::Missing => {
                                         frames_this_tick += 1;
@@ -2479,7 +2554,7 @@ impl ClientEngine {
                                     }
                                 };
 
-                                if let Some(blob) = frame_data {
+                                if let Some((blob, is_wb)) = frame_data {
                                     // Deserialize multi-channel blob
                                     let mut rx1_pcm: Option<Vec<i16>> = None;
                                     let mut bin_r_pcm: Option<Vec<i16>> = None;
@@ -2494,10 +2569,30 @@ impl ClientEngine {
                                             let opus_len = u16::from_be_bytes([blob[pos+1], blob[pos+2]]) as usize;
                                             if pos + 3 + opus_len > blob.len() { break; }
                                             let opus = &blob[pos+3..pos+3+opus_len];
+                                            // Decoder-pad keuze op basis van WB-flag van dit packet.
+                                            // Yaesu-RX heeft een eigen jitter-buf (geen WB-pad daar).
                                             match ch_id {
-                                                0 => { rx1_pcm = dec_rx1.decode(opus).ok(); }
-                                                1 => { bin_r_pcm = dec_bin_r.decode(opus).ok(); }
-                                                2 => { rx2_pcm = dec_rx2.decode(opus).ok(); }
+                                                0 => {
+                                                    rx1_pcm = if is_wb {
+                                                        dec_rx1_wb.decode(opus).ok()
+                                                    } else {
+                                                        dec_rx1.decode(opus).ok()
+                                                    };
+                                                }
+                                                1 => {
+                                                    bin_r_pcm = if is_wb {
+                                                        dec_bin_r_wb.decode(opus).ok()
+                                                    } else {
+                                                        dec_bin_r.decode(opus).ok()
+                                                    };
+                                                }
+                                                2 => {
+                                                    rx2_pcm = if is_wb {
+                                                        dec_rx2_wb.decode(opus).ok()
+                                                    } else {
+                                                        dec_rx2.decode(opus).ok()
+                                                    };
+                                                }
                                                 _ => {}
                                             }
                                             pos += 3 + opus_len;
@@ -2516,10 +2611,17 @@ impl ClientEngine {
                                         }
                                     }
 
-                                    // Resample and route based on audio_mode
+                                    // Resample and route based on audio_mode.
+                                    // Per-channel kiezen we de juiste resampler op basis
+                                    // van het WB-vlag-pad (16k vs 8k input). Output is
+                                    // altijd op playback_rate.
                                     // RX1 → always L
                                     let mut left_dev = if let Some(pcm) = rx1_pcm {
-                                        let mut dev = resample_to_device(&mut res_rx1_out, &pcm);
+                                        let mut dev = if is_wb {
+                                            resample_to_device(&mut res_rx1_out_wb, &pcm)
+                                        } else {
+                                            resample_to_device(&mut res_rx1_out, &pcm)
+                                        };
                                         apply_volume(&mut dev, rx_volume * vfo_a_volume * local_volume);
                                         let sq: f32 = dev.iter().map(|s| s*s).sum();
                                         rx1_level_accum += sq;
@@ -2529,7 +2631,11 @@ impl ClientEngine {
 
                                     // Resample RX2 once if available (reused in Mono, BIN, Split)
                                     let rx2_dev = if let Some(pcm) = &rx2_pcm {
-                                        let mut dev = resample_to_device(&mut res_rx2_out, pcm);
+                                        let mut dev = if is_wb {
+                                            resample_to_device(&mut res_rx2_out_wb, pcm)
+                                        } else {
+                                            resample_to_device(&mut res_rx2_out, pcm)
+                                        };
                                         let rx2_vol = rx2_volume * vfo_b_volume * local_volume;
                                         apply_volume(&mut dev, rx2_vol);
                                         let sq: f32 = dev.iter().map(|s| s*s).sum();
@@ -2555,7 +2661,11 @@ impl ClientEngine {
                                     } else if audio_mode == 1 {
                                         // BIN: R = binaural right (ch1), volume = RX1
                                         if let Some(pcm) = bin_r_pcm {
-                                            let mut dev = resample_to_device(&mut res_bin_r_out, &pcm);
+                                            let mut dev = if is_wb {
+                                                resample_to_device(&mut res_bin_r_out_wb, &pcm)
+                                            } else {
+                                                resample_to_device(&mut res_bin_r_out, &pcm)
+                                            };
                                             apply_volume(&mut dev, rx_volume * vfo_a_volume * local_volume);
                                             dev
                                         } else { left_dev.clone() } // fallback mono

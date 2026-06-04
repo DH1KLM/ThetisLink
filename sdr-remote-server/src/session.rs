@@ -174,6 +174,12 @@ pub struct ClientSession {
     /// S-meter source-subscription bitmap (see `ControlId::SmeterSources` doc).
     /// Default 0x22 = RX1 Avg + RX2 Avg — matches pre-multi-source behaviour.
     pub smeter_sources: u16,
+    /// Wideband-Thetis-audio opt-in: when true the server encodes
+    /// RX1/RX2/BinR via wideband Opus (16 kHz, ~30 kbps/ch) i.p.v.
+    /// narrowband (8 kHz, ~14 kbps/ch) en accepteert TX-audio met
+    /// `Flags::AUDIO_WIDEBAND` gezet. Default false — opt-in via
+    /// `ControlId::ThetisWidebandAudio` from the client.
+    pub thetis_wideband_audio: bool,
 }
 
 /// Result of touching a session
@@ -311,6 +317,7 @@ impl SessionManager {
             dx_spots_enabled: true,
             allow_zoom_below_2x: false,
             smeter_sources: 0x22,
+            thetis_wideband_audio: false,
         });
         info!("Auth challenge sent to {}", addr);
         nonce
@@ -409,6 +416,7 @@ impl SessionManager {
                 dx_spots_enabled: true,
                 allow_zoom_below_2x: false,
                 smeter_sources: 0x22,
+                thetis_wideband_audio: false,
             });
             TouchResult::NewClient
         }
@@ -598,6 +606,26 @@ impl SessionManager {
         if let Some(session) = self.clients.get_mut(&addr) {
             session.audio_mode = mode;
         }
+    }
+
+    /// Per-client wideband-audio opt-in. Returns false voor unknown
+    /// addrs (graceful default to narrowband).
+    pub fn client_thetis_wideband(&self, addr: SocketAddr) -> bool {
+        self.clients.get(&addr).map(|s| s.thetis_wideband_audio).unwrap_or(false)
+    }
+
+    pub fn set_thetis_wideband(&mut self, addr: SocketAddr, on: bool) {
+        if let Some(session) = self.clients.get_mut(&addr) {
+            session.thetis_wideband_audio = on;
+        }
+    }
+
+    /// Server moet wideband encoderen zolang ten minste één actieve
+    /// client de optie aan heeft staan; anders is de WB-encode-tak
+    /// pure CPU-overhead.
+    pub fn any_client_wants_thetis_wideband(&self) -> bool {
+        self.clients.values()
+            .any(|s| s.thetis_wideband_audio && Self::is_active_authed(s))
     }
 
     /// Resolve effective audio mode across all active clients.
@@ -807,6 +835,7 @@ mod tests {
             dx_spots_enabled: true,
             allow_zoom_below_2x: allow,
             smeter_sources: 0x22,
+            thetis_wideband_audio: false,
         }
     }
 

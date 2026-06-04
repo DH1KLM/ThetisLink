@@ -6,6 +6,7 @@ mod audio_stats;
 mod config;
 mod mcp2221_debug;
 mod mcp2221_scan;
+mod mcp2221_yaesu_rotor;
 mod mdns;
 mod ctun_recenter;
 mod dxcluster;
@@ -390,6 +391,7 @@ fn main() -> Result<()> {
             totp_enabled: defaults.totp_enabled,
             friendly_name: defaults.friendly_name,
             tuners: defaults.tuners,
+            rotors: defaults.rotors,
         };
         info!("Starting with tci={:?}", config.tci_addr);
         let rt = tokio::runtime::Runtime::new()?;
@@ -564,20 +566,16 @@ pub async fn run_server_async(
     }
 
     // Amplitec antenna switch — use prebuilt (from GUI) or create here (CLI mode)
+    // De serial-thread retry zelf naar binnen toe, dus we maken de
+    // instance altijd zodra de poort geconfigureerd is — ook als het
+    // apparaat nu offline staat. De UI ziet `connected=false` tot het
+    // bord weer aangesloten is.
     let amplitec = if amplitec_prebuilt.is_some() {
         amplitec_prebuilt
     } else if config.amplitec_enabled && config.amplitec_port.is_some() {
         let port_name = config.amplitec_port.as_ref().unwrap();
-        match amplitec::AmplitecSwitch::new(port_name) {
-            Ok(sw) => {
-                info!("Amplitec 6/2 connected on {}", port_name);
-                Some(Arc::new(sw))
-            }
-            Err(e) => {
-                warn!("Amplitec init failed: {}", e);
-                None
-            }
-        }
+        info!("Amplitec 6/2 starting on {} (thread retries until reachable)", port_name);
+        Some(Arc::new(amplitec::AmplitecSwitch::new(port_name)))
     } else {
         None
     };
@@ -669,6 +667,14 @@ pub async fn run_server_async(
     // idempotent-safe via OnceLock.
     let _ = status_panel_state.tuners_slot.set(tuners.clone());
 
+    // PATCH-yaesu-rotor-mcp2221 fase 3+4+5: RotorInstance wordt nu in
+    // de rotor-backend match-arm hieronder aangemaakt (alleen voor
+    // backend == "mcp2221_yaesu"), zodat de Rotor-facade en de
+    // status_panel-RotorInstance één gedeelde MCP2221A driver delen.
+    // De drie rotor-backends (EA7HG TCP / PstRotator UDP / Adafruit
+    // MCP2221A) zijn mutex-exclusief — slechts één tegelijk actief om
+    // hardware-conflicten te voorkomen.
+
     // UltraBeam RCU-06 — use prebuilt (from GUI) or create here (CLI mode)
     let ultrabeam = if ultrabeam_prebuilt.is_some() {
         ultrabeam_prebuilt
@@ -715,6 +721,55 @@ pub async fn run_server_async(
                         has_elevation: config.pstrotator_has_elevation,
                     });
                     Some(Arc::new(rotor::Rotor::from_handles(tx, status)))
+                }
+            }
+            "mcp2221_yaesu" => {
+                // Aansturing direct via een Adafruit MCP2221A-printje
+                // (PATCH-yaesu-rotor-mcp2221). Slot 0 in config.rotors;
+                // de RotorInstance maakt zelf de poll-thread + Rotor
+                // facade. We publiceren de RotorInstance óók in
+                // `rotor_slot` zodat het status-panel zijn live ADC +
+                // Park-knoppen + DAC-slider blijft tonen, en de Rotor
+                // facade gaat de bestaande client-rotor-window kant op.
+                if let Some(rot_cfg) = config.rotors.first() {
+                    if rot_cfg.enabled && rot_cfg.mcp_serial.starts_with("rot_") {
+                        let label = if rot_cfg.name.is_empty() {
+                            rot_cfg.mcp_serial.clone()
+                        } else {
+                            rot_cfg.name.clone()
+                        };
+                        let calibration = mcp2221_yaesu_rotor::RotorCalibration {
+                            v_at_0deg: rot_cfg.v_at_0deg,
+                            v_at_max_deg: rot_cfg.v_at_max_deg,
+                            max_deg: rot_cfg.max_deg,
+                            ramp_pct_per_sec: rot_cfg.ramp_pct_per_sec,
+                            shortest_route_in_overlap: rot_cfg.shortest_route_in_overlap,
+                        };
+                        let inst = mcp2221_yaesu_rotor::RotorInstance::new(
+                            0,
+                            &rot_cfg.mcp_serial,
+                            &label,
+                            calibration,
+                        );
+                        let facade = inst.make_rotor_facade();
+                        let _ = status_panel_state.rotor_slot.set(inst);
+                        info!(
+                            "Rotor (Adafruit MCP2221A) instance gebonden — serial \"{}\" (label \"{}\", cal {:.3}V→{:.3}V @ {}°)",
+                            rot_cfg.mcp_serial, label,
+                            rot_cfg.v_at_0deg, rot_cfg.v_at_max_deg, rot_cfg.max_deg
+                        );
+                        Some(Arc::new(facade))
+                    } else {
+                        log::warn!(
+                            "mcp2221_yaesu backend selected but config.rotors[0] is empty or disabled"
+                        );
+                        None
+                    }
+                } else {
+                    log::warn!(
+                        "mcp2221_yaesu backend selected but no rotor in config.rotors — gebruik wizard om een rot_<naam> bord te claimen"
+                    );
+                    None
                 }
             }
             _ => {

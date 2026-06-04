@@ -60,8 +60,8 @@ pub struct NetworkService {
     rx2_spectrum: Arc<Mutex<Rx2SpectrumProcessor>>,
     shutdown: watch::Receiver<bool>,
     amplitec: Option<Arc<AmplitecSwitch>>,
-    /// Multi-tuner collection (0..2 instances). The single-tuner status
-    /// broadcast and the Tune command handler route via
+    /// Multi-tuner collection (0..=`MAX_TUNERS` instances). The single-
+    /// tuner status broadcast and the Tune command handler route via
     /// `Tuners::for_amplitec_pos(active_pos)` and fall back to
     /// `Tuners::primary()` when no Amplitec mapping matches.
     tuners: Arc<Tuners>,
@@ -637,7 +637,14 @@ impl NetworkService {
 
                             if let Some(ref amp) = amplitec {
                                 let status = amp.status();
-                                let labels = Some(crate::config::labels_string(&config));
+                                // Live label-snapshot: `config` lokale is een snapshot
+                                // bij `start_server` tijd; bij rename via de Amplitec
+                                // context-menu wordt de globale config wel bijgewerkt
+                                // maar deze lokale niet. Lees dus elke tick uit de
+                                // mutex-protected cache zodat clients de nieuwe namen
+                                // krijgen via de send_if_changed dedup.
+                                let live_config = crate::config::load();
+                                let labels = Some(crate::config::labels_string(&live_config));
                                 let pkt = EquipmentStatusPacket {
                                     device_type: DeviceType::Amplitec6x2,
                                     switch_a: status.switch_a,
@@ -1903,12 +1910,14 @@ impl NetworkService {
                                 self.ptt.lock().await.record_ptt_packet();
 
                                 let arrival_ms = start.elapsed().as_millis() as u64;
+                                let wideband = audio_pkt.flags.wideband();
                                 jitter_buf.push(
                                     BufferedFrame {
                                         sequence: audio_pkt.sequence,
                                         timestamp: audio_pkt.timestamp,
                                         opus_data: audio_pkt.opus_data,
                                         ptt: true,
+                                        wideband,
                                     },
                                     arrival_ms,
                                 );
@@ -1920,12 +1929,14 @@ impl NetworkService {
                                 self.ptt.lock().await.record_ptt_packet();
 
                                 let arrival_ms = start.elapsed().as_millis() as u64;
+                                let wideband = audio_pkt.flags.wideband();
                                 jitter_buf.push(
                                     BufferedFrame {
                                         sequence: audio_pkt.sequence,
                                         timestamp: audio_pkt.timestamp,
                                         opus_data: audio_pkt.opus_data,
                                         ptt: false,
+                                        wideband,
                                     },
                                     arrival_ms,
                                 );
@@ -2506,6 +2517,11 @@ impl NetworkService {
                                     let enabled = ctrl.value != 0;
                                     info!("Client {} DX spots: {}", addr, if enabled { "ON" } else { "OFF" });
                                     self.session.lock().await.set_dx_spots_enabled(addr, enabled);
+                                }
+                                ControlId::ThetisWidebandAudio => {
+                                    let on = ctrl.value != 0;
+                                    info!("Client {} Thetis wideband audio: {}", addr, if on { "ON" } else { "OFF" });
+                                    self.session.lock().await.set_thetis_wideband(addr, on);
                                 }
                                 ControlId::Rx2SpectrumPan => {
                                     let pan = ctrl.value as f32 / 10000.0 - 0.5;

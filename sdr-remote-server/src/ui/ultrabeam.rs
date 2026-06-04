@@ -233,9 +233,13 @@ pub(super) fn render_ultrabeam_panel(
             }
         }
 
+        // Menu toggle blijft rechts uitgelijnd in de header-rij —
+        // `chevron_label` plaatst de gevulde driehoek links van het
+        // label binnen zijn eigen left-to-right horizontal, dus de
+        // cell zelf wordt door de parent right-to-left layout netjes
+        // helemaal rechts gezet.
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let menu_label = if *show_menu { "Menu \u{25BC}" } else { "Menu \u{25B6}" };
-            if ui.button(menu_label).clicked() {
+            if super::chevron_label(ui, *show_menu, egui::RichText::new("Menu").strong()).clicked() {
                 *show_menu = !*show_menu;
                 if *show_menu {
                     // Request element lengths when opening menu

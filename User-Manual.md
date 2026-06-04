@@ -1,4 +1,4 @@
-﻿# ThetisLink v2.0.4 — Gebruikershandleiding
+﻿# ThetisLink v2.1.0 — Gebruikershandleiding
 
 ## Inhoudsopgave
 
@@ -47,7 +47,7 @@ ThetisLink wordt gedistribueerd als een zip bestand met de volgende inhoud:
 |---------|-------------|
 | `ThetisLink-Server.exe` | Server executable (Windows) |
 | `ThetisLink-Client.exe` | Desktop client executable |
-| `ThetisLink-2.0.3.apk` | Android client app |
+| `ThetisLink-2.1.0.apk` | Android client app |
 | `Installatie.pdf` | Installatiehandleiding (Nederlands) |
 | `User-Manual.pdf` | Gebruikershandleiding (Nederlands, dit document) |
 | `Technische-Referentie.pdf` | Technische referentie (Nederlands) |
@@ -92,7 +92,7 @@ flowchart TB
     Server <--> Yaesu[Yaesu FT-991A<br>COM + USB Audio]
 ```
 
-Alle audio (RX/TX), IQ spectrum data en besturing gaan via één enkele TCI WebSocket verbinding. ThetisLink v2.0.4 gebruikt geen aparte CAT TCP verbinding — TCI dekt alle benodigde commando's, zowel met stock Thetis v2.10.3.15 als met de PA3GHM fork. Geen VB-Cable of andere drivers nodig.
+Alle audio (RX/TX), IQ spectrum data en besturing gaan via één enkele TCI WebSocket verbinding. ThetisLink v2.1.0 gebruikt geen aparte CAT TCP verbinding — TCI dekt alle benodigde commando's, zowel met stock Thetis v2.10.3.15 als met de PA3GHM fork. Geen VB-Cable of andere drivers nodig.
 
 ---
 
@@ -395,13 +395,59 @@ Serieel USB verbinding (19200 baud). Functies:
 
 ### Rotor backends
 
-ThetisLink ondersteunt twee rotor-backends. Kies in het server-config-venster onder *Rotor → backend* welke je gebruikt; één tegelijk actief.
+ThetisLink ondersteunt drie rotor-backends. Kies in het server-config-venster onder *Rotor → backend* welke je gebruikt; één tegelijk actief.
 
 In het client-paneel (kompas, GoTo, Stop) is geen verschil zichtbaar — de keuze van backend bepaalt alleen hoe de server met de rotor-hardware praat.
 
 #### EA7HG Visual Rotor
 
 Directe UDP-verbinding met de EA7HG Visual Rotor software (Prosistel-protocol). Vul het adres van de Visual Rotor in (bv. `192.168.1.60:3010`); verder geen configuratie nodig.
+
+#### Yaesu G-1000DXC via Adafruit MCP2221A (v2.1.0+)
+
+Directe aansturing van de Yaesu G-1000DXC EXT CONTROL connector vanaf de ThetisLink-server PC via een Adafruit MCP2221A breakout (op 5 V gejumperd). Geen extra controller-PCB of derde-partij software nodig. Vervangt EA7HG voor wie liever ThetisLink in-process houdt.
+
+**Hardware**
+
+- Adafruit MCP2221A breakout (#4471) met de 3 V solder-jumper aan de onderkant doorgesneden en de 5 V pad gebrugd
+- 2× BST82 (SOT-23) als low-side switches op pin 1 (R/CW) en pin 2 (L/CCW) van de Yaesu DIN-7
+- 2× 100 kΩ gate-pulldown (voorkomt spontane rotatie tijdens USB-reset)
+- 1× 1,8 kΩ + 1× 2,2 kΩ spanningsdeler op pin 4 (position-feedback) naar GP3 ADC; **niet** 1,8 kΩ + 10 kΩ — die clipt boven ~365° op rotors waar pin 4 boven 4,8 V uitkomt
+- Optioneel: 10 µF condensator parallel aan de 2,2 kΩ tegen 100 Hz netvoedings-ripple
+- 7-pin mini-DIN kabel naar de rotor
+
+**Setup in ThetisLink-server**
+
+1. Open de **MCP2221A** sectie in het Status-paneel.
+2. Klik **Scan** — de Adafruit verschijnt als "Unprogrammed" board.
+3. Kies *function = Rotor*, vul een naam in (bv. `rotor1`), klik **Add**. Het bord krijgt de USB-serial `rot_<naam>` geschreven naar zijn EEPROM.
+4. Herstart de server zodat het bord opgepakt wordt.
+5. Stel onder *Rotor → backend* in op **Yaesu G-1000DXC (MCP2221A)**.
+
+**Kalibratie**
+
+Voordat GoTo werkt moet de spanning-naar-graden mapping ingelezen worden:
+
+1. Draai handmatig naar het CCW-eindpunt (mechanisch hard tegen de stop, 0°).
+2. Klik **Park CCW (0°)** in de rotor-row.
+3. Draai handmatig naar het CW-eindpunt (450° bij de G-1000DXC).
+4. Klik **Park CW (450°)**.
+
+De server slaat de twee spanningen op als `v_at_0deg` en `v_at_max_deg` in `thetislink-server.conf`. Bij hardware-wijziging (deler-verhouding) altijd opnieuw kalibreren.
+
+**Configuratie per rotor**
+
+- *max°* — fullscale van de rotor (default 450 voor G-1000DXC)
+- *ramp* — soft-start / soft-stop snelheid in %/sec (1-200, default 50). Lager = traagheidsvriendelijker voor zware antennes; hoger = sneller reactief.
+- *shortest route* — alleen zichtbaar als `max_deg > 360`. Bij aanvinken kiest een GoTo de kortste mechanische route via de overlap-zone (bv. huidig 350°, target 30° → CW via 390° i.p.v. CCW via 0°). Default uit zodat "ga naar 30°" letterlijk op 30° fysiek eindigt.
+
+**Diagnostiek**
+
+De rotor-row toont de live positie in hele graden, de mediaan pin-4 spanning, de laatste raw ADC sample en de peak-to-peak spread (ruis-indicator). Tijdens een GoTo zie je het soft-start ramp-omhoog en de soft-stop ramp-omlaag in de DAC-slider. Bij stilstand poll't de server op 1 Hz (60-sample mediaan); bij beweging op 30 Hz (10-sample mediaan).
+
+**Test-knoppen + speed-slider**
+
+De CW/CCW/Stop knoppen + DAC speed-slider in de rotor-row staan los van de GoTo-loop. Zodra je de slider beweegt of een test-knop indrukt schakelt de server naar *manual mode* en respecteert je instelling tot een client een nieuwe GoTo/Stop/CW/CCW commando stuurt.
 
 #### PstRotator (XML/UDP)
 
@@ -673,6 +719,7 @@ Als het spectrum (lijn) en de waterval niet synchroon lopen bij het pannen, hers
 
 | Versie | Hoogtepunten |
 |---|---|
+| **2.1.0** | **Yaesu G-1000DXC rotor via MCP2221A, opt-in wideband Thetis RX, Amplitec reconnect, RX2 filter-fixes.** Backwards-compatible met v2.0.4 — wire-protocol ongewijzigd; 2.0.4-clients praten gewoon met 2.1.0-server (en omgekeerd). **Yaesu G-1000DXC rotor-backend** als 3e optie naast EA7HG en PstRotator: directe aansturing via Adafruit MCP2221A breakout (5 V mod), met soft-start/soft-stop ramp (1-200 %/s, default 50%), adaptive ADC poll-rate (30 Hz tijdens beweging / 1 Hz bij stilstand, mediaan-filter tegen 50/100 Hz netvoeding-ripple), kortste-route optie voor rotors met overlap-zone (max_deg > 360°), en kalibratie-wizard (Park CCW / Park CW). **Opt-in wideband Thetis RX** via fork-extensie — breekt geen stock-Thetis pad. **Amplitec 6/2 reconnect** na power-cycle + venster verschijnt ook bij offline-start (was: venster bleef onzichtbaar tot server-restart). **RX2 mode-switch filter-restore** (modulation-handler honoreert server filter-update bij modus-wissel) + per-channel filter-edge drag (RX1/RX2 drag-state gescheiden). **Yaesu EQ profile mic-gain persistence** (mic-slider wordt mee opgeslagen met band/treble); **scherpere TX resampler anti-alias filter**. **Modulaire multi-tuner wizard** met per-slot Add/Rename/Delete, classificatie-scan, inklapbaar MCP2221A-blok. **Status-paneel scroll-stabiliteit** (snapshot-cache bij lock-contentie; MCP2221A uitgeklapte sectie springt niet meer terug omhoog). UI-polish: chevron-labels op alle collapsible toggles, Settings-tab ScrollArea, Amplitec antenne-rename via right-click. Pair met **Thetis fork PA3GHM TL2-4** voor de volledige feature-set; stock Thetis blijft ondersteund. |
 | **2.0.4** | **Bandbreedte-toolkit, preventieve TX-inhibit, power-cap, PstRotator.** Backwards-compatible met v2.0.3 — wire-protocol uitsluitend additief. **Preventieve RX-only TX-inhibit** via nieuw `rx_only_ex` TCI-commando (vereist Thetis-fork PA3GHM TL2-3): MOX/spatiebalk/hardware-PTT/VOX worden aan de bron geweigerd op een RX-only Amplitec-positie, niet reactief teruggeflipt; stock Thetis valt terug op de reactieve `ZZTX0` catch-all. **Reactieve RF-power cap per positie** met PA-eigen DriveDown (SPE + RF2K-S), mode-multipliers (SSB/CW × 1.0, AM × 0.5, FM/DIG × 0.4); rate-limit 1 s/stap — korte CW-bursts (<1 s) kunnen de reactieve cap passeren, preventieve dekking bestaat alleen op RX-only posities. **PstRotator UDP/XML rotor-backend** (host = numeriek IP-adres, geen DNS). **Server-tab bandbreedte-monitor** (Down/Up Kbit/s, klikbaar voor per-stream breakdown) — telt UDP application-payload bytes (de Windows-netwerkmeter leest ~1,5-2× hoger door IP/UDP/Ethernet-headers). **Per-client DX-spots opt-out** (Desktop + Android Settings), met server-side dedup (~90 Kbit/s broadcast storm → ~6 Kbit/s). **WebSDR favorites edit-toggle**. Server-log cleanup (PowerCap state-change-only + DXC reconnect 1-regel-per-cycle). |
 | **2.0.3** | **Multi-tuner release + wire-protocol breaking change.** Twee fysieke StockCorner JC-4s/JC-3s tuners parallel via Adafruit MCP2221A USB-HID breakouts (vervangt de v2.0.2 serial-port RTS/CTS aansturing); per-tuner threshold + hysterese schuiven op de gele tune-status draad (1 MΩ + 1 MΩ deler, default 2.25 V / 0.50 V); board scan + serial programming UI; automatische USB-reconnect; inklapbaar MCP2221A-blok in het status-paneel. Daarnaast: S-meter herschreven met drie bronnen (Sig peak-hold, Avg true-mean, MaxBin), `rx_channel_sensors_ex` subscription, S9-frequency band shift; CTUN coupled-recenter + RX1/RX2 spectrum-mirror; MIDI client-side VFO-coalesce + auto-recenter handshake met de Thetis-fork; per-PA drive-snapshot persistence over proces-restart heen; collapsible window-states onthouden. **Wire-protocol u8 bumped van 2 → 3** (S-meter payload herschikt); v2.0.2-clients tegen v2.0.3-server (en omgekeerd) krijgen `ProtocolVersionMismatch` met gelocaliseerde melding ("Server is te oud" / "Client is te oud"). |
 | **2.0.2** | **Log-spam hotfix:** server-side `DiversityPhaseEx`, `DiversityGainEx` en `DiversityGainMultiEx` notifications loggen nu alleen INFO bij echte value-change. Thetis pusht deze elke diversity-tick (~10-20 Hz), waardoor het server-log per sessie honderdduizenden regels telde. Functioneel gedrag en wire-protocol ongewijzigd — volledig interoperabel met v2.0.0 / v2.0.1. |

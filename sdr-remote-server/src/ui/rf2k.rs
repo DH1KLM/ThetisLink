@@ -161,12 +161,19 @@ fn render_rf2k_power_display(
     render_rf2k_meter(ui, "Forward", &fwd_value, fwd_frac, fwd_color,
         Some(peak_frac), fwd_divs, max_fwd);
 
-    // SWR + Reflected: collapsible
+    // SWR + Reflected: collapsible. Open/closed state in egui's
+    // transient per-id store — niet persistent in config maar
+    // overleeft frames binnen één sessie.
     let swr = status.swr_x100 as f32 / 100.0;
     let swr_summary = format!("SWR {:.2}  |  Reflected {} W", swr, status.reflected_w);
-    egui::CollapsingHeader::new(swr_summary)
-        .default_open(false)
-        .show(ui, |ui| {
+    let id = ui.make_persistent_id("rf2k_swr_section");
+    let mut swr_open = ui.ctx().data_mut(|d| *d.get_temp_mut_or(id, false));
+    if super::chevron_label(ui, swr_open, swr_summary).clicked() {
+        swr_open = !swr_open;
+        ui.ctx().data_mut(|d| d.insert_temp(id, swr_open));
+    }
+    if swr_open {
+        ui.indent("rf2k_swr_body", |ui| {
             // Reflected power bar — auto-scale
             let (max_ref, ref_divs): (f32, &[(f32, &str)]) = if status.reflected_w > 100 {
                 (250.0, &[(0.0,"0"),(50.0,"50"),(100.0,"100"),(150.0,"150"),(200.0,"200"),(250.0,"250")])
@@ -195,6 +202,7 @@ fn render_rf2k_power_display(
             ];
             render_rf2k_swr_meter(ui, "SWR", &swr_value, swr_frac, swr_color, swr_divs);
         });
+    }
 
     ui.add_space(4.0);
 }
@@ -700,12 +708,9 @@ pub(super) fn render_rf2k_debug_section(
 
     let amber = Color32::from_rgb(255, 170, 40);
     ui.add_space(6.0);
-    ui.horizontal(|ui| {
-        let header = if *show_debug { "Debug \u{25BC}" } else { "Debug \u{25B6}" };
-        if ui.selectable_label(*show_debug, RichText::new(header).strong()).clicked() {
-            *show_debug = !*show_debug;
-        }
-    });
+    if super::chevron_label(ui, *show_debug, RichText::new("Debug").strong()).clicked() {
+        *show_debug = !*show_debug;
+    }
 
     if !*show_debug {
         return;
@@ -890,19 +895,16 @@ pub(super) fn render_rf2k_drive_config_section(
     }
 
     ui.add_space(6.0);
-    ui.horizontal(|ui| {
-        let header = if *show_drive_config { "Drive Config \u{25BC}" } else { "Drive Config \u{25B6}" };
-        if ui.selectable_label(*show_drive_config, RichText::new(header).strong()).clicked() {
-            *show_drive_config = !*show_drive_config;
-            if *show_drive_config && !*drive_loaded {
-                // Load from status
-                drive_edit[0] = status.drive_config_ssb;
-                drive_edit[1] = status.drive_config_am;
-                drive_edit[2] = status.drive_config_cont;
-                *drive_loaded = true;
-            }
+    if super::chevron_label(ui, *show_drive_config, RichText::new("Drive Config").strong()).clicked() {
+        *show_drive_config = !*show_drive_config;
+        if *show_drive_config && !*drive_loaded {
+            // Load from status
+            drive_edit[0] = status.drive_config_ssb;
+            drive_edit[1] = status.drive_config_am;
+            drive_edit[2] = status.drive_config_cont;
+            *drive_loaded = true;
         }
-    });
+    }
 
     if !*show_drive_config {
         return;

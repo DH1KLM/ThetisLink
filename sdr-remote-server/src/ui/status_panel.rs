@@ -20,6 +20,26 @@
 use egui::{Color32, RichText};
 
 use crate::audio_stats::StatusPanelShared;
+use crate::session::{ClientSnapshot, ConnectAttempt};
+
+/// Snapshot-cache: bij contentie op de SessionManager-lock (try_lock
+/// faalt) renderden we eerder een 1-regel "(snapshot busy…)" placeholder.
+/// Dat liet de paneel-hoogte periodiek krimpen waardoor de omringende
+/// ScrollArea de scroll-positie clampte en de gebruiker visueel zag dat
+/// content omhoog sprong terwijl hij naar de uitgeklapte MCP2221A-sectie
+/// keek. Cache laat ons in plaats daarvan de laatst-succesvolle snapshot
+/// blijven tonen — stale text is acceptabel; layout-jitter niet.
+fn clients_cache() -> &'static std::sync::Mutex<Option<Vec<ClientSnapshot>>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<Vec<ClientSnapshot>>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn attempts_cache() -> &'static std::sync::Mutex<Option<Vec<ConnectAttempt>>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<Vec<ConnectAttempt>>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
 
 /// Render the Status panel into the provided `ui`. Designed to fit in
 /// the same scrollable area as the existing log view; caller is
@@ -87,14 +107,21 @@ pub fn render_status_panel(
     });
 
     // ── 3. Active clients (snapshot via SessionManager.try_lock) ─────────
-    let clients_snapshot = if let Some(session_arc) = shared.session_slot.get() {
-        match session_arc.try_lock() {
-            Ok(guard) => Some(guard.active_clients_snapshot()),
-            Err(_) => None, // contended — show stale "—" rather than block UI
-        }
-    } else {
-        None // server not yet ready
-    };
+    // Bij lock-contentie pakken we de laatst gecachte snapshot zodat de
+    // sectie-hoogte stabiel blijft (zie `clients_cache` doc voor reden).
+    let clients_snapshot: Option<Vec<ClientSnapshot>> =
+        if let Some(session_arc) = shared.session_slot.get() {
+            match session_arc.try_lock() {
+                Ok(guard) => {
+                    let snap = guard.active_clients_snapshot();
+                    *clients_cache().lock().unwrap() = Some(snap.clone());
+                    Some(snap)
+                }
+                Err(_) => clients_cache().lock().unwrap().clone(),
+            }
+        } else {
+            None // server not yet ready
+        };
 
     match &clients_snapshot {
         Some(clients) if clients.is_empty() => {
@@ -155,14 +182,21 @@ pub fn render_status_panel(
     });
 
     // ── 5. Recent connect attempts ───────────────────────────────────────
-    let attempts = if let Some(session_arc) = shared.session_slot.get() {
-        match session_arc.try_lock() {
-            Ok(guard) => Some(guard.recent_connect_attempts()),
-            Err(_) => None,
-        }
-    } else {
-        None
-    };
+    // Idem: bij lock-contentie val terug op de laatst gecachte snapshot
+    // zodat de sectie-hoogte stabiel blijft.
+    let attempts: Option<Vec<ConnectAttempt>> =
+        if let Some(session_arc) = shared.session_slot.get() {
+            match session_arc.try_lock() {
+                Ok(guard) => {
+                    let snap = guard.recent_connect_attempts();
+                    *attempts_cache().lock().unwrap() = Some(snap.clone());
+                    Some(snap)
+                }
+                Err(_) => attempts_cache().lock().unwrap().clone(),
+            }
+        } else {
+            None
+        };
     ui.separator();
     ui.label(RichText::new("Recent connect attempts:").strong());
     match &attempts {
@@ -227,20 +261,28 @@ pub fn render_status_panel(
     // Open/closed state is persisted in the config so it survives a restart.
     ui.separator();
     let current_expanded = crate::config::load().mcp2221_section_expanded;
-    let resp = egui::CollapsingHeader::new(
-            RichText::new("MCP2221A tuner bridges").strong(),
-        )
-        .open(Some(current_expanded))
-        .show(ui, |ui| {
-            // 7a — per-tuner rows. We renderen ALTIJD 2 slots (de hardware
-            // ondersteunt maximaal 2 MCP2221A bridges); een nog-niet-
-            // geconfigureerd slot krijgt een lichtere config-row met alleen
-            // de "MCP serial" en "Amplitec pos" dropdowns. Zonder dit kan de
-            // owner bij een schone config de eerste koppeling niet maken
-            // (catch-22: geen mcp_serial → geen running TunerInstance →
-            // geen UI om mcp_serial te kiezen).
+    if super::chevron_label(
+        ui,
+        current_expanded,
+        RichText::new("MCP2221A tuner bridges").strong(),
+    )
+    .clicked()
+    {
+        crate::config::save_mcp2221_section_expanded(!current_expanded);
+    }
+    if current_expanded {
+        ui.indent("mcp2221_section", |ui| {
+            // 7a — per-tuner rows. Aantal slots is gelijk aan het aantal
+            // entries in `config.tuners` (1..=`MAX_TUNERS`). Lege Vec =
+            // geen tuner-rijen; fase 3 voegt de "Add tuner"-wizard toe
+            // die nieuwe entries op basis van een board-scan aanmaakt.
+            // Voor een slot dat in config staat maar nog geen running
+            // TunerInstance heeft (bv. uitgeschakeld of opstart-failure)
+            // tonen we de lichtere "disabled config row" met dezelfde
+            // MCP serial / Amplitec-pos dropdowns.
             let active = shared.tuners_slot.get();
-            for slot in 0..2usize {
+            let slot_count = crate::config::load().tuners.len();
+            for slot in 0..slot_count {
                 let inst = active.and_then(|t| {
                     t.instances().iter().find(|i| i.slot_index() == slot)
                 });
@@ -249,18 +291,21 @@ pub fn render_status_panel(
                     None => render_tuner_disabled_row(ui, slot),
                 }
             }
-            // 7b — board scan: list all MCP2221A devices on the USB bus so
+            // 7b — Yaesu rotor (PATCH-yaesu-rotor-mcp2221 fase 3): live
+            // ADC-positie + handmatige CW/CCW/Stop + DAC speed-slider voor
+            // hardware-verificatie. Alleen zichtbaar zodra een rot_*
+            // instance is opgestart.
+            if let Some(rotor) = shared.rotor_slot.get() {
+                ui.separator();
+                render_rotor_row(ui, rotor);
+            }
+            // 7c — board scan: list all MCP2221A devices on the USB bus so
             // the owner can figure out which USB serial belongs to which
             // physical tuner. Result cached statically until the next Scan
             // click so we don't hammer the HID enumerator on every repaint.
             ui.separator();
             render_board_scan_section(ui);
         });
-    // Detect a header click and toggle the persisted state. We use
-    // `.open(Some(...))` so egui ignores clicks itself — we drive the
-    // open/closed state from config and persist on every flip.
-    if resp.header_response.clicked() {
-        crate::config::save_mcp2221_section_expanded(!current_expanded);
     }
 }
 
@@ -270,8 +315,9 @@ fn render_tuner_detector_row(
 ) {
     let bridge = inst.bridge();
     let snap = bridge.snapshot();
+    let slot_idx = inst.slot_index();
     egui::Frame::group(ui.style()).show(ui, |ui| {
-        // Header: tuner label + connection status + model dropdown
+        // Header: tuner label + connection status + delete-knop rechts
         ui.horizontal(|ui| {
             ui.label(RichText::new(inst.label()).strong());
             match &snap.status {
@@ -288,6 +334,14 @@ fn render_tuner_detector_row(
                     );
                 }
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if super::delete_button(ui)
+                    .on_hover_text("Verwijder dit tuner-slot uit config (auto-restart)")
+                    .clicked()
+                {
+                    remove_tuner_slot(slot_idx);
+                }
+            });
         });
         // MCP serial selector — pick which physical Adafruit board (by USB
         // serial name, as the owner programmed it) is assigned to this tuner
@@ -502,6 +556,14 @@ fn render_tuner_disabled_row(ui: &mut egui::Ui, slot: usize) {
                 Color32::from_rgb(160, 160, 160),
                 "Disabled \u{2014} select an MCP serial to enable",
             );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if super::delete_button(ui)
+                    .on_hover_text("Verwijder dit tuner-slot uit config (auto-restart)")
+                    .clicked()
+                {
+                    remove_tuner_slot(slot);
+                }
+            });
         });
         // MCP serial dropdown — selecteren enabled het slot + auto-restart.
         ui.horizontal(|ui| {
@@ -636,6 +698,23 @@ fn board_serial_edit_state(path: &str) -> std::sync::Arc<std::sync::Mutex<String
         .clone()
 }
 
+/// Per-board scratch state voor de "Add new board"-wizard. Bevat de
+/// gekozen functie (Tuner/Rotor) voor een ongeprogrammeerd board.
+/// Default = Tuner zodat operator vaak direct kan klikken.
+fn board_function_state(
+    path: &str,
+) -> std::sync::Arc<std::sync::Mutex<crate::mcp2221_scan::BoardKind>> {
+    use crate::mcp2221_scan::BoardKind;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static MAP: OnceLock<Mutex<HashMap<String, Arc<Mutex<BoardKind>>>>> = OnceLock::new();
+    let map = MAP.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut m = map.lock().unwrap();
+    m.entry(path.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(BoardKind::Tuner)))
+        .clone()
+}
+
 /// Per-board result of the most recent `program_serial_at_path` call.
 fn board_program_result_state(
     path: &str,
@@ -686,57 +765,39 @@ fn infer_model_from_serial(serial: &str) -> crate::config::TunerModel {
     }
 }
 
-/// Self-restart the server: spawn a fresh copy of the running executable
-/// with the same CLI args, then `std::process::exit(0)` so the new copy can
-/// bind the UDP socket. Used by tuner-config UI actions (model dropdown,
-/// "Use for Tuner N" buttons) so the owner sees the change take effect
-/// without remembering to manually stop+start.
-///
-/// Logs the requested restart so the new instance's log starts clean — the
-/// log file is opened with `truncate=true` by `GuiLogger`.
+/// Verwijder de TunerConfig op slot-index `slot` uit `config.tuners` en
+/// trigger auto-restart zodat de runtime de geneerde TunerInstance niet
+/// meer probeert te benaderen. Owner gebruikt dit om een tuner-slot
+/// definitief uit de config te halen (bv. fysiek board afwezig of
+/// vervangen door een rename).
+fn remove_tuner_slot(slot: usize) {
+    let mut removed_label: Option<String> = None;
+    crate::config::modify_config(|c| {
+        if slot < c.tuners.len() {
+            let removed = c.tuners.remove(slot);
+            removed_label = Some(format!(
+                "Tuner {} (\"{}\")",
+                slot + 1,
+                removed.mcp_serial
+            ));
+        }
+    });
+    if let Some(label) = removed_label {
+        log::info!("Remove tuner slot: {} — auto-restart", label);
+        restart_server();
+    } else {
+        log::warn!("Remove tuner slot: index {} out of range (no-op)", slot);
+    }
+}
+
+/// Self-restart the server. Vraagt een auto-restart aan via de globale
+/// `request_auto_restart()` flag in `ui/utils.rs`. De daadwerkelijke
+/// cleanup + child-spawn + `process::exit(0)` loopt in `ServerApp::
+/// update()` zodra die de flag detecteert; daar worden Drop-handlers
+/// correct gerund (audio cpal-streams + TCI-connect afsluiten) voor
+/// de nieuwe child de devices probeert te claimen.
 fn restart_server() {
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(e) => {
-            log::error!("Auto-restart: cannot read current_exe(): {}", e);
-            return;
-        }
-    };
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    log::info!("Auto-restart: relaunching {:?} (args: {:?})", exe, args);
-
-    // Build the command with explicit null stdio + (on Windows) detached
-    // process flags. Without this the spawn fails with ERROR_NOT_SUPPORTED
-    // (os error 50) when the parent is a GUI-subsystem binary whose stdio
-    // handles are NULL: CreateProcess refuses to clone them into the child.
-    let mut cmd = std::process::Command::new(&exe);
-    cmd.args(&args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // DETACHED_PROCESS (0x00000008) — the new process gets its own
-        // console handle group, detached from ours. CREATE_NEW_PROCESS_GROUP
-        // (0x00000200) further isolates Ctrl-C delivery. Combined they make
-        // the child fully independent so this process can exit immediately.
-        const DETACHED_PROCESS: u32 = 0x00000008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
-    }
-
-    match cmd.spawn() {
-        Ok(child) => {
-            log::info!("Auto-restart: spawned PID {}, exiting", child.id());
-            // Hard exit so the old UDP socket / MCP2221A handles release
-            // before the new process tries to bind / open them.
-            std::process::exit(0);
-        }
-        Err(e) => {
-            log::error!("Auto-restart: spawn failed: {}", e);
-        }
-    }
+    super::request_auto_restart();
 }
 
 /// Shared scan cache used by both the "Detected boards" section and the
@@ -766,6 +827,207 @@ fn cached_scan_serials() -> Vec<String> {
     }
 }
 
+/// PATCH-yaesu-rotor-mcp2221 fase 3 — Yaesu G-1000DXC rotor live-status.
+/// Toont ADC-positie (raw counts + omgerekende Yaesu-pin spanning),
+/// CW/CCW/Stop knoppen, DAC speed-slider. Bedoeld voor hardware-
+/// verificatie en latere kalibratie (fase 4). Geen lokale state — alle
+/// commando's gaan direct naar de driver, snapshot leest live state.
+fn render_rotor_row(
+    ui: &mut egui::Ui,
+    rotor: &std::sync::Arc<crate::mcp2221_yaesu_rotor::RotorInstance>,
+) {
+    use crate::mcp2221_yaesu_rotor::{Status as RotorStatus, DAC_MAX};
+    let snap = rotor.status();
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("Yaesu rotor — {}", snap.label)).strong());
+            match &snap.status {
+                RotorStatus::Connected => {
+                    ui.colored_label(Color32::from_rgb(50, 200, 50), "Connected");
+                }
+                RotorStatus::NotInitialized => {
+                    ui.colored_label(Color32::from_rgb(160, 160, 160), "Not connected");
+                }
+                RotorStatus::Error(e) => {
+                    ui.colored_label(Color32::from_rgb(220, 90, 90), "Error")
+                        .on_hover_text(e);
+                }
+            }
+        });
+
+        // Primaire positie-display: graden (na kalibratie) als hoofdwaarde,
+        // pin-4 mediaan-spanning als secundair voor diagnose.
+        ui.horizontal(|ui| {
+            ui.label("Positie:");
+            match (snap.position_deg, snap.median_yaesu_volts) {
+                (Some(deg), Some(v)) => {
+                    ui.label(
+                        RichText::new(format!("{:>3}°", deg.round() as i32))
+                            .strong()
+                            .size(16.0),
+                    );
+                    ui.separator();
+                    ui.label(format!("≈ {:.3} V (median)", v));
+                }
+                (None, Some(v)) => {
+                    ui.label(
+                        RichText::new("— niet gekalibreerd —")
+                            .weak(),
+                    );
+                    ui.separator();
+                    ui.label(format!("≈ {:.3} V (median)", v));
+                }
+                _ => {
+                    ui.label(RichText::new("— geen sample —").weak());
+                }
+            }
+        });
+        // Spread + laatste raw sample voor ruis-diagnose.
+        if let Some(raw) = snap.last_adc_raw {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("  laatste raw:").weak());
+                ui.label(RichText::new(format!("{}", raw)).weak());
+                if let Some(p2p) = snap.adc_p2p_raw {
+                    ui.separator();
+                    ui.label(RichText::new(format!("spread Δ={} raw", p2p)).weak());
+                    // Omgerekend naar Yaesu pin-spanning voor leesbare diagnose.
+                    // 1,8 k + 10 k spanningsdeler-correctie matcht owner's hardware.
+                    let p2p_v = (p2p as f32) * 4.096 / 1023.0 * (11_800.0 / 10_000.0);
+                    ui.label(RichText::new(format!("≈ {:.3} V p2p", p2p_v)).weak());
+                }
+            });
+        }
+
+        // Direction-knoppen voor handmatige test.
+        ui.horizontal(|ui| {
+            ui.label("Test richting:");
+            let cw_fill = if snap.gp0_cw_high {
+                Some(Color32::from_rgb(100, 160, 230))
+            } else {
+                None
+            };
+            let cw_btn = match cw_fill {
+                Some(c) => egui::Button::new("CW (R)").fill(c),
+                None => egui::Button::new("CW (R)"),
+            };
+            if ui.add(cw_btn).clicked() {
+                rotor.set_direction(!snap.gp0_cw_high, false);
+            }
+
+            let ccw_fill = if snap.gp1_ccw_high {
+                Some(Color32::from_rgb(100, 160, 230))
+            } else {
+                None
+            };
+            let ccw_btn = match ccw_fill {
+                Some(c) => egui::Button::new("CCW (L)").fill(c),
+                None => egui::Button::new("CCW (L)"),
+            };
+            if ui.add(ccw_btn).clicked() {
+                rotor.set_direction(false, !snap.gp1_ccw_high);
+            }
+
+            if ui.button("Stop").clicked() {
+                rotor.set_direction(false, false);
+            }
+        });
+
+        // DAC speed-slider (5-bit, 0..31).
+        ui.horizontal(|ui| {
+            ui.label("Speed (DAC):");
+            let mut dac = snap.dac_value as i32;
+            let label = format!(
+                "/ {} (≈{:.2} V)",
+                DAC_MAX,
+                snap.dac_value as f32 / DAC_MAX as f32 * 5.0
+            );
+            if ui
+                .add(egui::Slider::new(&mut dac, 0..=(DAC_MAX as i32)).text(label))
+                .changed()
+            {
+                rotor.set_dac(dac.clamp(0, DAC_MAX as i32) as u8);
+            }
+        });
+
+        // Kalibratie (PATCH-yaesu-rotor-mcp2221 fase 4): owner draait
+        // de rotor naar CCW-eindpark, klikt "Park CCW (0°)" om de
+        // huidige mediaan-spanning vast te leggen; vervolgens naar CW-
+        // eindpark en "Park CW". De max_deg-spinner zet de fullscale
+        // (default 450° voor G-1000DXC). Alle waarden persisteren naar
+        // `config.rotors[N]` zodat de mapping na restart blijft staan.
+        ui.horizontal(|ui| {
+            ui.label("Kalibratie:");
+            if ui
+                .button("Park CCW (0°)")
+                .on_hover_text(format!(
+                    "Sla huidige mediaan vast als 0°. Nu: {:.3} V",
+                    snap.calibration.v_at_0deg
+                ))
+                .clicked()
+            {
+                rotor.park_ccw();
+            }
+            ui.label(RichText::new(format!("{:.3} V", snap.calibration.v_at_0deg)).weak());
+            if ui
+                .button(format!("Park CW ({}°)", snap.calibration.max_deg))
+                .on_hover_text(format!(
+                    "Sla huidige mediaan vast als max°. Nu: {:.3} V",
+                    snap.calibration.v_at_max_deg
+                ))
+                .clicked()
+            {
+                rotor.park_cw();
+            }
+            ui.label(RichText::new(format!("{:.3} V", snap.calibration.v_at_max_deg)).weak());
+            ui.separator();
+            ui.label("max:");
+            let mut max_deg = snap.calibration.max_deg;
+            if ui
+                .add(egui::DragValue::new(&mut max_deg).range(90..=720).suffix("°"))
+                .changed()
+            {
+                rotor.set_max_deg(max_deg);
+            }
+            ui.separator();
+            // Ramp-rate slider: hoe snel de DAC van 0 → max ramp-t (en
+            // omgekeerd) tijdens een GoTo of start/stop. Lage waarde =
+            // langzame, antenne-vriendelijke acceleratie (zware
+            // mast/grote antenne); hoge waarde = snel reactief.
+            ui.label("ramp:")
+                .on_hover_text("Soft-start/stop snelheid (%/sec). Lager = traagheidsvriendelijker voor zware antennes.");
+            let mut ramp = snap.calibration.ramp_pct_per_sec;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut ramp)
+                        .range(1.0..=200.0)
+                        .speed(1.0)
+                        .suffix(" %/s"),
+                )
+                .changed()
+            {
+                rotor.set_ramp_pct_per_sec(ramp);
+            }
+            // Shortest-route optie alleen tonen bij rotors met
+            // overlap-zone (max_deg > 360); voor standaard 360°
+            // rotors is de keuze betekenisloos.
+            if snap.calibration.max_deg > 360 {
+                ui.separator();
+                let mut shortest = snap.calibration.shortest_route_in_overlap;
+                if ui
+                    .checkbox(&mut shortest, "shortest route")
+                    .on_hover_text(
+                        "Kies bij GoTo de kortste mechanische route via de overlap-zone.\n\
+                         Bv. huidig 350°, target 30° → CW via 390° i.p.v. CCW via 0°.",
+                    )
+                    .changed()
+                {
+                    rotor.set_shortest_route_in_overlap(shortest);
+                }
+            }
+        });
+    });
+}
+
 fn render_board_scan_section(ui: &mut egui::Ui) {
     let cache = scan_cache();
 
@@ -791,74 +1053,273 @@ fn render_board_scan_section(ui: &mut egui::Ui) {
             );
         }
         Some(Ok(list)) => {
+            // Tel ongeprogrammeerde boards — bij >1 disable de Add-knop
+            // zodat de operator zeker weet welk fysiek board hij in
+            // gebruik gaat nemen (anders kan een toegevoegd `tun_<naam>`
+            // naar de verkeerde Adafruit gaan). Owner-conventie:
+            // configureer altijd met max 1 onbenoemd board aangesloten.
+            use crate::mcp2221_scan::BoardKind;
+            let unprogrammed_count = list
+                .iter()
+                .filter(|b| b.kind() == BoardKind::Unprogrammed)
+                .count();
+            if unprogrammed_count > 1 {
+                ui.colored_label(
+                    Color32::from_rgb(220, 160, 40),
+                    format!(
+                        "  ⚠ {} onbenoemde boards aangesloten — sluit max 1 ongeprogrammeerd board aan tijdens configuratie",
+                        unprogrammed_count
+                    ),
+                );
+            }
             for b in list {
-                // Vertical per-board block so the TextEdit + button never get
-                // clipped off the right edge of the panel in narrow windows.
-                // Each board carries a single "Program serial" action — both
-                // for anonymous boards (initial naming) and named boards
-                // (rename). Tuner-slot assignment happens via the dropdown
-                // inside each tuner-bridge frame above, not here.
+                let kind = b.kind();
                 egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.label(
-                        RichText::new(format!("• {}", b.label())).monospace(),
-                    );
+                    // Header met functie-classificatie tag + serial-label.
+                    ui.horizontal(|ui| {
+                        let tag_color = match kind {
+                            BoardKind::Tuner => Color32::from_rgb(80, 180, 220),
+                            BoardKind::Rotor => Color32::from_rgb(220, 160, 60),
+                            BoardKind::Unprogrammed => Color32::from_rgb(160, 160, 160),
+                        };
+                        ui.colored_label(
+                            tag_color,
+                            RichText::new(format!("[{}]", kind.label())).strong(),
+                        );
+                        ui.label(RichText::new(b.label()).monospace());
+                    });
                     ui.label(
                         RichText::new(format!("path: {}", b.path))
                             .monospace()
                             .small()
                             .weak(),
                     );
-                    ui.horizontal(|ui| {
-                        let serial_present = !b.serial_number.is_empty();
-                        ui.label(if serial_present {
-                            "Rename serial:"
-                        } else {
-                            "Set serial:"
-                        });
-                        let text = board_serial_edit_state(&b.path);
-                        let mut guard = text.lock().unwrap();
-                        // Pre-fill the text input with the current serial so
-                        // the owner can edit-in-place when renaming.
-                        if guard.is_empty() && serial_present {
-                            *guard = b.serial_number.clone();
-                        }
-                        ui.add(
-                            egui::TextEdit::singleline(&mut *guard)
-                                .desired_width(180.0)
-                                .hint_text("e.g. JC-4s loop"),
-                        );
-                        if ui.button("Program serial").clicked() {
-                            let new_serial = guard.trim().to_string();
-                            let path = b.path.clone();
-                            drop(guard);
-                            log::info!(
-                                "Program serial: path=\"{}\" new_serial=\"{}\"",
-                                path, new_serial
+
+                    if kind == BoardKind::Unprogrammed {
+                        // Wizard voor nieuwe boards: kies functie + geef naam
+                        // + Add. Server schrijft `tun_<naam>` of `rot_<naam>`
+                        // naar EEPROM en voegt de nieuwe entry toe aan
+                        // `config.tuners` (alleen Tuner in v2.0.5; Rotor
+                        // is voorzien voor fase 4).
+                        ui.horizontal(|ui| {
+                            ui.label("Functie:");
+                            let func = board_function_state(&b.path);
+                            let mut sel = *func.lock().unwrap();
+                            egui::ComboBox::from_id_salt(format!("kind_{}", b.path))
+                                .selected_text(sel.label())
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut sel, BoardKind::Tuner, "Tuner");
+                                    ui.selectable_value(&mut sel, BoardKind::Rotor, "Rotor");
+                                });
+                            *func.lock().unwrap() = sel;
+
+                            ui.label("Naam:");
+                            let text = board_serial_edit_state(&b.path);
+                            let mut guard = text.lock().unwrap();
+                            ui.add(
+                                egui::TextEdit::singleline(&mut *guard)
+                                    .desired_width(160.0)
+                                    .hint_text("e.g. JC-4s loop / rotor1"),
                             );
-                            let res = if new_serial.is_empty() {
-                                Err("serial cannot be empty".to_string())
-                            } else {
-                                crate::mcp2221_scan::program_serial_at_path(
-                                    &path,
-                                    &new_serial,
-                                )
-                                .map_err(|e| format!("{:?}", e))
-                            };
-                            match &res {
-                                Ok(()) => log::info!(
-                                    "Program serial OK: path=\"{}\"",
-                                    path
-                                ),
-                                Err(msg) => log::warn!(
-                                    "Program serial FAIL: path=\"{}\" err={}",
-                                    path, msg
-                                ),
+
+                            let add_enabled = unprogrammed_count <= 1
+                                && (sel == BoardKind::Tuner || sel == BoardKind::Rotor)
+                                && !guard.trim().is_empty();
+                            if ui.add_enabled(add_enabled, egui::Button::new("Add")).clicked() {
+                                let name = guard.trim().to_string();
+                                drop(guard);
+                                let prefix = match sel {
+                                    BoardKind::Tuner => BoardKind::TUNER_PREFIX,
+                                    BoardKind::Rotor => BoardKind::ROTOR_PREFIX,
+                                    BoardKind::Unprogrammed => "",
+                                };
+                                let new_serial = format!("{}{}", prefix, name);
+                                let path = b.path.clone();
+                                log::info!(
+                                    "Add board: path=\"{}\" function={} new_serial=\"{}\"",
+                                    path, sel.label(), new_serial
+                                );
+                                // Uniciteit-check op config.tuners EN config.rotors
+                                // (één serial mag in geen van beide al staan).
+                                let cfg_snap = crate::config::load();
+                                let conflict = cfg_snap.tuners.iter().any(|t| t.mcp_serial == new_serial)
+                                    || cfg_snap.rotors.iter().any(|r| r.mcp_serial == new_serial);
+                                let res = if conflict {
+                                    Err(format!("serial \"{}\" bestaat al", new_serial))
+                                } else if sel == BoardKind::Tuner {
+                                    crate::mcp2221_scan::program_serial_at_path(
+                                        &path,
+                                        &new_serial,
+                                    )
+                                    .map(|()| {
+                                        // Voeg nieuwe TunerConfig entry toe
+                                        // aan config en save.
+                                        crate::config::modify_config(|c| {
+                                            if c.tuners.len() < crate::config::MAX_TUNERS {
+                                                let mut t =
+                                                    crate::config::TunerConfig::default();
+                                                t.enabled = true;
+                                                t.mcp_serial = new_serial.clone();
+                                                c.tuners.push(t);
+                                            }
+                                        });
+                                    })
+                                    .map_err(|e| format!("{:?}", e))
+                                } else if sel == BoardKind::Rotor {
+                                    // PATCH-yaesu-rotor-mcp2221 fase 1: claim Adafruit
+                                    // bord als rotor-slot. Runtime-binding (driver-
+                                    // module + actuele aansturing van GP0/1 + DAC/
+                                    // ADC) komt in fase 3.
+                                    crate::mcp2221_scan::program_serial_at_path(
+                                        &path,
+                                        &new_serial,
+                                    )
+                                    .map(|()| {
+                                        crate::config::modify_config(|c| {
+                                            if c.rotors.len() < crate::config::MAX_ROTORS {
+                                                let mut r =
+                                                    crate::config::RotorConfig::default();
+                                                r.enabled = true;
+                                                r.name = name.clone();
+                                                r.mcp_serial = new_serial.clone();
+                                                c.rotors.push(r);
+                                            }
+                                        });
+                                    })
+                                    .map_err(|e| format!("{:?}", e))
+                                } else {
+                                    Err("kies Tuner of Rotor als functie".to_string())
+                                };
+                                let ok = res.is_ok();
+                                *board_program_result_state(&b.path).lock().unwrap() =
+                                    Some(res);
+                                if ok {
+                                    // Restart zodat de TunerInstance de
+                                    // nieuwe config-entry direct binds.
+                                    restart_server();
+                                }
                             }
-                            *board_program_result_state(&b.path).lock().unwrap() =
-                                Some(res);
+                        });
+                        // Hint over uniciteit + max-1-board-regel
+                        ui.label(
+                            RichText::new(
+                                "  Tip: configureer met max 1 onbenoemd board aangesloten.",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                    } else {
+                        // Tuner of Rotor — rename-flow blijft beschikbaar,
+                        // prefix wordt afgedwongen via een read-only label.
+                        // Voor een Tuner-board zonder bijbehorende config-
+                        // entry tonen we óók een "Koppel aan config"-knop;
+                        // dat dekt het scenario "owner heeft tuner1_*/2_*
+                        // config-regels verwijderd maar het board heeft al
+                        // een geprogrammeerd tun_-serial" — de nieuwe entry
+                        // wordt zonder herprogrammering toegevoegd.
+                        let prefix = match kind {
+                            BoardKind::Tuner => BoardKind::TUNER_PREFIX,
+                            BoardKind::Rotor => BoardKind::ROTOR_PREFIX,
+                            BoardKind::Unprogrammed => "",
+                        };
+                        let in_config = crate::config::load()
+                            .tuners
+                            .iter()
+                            .any(|t| t.mcp_serial == b.serial_number);
+                        ui.horizontal(|ui| {
+                            ui.label("Rename:");
+                            ui.label(RichText::new(prefix).monospace().weak());
+                            let text = board_serial_edit_state(&b.path);
+                            let mut guard = text.lock().unwrap();
+                            if guard.is_empty() {
+                                // Pre-fill met huidige naam (zonder prefix)
+                                *guard = b
+                                    .serial_number
+                                    .strip_prefix(prefix)
+                                    .unwrap_or(&b.serial_number)
+                                    .to_string();
+                            }
+                            ui.add(
+                                egui::TextEdit::singleline(&mut *guard)
+                                    .desired_width(160.0)
+                                    .hint_text("naam"),
+                            );
+                            if ui.button("Rename").clicked() {
+                                let name = guard.trim().to_string();
+                                drop(guard);
+                                let new_serial = format!("{}{}", prefix, name);
+                                let path = b.path.clone();
+                                let old_serial = b.serial_number.clone();
+                                log::info!(
+                                    "Rename board: path=\"{}\" old=\"{}\" new=\"{}\"",
+                                    path, old_serial, new_serial
+                                );
+                                let res = if name.is_empty() {
+                                    Err("naam mag niet leeg zijn".to_string())
+                                } else {
+                                    crate::mcp2221_scan::program_serial_at_path(
+                                        &path,
+                                        &new_serial,
+                                    )
+                                    .map(|()| {
+                                        // Update referenties in config.tuners
+                                        // (mcp_serial-veld matched op oude naam).
+                                        crate::config::modify_config(|c| {
+                                            for t in &mut c.tuners {
+                                                if t.mcp_serial == old_serial {
+                                                    t.mcp_serial = new_serial.clone();
+                                                }
+                                            }
+                                        });
+                                    })
+                                    .map_err(|e| format!("{:?}", e))
+                                };
+                                let ok = res.is_ok();
+                                *board_program_result_state(&b.path).lock().unwrap() =
+                                    Some(res);
+                                if ok {
+                                    // Restart zodat de TunerInstance de
+                                    // nieuwe serial bindt; zonder dit blijft
+                                    // de oude slot "niet verbonden" tonen.
+                                    restart_server();
+                                }
+                            }
+                        });
+                        if !in_config && kind == BoardKind::Tuner {
+                            ui.horizontal(|ui| {
+                                ui.colored_label(
+                                    Color32::from_rgb(220, 160, 40),
+                                    "  ⚠ Geprogrammeerd tuner-board zonder config-entry.",
+                                );
+                                let can_add = crate::config::load().tuners.len()
+                                    < crate::config::MAX_TUNERS;
+                                if ui
+                                    .add_enabled(can_add, egui::Button::new("Koppel aan config"))
+                                    .clicked()
+                                {
+                                    let serial = b.serial_number.clone();
+                                    log::info!(
+                                        "Claim tuner board: serial=\"{}\" → new config entry",
+                                        serial
+                                    );
+                                    crate::config::modify_config(|c| {
+                                        if c.tuners.len() < crate::config::MAX_TUNERS {
+                                            let mut t =
+                                                crate::config::TunerConfig::default();
+                                            t.enabled = true;
+                                            t.mcp_serial = serial.clone();
+                                            t.model = infer_model_from_serial(&serial);
+                                            c.tuners.push(t);
+                                        }
+                                    });
+                                    *board_program_result_state(&b.path).lock().unwrap() =
+                                        Some(Ok(()));
+                                    restart_server();
+                                }
+                            });
                         }
-                    });
-                    // Result line for the most recent Program-serial attempt.
+                    }
+                    // Resultaat van laatste Add/Rename-poging.
                     if let Some(res) = board_program_result_state(&b.path)
                         .lock()
                         .unwrap()
@@ -868,7 +1329,7 @@ fn render_board_scan_section(ui: &mut egui::Ui) {
                             Ok(()) => {
                                 ui.colored_label(
                                     Color32::from_rgb(50, 200, 50),
-                                    "written; click Scan to refresh",
+                                    "OK — klik Scan om te verversen",
                                 );
                             }
                             Err(msg) => {
@@ -881,10 +1342,6 @@ fn render_board_scan_section(ui: &mut egui::Ui) {
                     }
                 });
             }
-            ui.colored_label(
-                Color32::from_rgb(160, 160, 160),
-                "  (assign a board to a tuner via the MCP-serial dropdown in each Tuner-bridge frame above)",
-            );
         }
         Some(Err(e)) => {
             ui.colored_label(

@@ -404,6 +404,7 @@ impl ServerApp {
             // settings UI exposes tuner1/tuner2 the values just round-trip
             // through whatever was last loaded from disk.
             tuners: crate::config::load().tuners,
+            rotors: crate::config::load().rotors,
             tci_addr: if self.tci_addr.trim().is_empty() { None } else { Some(self.tci_addr.trim().to_string()) },
             dxcluster_server: self.dxcluster_server.clone(),
             dxcluster_callsign: self.dxcluster_callsign.clone(),
@@ -431,7 +432,12 @@ impl ServerApp {
             let audio_dev_opt = if audio_dev.is_empty() { None } else { Some(audio_dev) };
             match with_timeout(com_timeout, move || crate::yaesu::YaesuRadio::new(&port, baud, audio_dev_opt.as_deref())) {
                 Ok(radio) => {
-                    log::info!("Yaesu FT-991A connected on {}", port_log);
+                    // YaesuRadio is fail-soft: the underlying serial open
+                    // may have failed at probe-time. The actual connect/
+                    // not-detected log line is emitted inside YaesuRadio::new()
+                    // itself so we don't shadow it with a misleading
+                    // "connected" message here.
+                    log::debug!("Yaesu FT-991A instance created for {}", port_log);
                     self.yaesu = Some(Arc::new(radio));
                 }
                 Err(e) => {
@@ -440,19 +446,15 @@ impl ServerApp {
             }
         }
 
-        // Create AmplitecSwitch early so UI can access it too
+        // Create AmplitecSwitch early so UI can access it too. De
+        // worker-thread retry zelf bij offline device, dus we maken
+        // de instance ook als het bord nu niet bereikbaar is — anders
+        // verscheen het Amplitec-venster niet bij offline-start en
+        // kwam het ook niet vanzelf terug na een power-cycle (de
+        // oude thread brak op het eerste read-failure).
         let amplitec = if !amp_port.is_empty() && self.amplitec_enabled {
-            let port = amp_port.clone();
-            match with_timeout(com_timeout, move || AmplitecSwitch::new(&port)) {
-                Ok(sw) => {
-                    log::info!("Amplitec 6/2 connected on {}", amp_port);
-                    Some(Arc::new(sw))
-                }
-                Err(e) => {
-                    log::warn!("Amplitec init failed: {}", e);
-                    None
-                }
-            }
+            log::info!("Amplitec 6/2 starting on {} (thread retries until reachable)", amp_port);
+            Some(Arc::new(AmplitecSwitch::new(&amp_port)))
         } else {
             None
         };
@@ -526,7 +528,15 @@ impl ServerApp {
             }
         }
 
-        // Create Rotor if configured — backend keuze: EA7HG of PstRotator
+        // Create Rotor if configured — backend keuze: EA7HG, PstRotator
+        // of Adafruit MCP2221A (PATCH-yaesu-rotor-mcp2221).
+        // RotorInstance voor mcp2221_yaesu wordt tijdelijk bewaard in
+        // `pending_yaesu_rotor` zodat we 'm na het aanmaken van
+        // status_panel_state (verderop in deze fn) kunnen publiceren
+        // in rotor_slot.
+        let mut pending_yaesu_rotor: Option<
+            Arc<crate::mcp2221_yaesu_rotor::RotorInstance>,
+        > = None;
         if self.rotor_enabled {
             match self.rotor_backend.as_str() {
                 "pstrotator" => {
@@ -537,7 +547,7 @@ impl ServerApp {
                         );
                     } else {
                         log::info!(
-                            "Rotor (PstRotator) \u{2192} {}:{} (feedback :{}, ele={})",
+                            "Rotor (PstRotator) -> {}:{} (feedback :{}, ele={})",
                             host,
                             self.pstrotator_port,
                             self.pstrotator_feedback_port,
@@ -552,6 +562,52 @@ impl ServerApp {
                             });
                         self.rotor =
                             Some(Arc::new(crate::rotor::Rotor::from_handles(tx, status)));
+                    }
+                }
+                "mcp2221_yaesu" => {
+                    let rotors_cfg = crate::config::load().rotors;
+                    if let Some(rot_cfg) = rotors_cfg.first() {
+                        if rot_cfg.enabled && rot_cfg.mcp_serial.starts_with("rot_") {
+                            let label = if rot_cfg.name.is_empty() {
+                                rot_cfg.mcp_serial.clone()
+                            } else {
+                                rot_cfg.name.clone()
+                            };
+                            let calibration =
+                                crate::mcp2221_yaesu_rotor::RotorCalibration {
+                                    v_at_0deg: rot_cfg.v_at_0deg,
+                                    v_at_max_deg: rot_cfg.v_at_max_deg,
+                                    max_deg: rot_cfg.max_deg,
+                                    ramp_pct_per_sec: rot_cfg.ramp_pct_per_sec,
+                                    shortest_route_in_overlap: rot_cfg.shortest_route_in_overlap,
+                                };
+                            let inst = crate::mcp2221_yaesu_rotor::RotorInstance::new(
+                                0,
+                                &rot_cfg.mcp_serial,
+                                &label,
+                                calibration,
+                            );
+                            let facade = inst.make_rotor_facade();
+                            self.rotor =
+                                Some(Arc::new(facade));
+                            pending_yaesu_rotor = Some(inst);
+                            log::info!(
+                                "Rotor (Adafruit MCP2221A) serial=\"{}\" label=\"{}\" cal {:.3}V->{:.3}V @ {}°",
+                                rot_cfg.mcp_serial,
+                                label,
+                                rot_cfg.v_at_0deg,
+                                rot_cfg.v_at_max_deg,
+                                rot_cfg.max_deg,
+                            );
+                        } else {
+                            log::warn!(
+                                "mcp2221_yaesu backend geselecteerd maar config.rotors[0] is leeg of disabled — gebruik wizard om een rot_<naam> bord te claimen"
+                            );
+                        }
+                    } else {
+                        log::warn!(
+                            "mcp2221_yaesu backend geselecteerd maar geen rotor in config.rotors"
+                        );
                     }
                 }
                 _ => {
@@ -581,6 +637,12 @@ impl ServerApp {
         // PATCH-2: build the Status-panel state bundle and keep a clone for the UI.
         let status_panel_state = crate::audio_stats::StatusPanelShared::new();
         self.status_panel_state = Some(status_panel_state.clone());
+        // Publiceer eventuele Adafruit-rotor instance in het status-panel
+        // slot zodat het rotor-paneel (live ADC + Park-knoppen + DAC-slider)
+        // verschijnt parallel met de standaard rotor-window.
+        if let Some(inst) = pending_yaesu_rotor.take() {
+            let _ = status_panel_state.rotor_slot.set(inst);
+        }
         let handle = std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
             rt.block_on(async {
@@ -635,6 +697,50 @@ impl eframe::App for ServerApp {
             self.pending_autostart = false;
             self.start_server();
         }
+
+        // Refresh in-memory mirror van label-config — wordt door het
+        // Amplitec rename-dialog (context-menu) via `modify_config`
+        // bijgewerkt, en dit pad zorgt dat de UI in dezelfde frame de
+        // nieuwe naam toont zonder server-restart.
+        {
+            let live_labels = crate::config::load().amplitec_labels.clone();
+            if live_labels != self.amplitec_labels {
+                self.amplitec_labels = live_labels;
+            }
+        }
+
+        // Auto-restart handling: een UI-knop (tuner config, slot delete,
+        // serial rename) heeft via `request_auto_restart()` aangegeven dat
+        // de server moet herstarten. Doe dat hier in de event-loop zodat:
+        //   1. Drop-handlers correct runnen op de gestopte hardware-Arcs
+        //      (audio cpal-streams + Thetis TCI-WebSocket vrijgeven).
+        //   2. Een korte sleep het OS tijd geeft om die handles te
+        //      releasen voor de nieuwe child probeert te enumeraten.
+        // Voorheen riep restart_server direct process::exit(0) na spawn,
+        // wat Drop oversloeg — audio op de nieuwe instance werkte dan
+        // vaak niet tot owner handmatig de server afsloot en herstartte.
+        if auto_restart_requested() {
+            self.save_window_positions();
+            if let Some(tx) = self.shutdown_tx.take() {
+                let _ = tx.send(true);
+            }
+            // Drop alle hardware-Arcs → cpal streams, serial ports en
+            // TCI-connection worden via hun eigen Drop-impls afgesloten.
+            self.yaesu = None;
+            self.amplitec = None;
+            self.tuner = None;
+            self.spe = None;
+            self.rf2k = None;
+            self.ultrabeam = None;
+            self.rotor = None;
+            self.status_panel_state = None;
+            // Geef OS tijd om USB-HID + audio-device handles los te laten
+            // voor de nieuwe child enumeration start. Empirisch: 500-800
+            // ms is voldoende op Windows; 600 ms is een veilige middenweg
+            // tussen "audio claimt nog" en "operator merkt de pauze".
+            std::thread::sleep(Duration::from_millis(600));
+            spawn_replacement_and_exit();
+        }
         // Track main window size and position
         if let Some(rect) = ctx.input(|i| i.viewport().inner_rect) {
             self.main_window_size = Some([rect.width(), rect.height()]);
@@ -645,6 +751,11 @@ impl eframe::App for ServerApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             match self.mode {
                 Mode::Settings => {
+                    // ScrollArea zodat het Settings-paneel ook bruikbaar
+                    // blijft bij kleinere venstershoogtes — de Save & Start
+                    // knop staat helemaal onderaan en moet altijd bereikbaar
+                    // zijn zonder het hele venster groter te slepen.
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     ui.heading(format!("ThetisLink Server v{}", sdr_remote_core::VERSION));
                     ui.add_space(10.0);
 
@@ -794,9 +905,15 @@ impl eframe::App for ServerApp {
                     ui.horizontal(|ui| {
                         ui.checkbox(&mut self.rotor_enabled, "Rotor");
                         ui.label("backend:");
+                        // Snapshot voor change-detect; bij wijziging direct
+                        // naar disk persisteren (anders raakt de keuze
+                        // weg wanneer owner de server niet via Start
+                        // herstart na de dropdown-wijziging).
+                        let backend_before = self.rotor_backend.clone();
                         egui::ComboBox::from_id_salt("rotor_backend_combo")
                             .selected_text(match self.rotor_backend.as_str() {
                                 "pstrotator" => "PstRotator (XML/UDP)",
+                                "mcp2221_yaesu" => "Adafruit MCP2221A → Yaesu G-1000DXC",
                                 _ => "EA7HG Visual Rotor",
                             })
                             .show_ui(ui, |ui| {
@@ -810,7 +927,19 @@ impl eframe::App for ServerApp {
                                     "pstrotator".to_string(),
                                     "PstRotator (XML/UDP)",
                                 );
+                                ui.selectable_value(
+                                    &mut self.rotor_backend,
+                                    "mcp2221_yaesu".to_string(),
+                                    "Adafruit MCP2221A → Yaesu G-1000DXC",
+                                );
                             });
+                        if backend_before != self.rotor_backend {
+                            let new_backend = self.rotor_backend.clone();
+                            log::info!("Rotor backend switched: {} → {}", backend_before, new_backend);
+                            crate::config::modify_config(|c| {
+                                c.rotor_backend = new_backend.clone();
+                            });
+                        }
                     });
                     match self.rotor_backend.as_str() {
                         "pstrotator" => {
@@ -842,7 +971,7 @@ impl eframe::App for ServerApp {
                             });
                             ui.label(
                                 egui::RichText::new(
-                                    "PstRotator: in 'Communication \u{2192} UDP Control Port' \
+                                    "PstRotator: in 'Communication -> UDP Control Port' \
                                      bovenstaande poort instellen + 'UDP Control' aanvinken. \
                                      Lokale firewall: inbound UDP feedback-poort toestaan.",
                                 )
@@ -929,6 +1058,7 @@ impl eframe::App for ServerApp {
                     if ui.add_enabled(pw_valid, egui::Button::new("Save & Start")).clicked() {
                         self.start_server();
                     }
+                    }); // <- end ScrollArea wrap voor Mode::Settings
                 }
                 Mode::Running => {
                     ui.horizontal(|ui| {
@@ -1102,6 +1232,7 @@ impl eframe::App for ServerApp {
                             return;
                         }
                         egui::CentralPanel::default().show(ctx, |ui| {
+                            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                             render_tuner_panel(ui, &tuner_for_window, &status, &mut self.show_tuner_log);
 
                             ui.add_space(4.0);
@@ -1113,7 +1244,7 @@ impl eframe::App for ServerApp {
                                 if macro_status.running {
                                     ui.colored_label(
                                         Color32::from_rgb(255, 170, 40),
-                                        format!("\u{25B6} {} ({}/{})",
+                                        format!("> {} ({}/{})",
                                             macro_status.current_label,
                                             macro_status.step,
                                             macro_status.total_steps),
@@ -1158,6 +1289,7 @@ impl eframe::App for ServerApp {
 
                             ui.add_space(4.0);
                             render_tuner_log(ui, &log_entries, self.show_tuner_log);
+                            }); // <- ScrollArea wrap voor Tuner content
                         });
                         ctx.request_repaint_after(Duration::from_millis(200));
                     },
@@ -1206,14 +1338,14 @@ impl eframe::App for ServerApp {
                 if status.switch_a != self.last_switch_a && status.switch_a > 0 {
                     let label = self.amplitec_labels[(status.switch_a - 1).min(5) as usize].clone();
                     let ts = chrono::Local::now().format("%H:%M:%S").to_string();
-                    self.amplitec_log.push_back((ts, format!("Poort A \u{2192} {} ({})", status.switch_a, label)));
+                    self.amplitec_log.push_back((ts, format!("Poort A -> {} ({})", status.switch_a, label)));
                     if self.amplitec_log.len() > 100 { self.amplitec_log.pop_front(); }
                     self.last_switch_a = status.switch_a;
                 }
                 if status.switch_b != self.last_switch_b && status.switch_b > 0 {
                     let label = self.amplitec_labels[(status.switch_b - 1).min(5) as usize].clone();
                     let ts = chrono::Local::now().format("%H:%M:%S").to_string();
-                    self.amplitec_log.push_back((ts, format!("Poort B \u{2192} {} ({})", status.switch_b, label)));
+                    self.amplitec_log.push_back((ts, format!("Poort B -> {} ({})", status.switch_b, label)));
                     if self.amplitec_log.len() > 100 { self.amplitec_log.pop_front(); }
                     self.last_switch_b = status.switch_b;
                 }
@@ -1251,10 +1383,12 @@ impl eframe::App for ServerApp {
                             return;
                         }
                         egui::CentralPanel::default().show(ctx, |ui| {
-                            render_amplitec_panel(
-                                ui, &amplitec_for_window, &status,
-                                &labels, &log_entries, &mut self.show_amplitec_log,
-                            );
+                            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                                render_amplitec_panel(
+                                    ui, &amplitec_for_window, &status,
+                                    &labels, &log_entries, &mut self.show_amplitec_log,
+                                );
+                            });
                         });
                         ctx.request_repaint_after(Duration::from_millis(500));
                     },
@@ -1274,10 +1408,10 @@ impl eframe::App for ServerApp {
                 if status.state != self.last_spe_state {
                     let ts = chrono::Local::now().format("%H:%M:%S").to_string();
                     let msg = match status.state {
-                        0 => "Status \u{2192} Off".to_string(),
-                        1 => "Status \u{2192} Standby".to_string(),
-                        2 => "Status \u{2192} Operate".to_string(),
-                        _ => format!("Status \u{2192} Unknown ({})", status.state),
+                        0 => "Status -> Off".to_string(),
+                        1 => "Status -> Standby".to_string(),
+                        2 => "Status -> Operate".to_string(),
+                        _ => format!("Status -> Unknown ({})", status.state),
                     };
                     self.spe_log.push_back((ts, msg));
                     if self.spe_log.len() > 100 { self.spe_log.pop_front(); }
@@ -1335,9 +1469,11 @@ impl eframe::App for ServerApp {
                         }
                         let drive_pct = self.drive_level.load(Ordering::Relaxed);
                         egui::CentralPanel::default().show(ctx, |ui| {
-                            render_spe_panel(ui, &spe_for_window, &status, &log_entries,
-                                &mut self.show_spe_log, &mut self.spe_peak_power, &mut self.spe_peak_time, drive_pct,
-                                &self.active_pa);
+                            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                                render_spe_panel(ui, &spe_for_window, &status, &log_entries,
+                                    &mut self.show_spe_log, &mut self.spe_peak_power, &mut self.spe_peak_time, drive_pct,
+                                    &self.active_pa);
+                            });
                         });
                         ctx.request_repaint_after(Duration::from_millis(100));
                     },
@@ -1480,6 +1616,7 @@ impl eframe::App for ServerApp {
                 let rotor_sz = self.rotor_window_size.unwrap_or([340.0, 320.0]);
                 let backend_title = match self.rotor_backend.as_str() {
                     "pstrotator" => "Rotor — PstRotator",
+                    "mcp2221_yaesu" => "Rotor — Adafruit MCP2221A → Yaesu G-1000DXC",
                     _ => "Rotor — EA7HG Visual Rotor",
                 };
                 let mut rotor_vb = ViewportBuilder::default()
@@ -1587,6 +1724,55 @@ impl eframe::App for ServerApp {
                         });
                     });
                 });
+        }
+    }
+}
+
+/// Spawn een verse copy van de huidige executable met dezelfde CLI-args
+/// en `process::exit(0)` daarna, zodat de nieuwe process de UDP socket
+/// en alle hardware-handles kan binden. Aangeroepen door de
+/// auto-restart-flow in `update()` *nadat* alle Drop-handlers gelopen
+/// zijn en de cpal/USB handles vrijgegeven zijn.
+fn spawn_replacement_and_exit() -> ! {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            log::error!("Auto-restart: cannot read current_exe(): {}", e);
+            std::process::exit(1);
+        }
+    };
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    log::info!("Auto-restart: relaunching {:?} (args: {:?})", exe, args);
+
+    // Build the command with explicit null stdio + (on Windows) detached
+    // process flags. Without this the spawn fails with ERROR_NOT_SUPPORTED
+    // (os error 50) when the parent is a GUI-subsystem binary whose stdio
+    // handles are NULL: CreateProcess refuses to clone them into the child.
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS (0x00000008) — de nieuwe process krijgt een
+        // eigen console-handle-group, los van ons. CREATE_NEW_PROCESS_GROUP
+        // (0x00000200) isoleert Ctrl-C-bezorging. Samen zorgen ze dat de
+        // child volledig zelfstandig is zodat dit proces meteen kan exit.
+        const DETACHED_PROCESS: u32 = 0x00000008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+
+    match cmd.spawn() {
+        Ok(child) => {
+            log::info!("Auto-restart: spawned PID {}, exiting", child.id());
+            std::process::exit(0);
+        }
+        Err(e) => {
+            log::error!("Auto-restart: spawn failed: {}", e);
+            std::process::exit(1);
         }
     }
 }

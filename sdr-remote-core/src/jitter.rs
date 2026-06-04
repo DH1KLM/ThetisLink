@@ -11,6 +11,11 @@ pub struct BufferedFrame {
     pub timestamp: u32,
     pub opus_data: Vec<u8>,
     pub ptt: bool,
+    /// True wanneer de packet-header `Flags::AUDIO_WIDEBAND` had — bij
+    /// pop wordt op basis hiervan het juiste Opus-decoder pad gekozen
+    /// (wideband 16 kHz vs narrowband 8 kHz). Default false zodat
+    /// bestaande callers die geen WB ondersteunen unchanged blijven.
+    pub wideband: bool,
 }
 
 /// Result from pulling a frame out of the jitter buffer
@@ -294,6 +299,7 @@ mod tests {
             timestamp: seq * 20,
             opus_data: vec![seq as u8; 32],
             ptt: false,
+            wideband: false,
         }
     }
 

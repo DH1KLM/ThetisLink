@@ -94,6 +94,11 @@ pub enum Command {
     SetMonitor(bool),
     // DX-cluster spot stream opt-out (data-saving voor metered links)
     SetDxSpotsEnabled(bool),
+    /// Thetis-audio wideband opt-in (16 kHz Opus i.p.v. 8 kHz default).
+    /// Stuurt `ControlId::ThetisWidebandAudio` naar server en switcht
+    /// lokaal decoder/resampler pad bij ontvangst van WB-getagde audio
+    /// packets.
+    SetThetisWidebandAudio(bool),
     // RX2 / VFO-B
     SetRx2Enabled(bool),
     SetVfoSync(bool),

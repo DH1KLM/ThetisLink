@@ -241,21 +241,15 @@ private fun AmplitecTab(
         for (pos in 1..6) {
             val isActive = state.amplitecSwitchA == pos
             val isBlocked = state.amplitecSwitchB == pos
-            Button(
-                onClick = { onSetSwitchA(pos) },
+            AmplitecAntennaButton(
+                pos = pos,
+                alias = labelA(pos),
                 enabled = state.amplitecConnected,
-                colors = if (isActive) {
-                    ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
-                } else if (isBlocked) {
-                    ButtonDefaults.outlinedButtonColors(contentColor = Color.Gray)
-                } else {
-                    ButtonDefaults.outlinedButtonColors()
-                },
-                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                isActive = isActive,
+                isBlocked = isBlocked,
+                onClick = { onSetSwitchA(pos) },
                 modifier = Modifier.weight(1f),
-            ) {
-                Text(labelA(pos), fontWeight = if (isActive) FontWeight.Bold else FontWeight.Normal, fontSize = 12.sp, maxLines = 1)
-            }
+            )
         }
     }
 
@@ -281,20 +275,73 @@ private fun AmplitecTab(
         for (pos in 1..6) {
             val isActive = state.amplitecSwitchB == pos
             val isBlocked = state.amplitecSwitchA == pos
-            Button(
-                onClick = { onSetSwitchB(pos) },
+            AmplitecAntennaButton(
+                pos = pos,
+                alias = labelB(pos),
                 enabled = state.amplitecConnected,
-                colors = if (isActive) {
-                    ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
-                } else if (isBlocked) {
-                    ButtonDefaults.outlinedButtonColors(contentColor = Color.Gray)
-                } else {
-                    ButtonDefaults.outlinedButtonColors()
-                },
-                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                isActive = isActive,
+                isBlocked = isBlocked,
+                onClick = { onSetSwitchB(pos) },
                 modifier = Modifier.weight(1f),
-            ) {
-                Text(labelB(pos), fontWeight = if (isActive) FontWeight.Bold else FontWeight.Normal, fontSize = 12.sp, maxLines = 1)
+            )
+        }
+    }
+}
+
+/**
+ * Twee-regelige antenne-knop — visueel afgestemd op de server- en
+ * desktop-versie (`antenna_button` in `amplitec.rs` / `devices.rs`).
+ * Bovenste regel: `Ant<N>` (klein, identifier).
+ * Onderste regel: alias (groter, functionele naam) — alleen als de
+ * alias afwijkt van de Ant<N>-default, anders wordt het visueel een
+ * dubbele regel.
+ *
+ * Geen rename hier: labels worden alleen server-side beheerd.
+ */
+@Composable
+private fun AmplitecAntennaButton(
+    pos: Int,
+    alias: String,
+    enabled: Boolean,
+    isActive: Boolean,
+    isBlocked: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val posText = "Ant$pos"
+    val showAlias = alias.isNotBlank() && alias != posText && alias != pos.toString()
+    val colors = when {
+        isActive -> ButtonDefaults.buttonColors(
+            containerColor = Color(0xFF64A0E6),
+            contentColor = Color.White,
+        )
+        isBlocked -> ButtonDefaults.outlinedButtonColors(contentColor = Color.Gray)
+        else -> ButtonDefaults.outlinedButtonColors()
+    }
+    Button(
+        onClick = onClick,
+        enabled = enabled,
+        colors = colors,
+        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 4.dp),
+        modifier = modifier,
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(
+                posText,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Normal,
+                maxLines = 1,
+            )
+            if (showAlias) {
+                Text(
+                    alias,
+                    fontSize = 13.sp,
+                    fontWeight = if (isActive) FontWeight.Bold else FontWeight.Medium,
+                    maxLines = 1,
+                )
             }
         }
     }

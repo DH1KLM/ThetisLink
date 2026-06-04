@@ -38,7 +38,19 @@ impl TunerModel {
     }
 }
 
-/// Per-slot tuner configuration. Two of these live in [`ServerConfig::tuners`].
+/// Bovengrens van het aantal tuner-slots dat tegelijk geconfigureerd
+/// mag zijn. Komt overeen met het aantal Amplitec-A posities (6) zodat
+/// elke positie maximaal één eigen tuner kan hebben.
+pub const MAX_TUNERS: usize = 6;
+
+/// Maximum number of rotor-slots. For now single rotor (Yaesu G-1000DXC
+/// direct via MCP2221A). Higher value would only matter if/when multiple
+/// rotor-backends per server become a use-case (e.g. one az-only + one
+/// az/el station); raise here if that materialises.
+pub const MAX_ROTORS: usize = 1;
+
+/// Per-slot tuner configuration. Tot `MAX_TUNERS` van deze leven in
+/// [`ServerConfig::tuners`].
 #[derive(Clone, Debug)]
 pub struct TunerConfig {
     /// Enable this tuner slot at server start.
@@ -73,6 +85,61 @@ impl Default for TunerConfig {
             amplitec_pos: None,
             threshold_v: 2.25,
             hysteresis_v: 0.50,
+        }
+    }
+}
+
+/// Per-slot rotor configuration (PATCH-yaesu-rotor-mcp2221 fase 1).
+/// Eén entry per fysiek MCP2221A-board dat een Yaesu G-1000DXC direct
+/// aanstuurt. Fase 1 vult alleen `enabled` + `mcp_serial` + `name`;
+/// kalibratie-velden (v_at_0deg / v_at_max_deg / max_deg) en
+/// default_speed komen in latere fasen erbij.
+#[derive(Clone, Debug)]
+pub struct RotorConfig {
+    /// Enable this rotor slot at server start.
+    pub enabled: bool,
+    /// Display alias (UI + logs). Vaak gelijk aan het deel achter
+    /// `rot_` in de USB serial, maar mag vrije tekst zijn.
+    pub name: String,
+    /// USB serial van het MCP2221A-board dat deze rotor aanstuurt
+    /// (`rot_<naam>` prefix per ThetisLink-conventie). Leeg = niet
+    /// gebonden.
+    pub mcp_serial: String,
+    /// Kalibratie (fase 4): Yaesu pin-4 spanning bij 0° (CCW eindpark).
+    /// Default 0,0 = niet-gekalibreerd. Owner zet dit via "Park CCW".
+    pub v_at_0deg: f32,
+    /// Kalibratie (fase 4): Yaesu pin-4 spanning bij `max_deg`
+    /// (CW eindpark). Default 4,5 V (typisch G-1000DXC). Owner zet
+    /// dit via "Park CW".
+    pub v_at_max_deg: f32,
+    /// Maximale rotatie in graden (default 450 voor G-1000DXC).
+    pub max_deg: u16,
+    /// Soft-start/stop snelheidsverhoging in procent per seconde
+    /// (PATCH fase 6). Default 50%/sec = volledige ramp 0→max in 2 s.
+    /// Lagere waarde voor zware antennes (5-10%/sec); hogere waarde
+    /// (75-100%/sec) voor lichte antennes. Wordt zowel voor de
+    /// soft-start (gate-on → max DAC) als voor de soft-stop bij
+    /// GoTo-landing gebruikt.
+    pub ramp_pct_per_sec: f32,
+    /// Bij rotors met overlap-range (max_deg > 360, bv. G-1000DXC met
+    /// 450°): kies bij GoTo automatisch de kortste route via de
+    /// overlap-zone. Voorbeeld bij max_deg=450: huidig 350°, target
+    /// 30° → CCW-route = 320°, CW via 390° = 40° → CW wint. Default
+    /// uit zodat "ga naar 30°" letterlijk op 30° fysiek eindigt.
+    pub shortest_route_in_overlap: bool,
+}
+
+impl Default for RotorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            name: String::new(),
+            mcp_serial: String::new(),
+            v_at_0deg: 0.0,
+            v_at_max_deg: 4.5,
+            max_deg: 450,
+            ramp_pct_per_sec: 50.0,
+            shortest_route_in_overlap: false,
         }
     }
 }
@@ -127,9 +194,21 @@ pub struct ServerConfig {
     /// which tuner to drive when the user presses Tune. **Schema is wired into
     /// load/save now; the runtime + UI that consume it land in a follow-up
     /// patch, alongside the MCP2221A tuner-driver rewrite.**
-    pub tuners: [TunerConfig; 2],
+    /// Dynamische lijst (1..=`MAX_TUNERS`) van tuner-slots, één per
+    /// fysieke MCP2221A board. Vroeger een vaste `[TunerConfig; 2]`,
+    /// nu een `Vec` zodat de server schalend kan zijn naar het aantal
+    /// Amplitec-posities (max 6) zonder code-wijziging per slot.
+    /// Slot-index is 0-based intern; UI-labels en config-keys nummeren
+    /// vanaf 1 (`tuner1_*`, `tuner2_*`, ...).
+    pub tuners: Vec<TunerConfig>,
     /// Show tuner control window on start (default true)
     pub show_tuner_window: bool,
+    /// Per-slot Yaesu-rotor configuration (PATCH-yaesu-rotor-mcp2221).
+    /// Eén entry per MCP2221A-board met `rot_` USB-serial prefix; tot
+    /// `MAX_ROTORS`. Runtime-binding (rotor-backend `Mcp2221Yaesu`)
+    /// landt in fase 3 van de brief; fase 1 vult het schema en de
+    /// wizard-claim.
+    pub rotors: Vec<RotorConfig>,
     /// SPE Expert 1.3K-FA serial port (e.g. "COM6")
     pub spe_port: Option<String>,
     pub spe_enabled: bool,
@@ -235,8 +314,9 @@ impl Default for ServerConfig {
             amplitec_max_w: [None; 6],
             amplitec_tx_blocked: [false; 6],
             show_amplitec_window: true,
-            tuners: [TunerConfig::default(), TunerConfig::default()],
+            tuners: Vec::new(),
             show_tuner_window: true,
+            rotors: Vec::new(),
             spe_port: None,
             spe_enabled: true,
             show_spe_window: true,
@@ -286,8 +366,35 @@ impl Default for ServerConfig {
     }
 }
 
-/// Apply a `tuner1_FIELD=value` / `tuner2_FIELD=value` config entry to the
-/// matching `TunerConfig` slot.  Unknown sub-keys are silently ignored so a
+/// Probeert een `tuner<N>_FIELD` key te parsen. Returnt `Some((slot0_idx,
+/// field))` waarbij `slot0_idx = N - 1`. Accepteert N in 1..=`MAX_TUNERS`.
+/// Returnt `None` bij niet-tuner-keys of onbekende slot-index.
+fn parse_tuner_slot_prefix(key: &str) -> Option<(usize, &str)> {
+    let rest = key.strip_prefix("tuner")?;
+    let underscore = rest.find('_')?;
+    let n: usize = rest[..underscore].parse().ok()?;
+    if (1..=MAX_TUNERS).contains(&n) {
+        Some((n - 1, &rest[underscore + 1..]))
+    } else {
+        None
+    }
+}
+
+/// Vergroot de `tuners`-Vec zodat `slot0_idx` een geldige index is, met
+/// default `TunerConfig`-entries voor gaten. Owner-config kan een Vec van
+/// 0 hebben (eerste run zonder tuners) en alleen `tuner2_*` keys; in dat
+/// geval krijgen slot 0 (en eventuele andere gaten) een default-entry.
+fn ensure_tuner_slot(tuners: &mut Vec<TunerConfig>, slot0_idx: usize) {
+    if slot0_idx >= MAX_TUNERS {
+        return;
+    }
+    while tuners.len() <= slot0_idx {
+        tuners.push(TunerConfig::default());
+    }
+}
+
+/// Apply a `tuner<N>_FIELD=value` config entry to the matching
+/// `TunerConfig` slot. Unknown sub-keys are silently ignored so a
 /// future field-name doesn't have to be cross-version-compatible.
 fn parse_tuner_key(t: &mut TunerConfig, sub: &str, value: &str) {
     match sub {
@@ -309,6 +416,69 @@ fn parse_tuner_key(t: &mut TunerConfig, sub: &str, value: &str) {
             if let Ok(v) = value.parse::<f32>() {
                 t.hysteresis_v = v.clamp(0.1, 2.0);
             }
+        }
+        _ => {}
+    }
+}
+
+/// `rotor<N>_FIELD` parser parallel to `parse_tuner_slot_prefix`. Returns
+/// `(slot0_idx, sub)` voor N in 1..=`MAX_ROTORS`.
+fn parse_rotor_slot_prefix(key: &str) -> Option<(usize, &str)> {
+    let rest = key.strip_prefix("rotor")?;
+    let underscore = rest.find('_')?;
+    let n: usize = rest[..underscore].parse().ok()?;
+    if (1..=MAX_ROTORS).contains(&n) {
+        Some((n - 1, &rest[underscore + 1..]))
+    } else {
+        None
+    }
+}
+
+fn ensure_rotor_slot(rotors: &mut Vec<RotorConfig>, slot0_idx: usize) {
+    if slot0_idx >= MAX_ROTORS {
+        return;
+    }
+    while rotors.len() <= slot0_idx {
+        rotors.push(RotorConfig::default());
+    }
+}
+
+fn parse_rotor_key(r: &mut RotorConfig, sub: &str, value: &str) {
+    match sub {
+        "enabled" => r.enabled = value != "false",
+        "name" => r.name = value.to_string(),
+        "mcp_serial" => r.mcp_serial = value.to_string(),
+        "v_at_0deg" => {
+            if let Ok(v) = value.parse::<f32>() {
+                // Yaesu pin-4 spanning na ongedaan-maken van de
+                // printje-spanningsdeler. Met de nieuwe 1,8k+2,2k deler
+                // (ratio 1,818) reikt het meetbereik tot ~7,45 V; eerdere
+                // clamp van 5,0 V kapte de hoge-graden-kalibratie af na
+                // restart. 10 V geeft ruime marge voor alle realistische
+                // rotors zonder load-bestand corruptie te accepteren.
+                r.v_at_0deg = v.clamp(0.0, 10.0);
+            }
+        }
+        "v_at_max_deg" => {
+            if let Ok(v) = value.parse::<f32>() {
+                r.v_at_max_deg = v.clamp(0.0, 10.0);
+            }
+        }
+        "max_deg" => {
+            if let Ok(v) = value.parse::<u16>() {
+                r.max_deg = v.clamp(90, 720);
+            }
+        }
+        "ramp_pct_per_sec" => {
+            if let Ok(v) = value.parse::<f32>() {
+                r.ramp_pct_per_sec = v.clamp(1.0, 200.0);
+            }
+        }
+        "shortest_route_in_overlap" => {
+            r.shortest_route_in_overlap = matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
         }
         _ => {}
     }
@@ -453,16 +623,26 @@ fn load_unlocked() -> ServerConfig {
                         // owners upgrading from v2.0.2 do not lose their
                         // slot-0 enable state: mirror into tuners[0].enabled.
                         let v = value.trim() != "false";
+                        ensure_tuner_slot(&mut config.tuners, 0);
                         config.tuners[0].enabled = v;
                     }
                     "tuner_assume_tuned" => {}
-                    // New per-slot keys: tuner1_* / tuner2_* dispatched to
-                    // config.tuners[0] / config.tuners[1] respectively.
-                    k if k.starts_with("tuner1_") => {
-                        parse_tuner_key(&mut config.tuners[0], &k[7..], value.trim());
+                    // Per-slot keys: `tuner<N>_FIELD=value` met N=1..MAX_TUNERS.
+                    // Auto-grow de Vec tot index N-1 zodat oude config-files
+                    // (twee slots) én nieuwe (1..6 slots) beide werken.
+                    k if parse_tuner_slot_prefix(k).is_some() => {
+                        if let Some((slot0_idx, sub)) = parse_tuner_slot_prefix(k) {
+                            ensure_tuner_slot(&mut config.tuners, slot0_idx);
+                            parse_tuner_key(&mut config.tuners[slot0_idx], sub, value.trim());
+                        }
                     }
-                    k if k.starts_with("tuner2_") => {
-                        parse_tuner_key(&mut config.tuners[1], &k[7..], value.trim());
+                    // Per-slot rotor-keys: `rotor<N>_FIELD=value` met N=1..MAX_ROTORS.
+                    // PATCH-yaesu-rotor-mcp2221 fase 1.
+                    k if parse_rotor_slot_prefix(k).is_some() => {
+                        if let Some((slot0_idx, sub)) = parse_rotor_slot_prefix(k) {
+                            ensure_rotor_slot(&mut config.rotors, slot0_idx);
+                            parse_rotor_key(&mut config.rotors[slot0_idx], sub, value.trim());
+                        }
                     }
                     "tuner_window" => {
                         config.show_tuner_window = value.trim() == "true";
@@ -561,11 +741,13 @@ fn load_unlocked() -> ServerConfig {
                         config.show_rotor_window = value.trim() == "true";
                     }
                     "rotor_backend" => {
+                        // Accepteer de drie geldige backends; alles anders
+                        // valt terug op "ea7hg" voor backwards-compat.
                         let v = value.trim().to_lowercase();
-                        config.rotor_backend = if v == "pstrotator" {
-                            "pstrotator".to_string()
-                        } else {
-                            "ea7hg".to_string()
+                        config.rotor_backend = match v.as_str() {
+                            "pstrotator" => "pstrotator".to_string(),
+                            "mcp2221_yaesu" => "mcp2221_yaesu".to_string(),
+                            _ => "ea7hg".to_string(),
                         };
                     }
                     "pstrotator_host" => {
@@ -848,6 +1030,23 @@ fn save_unlocked(config: &ServerConfig) {
         ));
         contents.push_str(&format!("{}_threshold_v={}\n", prefix, t.threshold_v));
         contents.push_str(&format!("{}_hysteresis_v={}\n", prefix, t.hysteresis_v));
+    }
+    // Per-rotor slots (PATCH-yaesu-rotor-mcp2221 fase 1) — rotor1_* / rotor2_*
+    // keys. Fase 1 schrijft alleen enabled / name / mcp_serial; latere fasen
+    // breiden uit met kalibratie + speed-velden.
+    for (i, r) in config.rotors.iter().enumerate() {
+        let prefix = format!("rotor{}", i + 1);
+        contents.push_str(&format!("{}_enabled={}\n", prefix, r.enabled));
+        contents.push_str(&format!("{}_name={}\n", prefix, r.name));
+        contents.push_str(&format!("{}_mcp_serial={}\n", prefix, r.mcp_serial));
+        contents.push_str(&format!("{}_v_at_0deg={:.3}\n", prefix, r.v_at_0deg));
+        contents.push_str(&format!("{}_v_at_max_deg={:.3}\n", prefix, r.v_at_max_deg));
+        contents.push_str(&format!("{}_max_deg={}\n", prefix, r.max_deg));
+        contents.push_str(&format!("{}_ramp_pct_per_sec={:.1}\n", prefix, r.ramp_pct_per_sec));
+        contents.push_str(&format!(
+            "{}_shortest_route_in_overlap={}\n",
+            prefix, r.shortest_route_in_overlap
+        ));
     }
     for i in 0..6 {
         contents.push_str(&format!("amplitec_label{}={}\n", i + 1, config.amplitec_labels[i]));

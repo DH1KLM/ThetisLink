@@ -16,6 +16,181 @@ hardware notes, see `docs-book/src/technical-reference.md` and
 
 ---
 
+## [2.1.0] — 2026-06 (Yaesu rotor MCP2221A backend, wideband Thetis RX, Amplitec reliability)
+
+> **Backwards-compatible with 2.0.4.** Wire-protocol unchanged — a
+> 2.0.4 client talks to a 2.1.0 server (and vice versa) without
+> issues. The new rotor backend, wideband RX opt-in and Amplitec
+> reconnect logic are all server-side; clients see them through the
+> existing TCI/Rotor/Amplitec channels. Pair 2.1.0 with the matching
+> Thetis-fork build **PA3GHM TL2-4** to unlock the full feature-set;
+> stock Thetis remains supported via the standard fallback paths.
+
+### Added — Yaesu G-1000DXC rotor via Adafruit MCP2221A
+
+A third rotor backend joins the existing **EA7HG** and **PstRotator**
+options, driving a Yaesu G-1000DXC's EXT CONTROL port directly from
+a Adafruit MCP2221A breakout (5 V mod) without any intermediate
+controller PCB or third-party software. The on-board MCP2221A speaks
+GPIO (CW/CCW gates via BST82 low-side switches), DAC (speed) and ADC
+(position feedback) over USB-HID; ThetisLink does all the control
+logic in-process.
+
+- **Soft-start / soft-stop ramp** — configurable acceleration
+  (`ramp_pct_per_sec`, 1–200 %/s, default 50 %/s) protects heavy mast
+  hardware. The GoTo soft-stop landing computes a deceleration
+  distance from the current speed + ramp-rate and reaches the target
+  within ±1° without overshoot.
+- **Adaptive sample rate** — ADC polled at 30 Hz during motion
+  (33 ms tick, intentionally off the 50/60 Hz mains-ripple multiples)
+  with a 10-sample median filter for control loop responsiveness, and
+  at 1 Hz when idle with a 60-sample median for a calm position
+  display.
+- **Shortest-route option** for rotors with overlap range
+  (`max_deg > 360`): with the checkbox enabled, a GoTo from e.g. 350°
+  to 30° picks the 40° CW path through the overlap zone instead of
+  the 320° CCW path through the dead band.
+- **Manual override** — the server-UI's CW/CCW test buttons and
+  speed-slider take precedence over the ramp loop while you debug
+  hardware; the ramp resumes control when the next client GoTo
+  arrives.
+- **Calibration wizard** — "Park CCW" / "Park CW" buttons capture the
+  Yaesu position-pin voltage at the mechanical endpoints; the linear
+  mapping survives the slightly above-spec voltage range some
+  G-1000DXC units exhibit (up to ~7.5 V on pin 4, well above the
+  schema-documented 4.5 V).
+
+The client side stays unchanged: the existing Rotor window (compass
+circle, GoTo input, Stop button) drives the new backend through the
+same `Rotor` facade as EA7HG and PstRotator.
+
+### Added — Optional wideband Thetis RX audio
+
+A new server checkbox **"ThetisLink extensions WB RX"** lifts the
+fixed 48 kHz RX-audio rate when paired with a Thetis-fork that
+supports the wideband-IQ extension. Owners with capable network and
+desktop hardware can now stream RX at the wider rate without giving
+up the standard fallback for stock Thetis. Default off — the existing
+narrow-band path is unchanged.
+
+### Added — Modular multi-tuner wizard
+
+The server's MCP2221A tuner-bridge section now supports multiple tuner
+slots driven from a `Vec<TunerConfig>` schema. Each slot is added via
+a board-scan wizard that classifies detected USB devices (Tuner vs
+Rotor vs Unprogrammed) and writes the chosen function to the board's
+EEPROM. Per-slot rename, delete and threshold-slider; the surrounding
+**MCP2221A** section is now collapsible and its expanded/collapsed
+state persists across restarts.
+
+### Fixed — Amplitec reconnect after power cycle
+
+The Amplitec 6/2 serial worker thread no longer dies on the first
+USB-error. It loops with a 5-second retry, marks the device as
+disconnected during the outage and reconnects automatically when the
+controller comes back online. The Amplitec window now also appears
+even when the device is offline at server start — previously a missed
+COM-port at boot made the whole UI section invisible until a server
+restart.
+
+### Fixed — RX2 mode-switch filter restore
+
+Switching RX2 to a mode the client had never seen (USB → CW for
+example) restored the filter edges from the new mode's defaults
+instead of carrying over the obsolete previous mode's filter. A
+one-line guard in the client's modulation handler honours the
+server's filter-band update during the switch instead of overwriting
+it with stale state.
+
+### Fixed — RX2 spectrum filter-drag isolation
+
+Per-channel filter-edge drag keys decoupled the RX1 and RX2 drag
+state, so a filter-edge drag on RX2 no longer pulls RX1's filter
+along by accident.
+
+### Fixed — Yaesu EQ profile mic-gain persistence
+
+The Yaesu FT-991A equalizer profile now saves the mic-gain slider
+together with the band/treble levels; switching profiles or
+restarting the client preserves the slider value.
+
+### Fixed — Yaesu TX resampler aliasing
+
+Sharper anti-alias filter on the client's Yaesu TX audio resampler;
+high-frequency artefacts in the transmitted audio are reduced.
+
+### Fixed — Server status panel scroll-jump
+
+The Status panel's "Active clients" and "Recent connect attempts"
+sections briefly shrank to a 1-line "snapshot busy…" placeholder
+whenever the SessionManager lock was contended. The lost rows pulled
+the scrollable content above any expanded section underneath, so
+scrolling down to inspect the MCP2221A panel kept jumping back up.
+Snapshots are now cached and reused on contention; the layout stays
+stable across renders.
+
+### Fixed — Graceful server auto-restart
+
+Auto-restart now runs the hardware-Arc Drop handlers before the new
+process spawns, releasing cpal audio streams and the TCI WebSocket
+cleanly. Audio on the new instance works on the first try instead of
+requiring a manual stop+start cycle.
+
+### Fixed — UltraBeam element-lengths at connect
+
+Initial element-length read on connect; the UI no longer briefly
+shows zeros for the first ~300 ms after the UltraBeam controller
+appears on the network.
+
+### Fixed — Yaesu audio cold-start fail-soft
+
+Yaesu output stream retry-loop + de-duplicated retry logs prevent the
+"audio device disappeared at boot" failure mode where the server
+gave up after one attempt; the first poll after the device enumerates
+correctly now succeeds quietly.
+
+### Changed — UI polish across server and client
+
+- All `CollapsingHeader` widgets replaced by a custom `chevron_label`
+  with a geometric triangle marker, ASCII-only to avoid the egui
+  default font's missing-glyph tofu on some Windows setups
+- Server Settings tab now wrapped in a `ScrollArea` so the panel
+  stays usable on smaller displays
+- Amplitec antenna-button two-line layout with prominent alias label;
+  rename via right-click context menu; auto-scale buttons on long
+  names
+- Client frequency-digit hover blocks the parent `ScrollArea` so
+  mouse-wheel digit edits no longer scroll the surrounding panel
+- Rotor poll-thread log noise demoted to `debug!` (per-tick
+  `set_direction` and 5-second ADC stats) — no longer floods the
+  default server log
+
+### Compliance
+
+- New driver module `mcp2221_yaesu_rotor.rs` carries an
+  `SPDX-License-Identifier: GPL-2.0-or-later` header. The vendored
+  `mcp2221-hal` crate keeps its original MIT/Apache-2 dual license
+  alongside ThetisLink's GPL-2.0-or-later distribution as before.
+- SBOM (`compliance/sbom.spdx.json`) and third-party-licenses bundle
+  regenerated for v2.1.0.
+- No new third-party crate additions on top of v2.0.4 beyond what the
+  workspace already depended on.
+
+### Hardware reference — Yaesu G-1000DXC + MCP2221A
+
+For owners building the same setup: the rotor printje uses a
+**1.8 kΩ + 2.2 kΩ** divider (ratio 1.818) on the position-feedback
+pin, mapping the 0–4.8 V (or higher, depending on unit) Yaesu output
+into the MCP2221A's internal 4.096 V ADC reference with a safe
+margin. The initial 1.8 kΩ + 10 kΩ design (ratio 1.18) clipped above
+~365° on some units; rebuild with 2.2 kΩ if you observe ADC
+saturation past the 365° mark. A 10 µF cap parallel to the 2.2 kΩ
+suppresses the 100 Hz mains-rectifier ripple visible on the position
+signal. Recalibrate with **Park CCW** + **Park CW** after any divider
+change.
+
+---
+
 ## [2.0.4] — 2026-05 (bandwidth toolkit, preventive TX-inhibit, power-cap, PstRotator)
 
 > **Backwards-compatible with 2.0.3.** Wire-protocol additive only —

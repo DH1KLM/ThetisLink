@@ -5,7 +5,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use log::{info, warn};
+use log::{debug, info, warn};
 
 /// Amplitec 6/2 antenna switch USB serial controller.
 /// Communicates via 19200 baud, 12-byte binary commands.
@@ -56,16 +56,12 @@ const CMD_SWITCH_B: [[u8; 12]; 6] = [
 ];
 
 impl AmplitecSwitch {
-    /// Open serial port and start background thread.
-    pub fn new(port_name: &str) -> Result<Self, String> {
-        let port = serialport::new(port_name, 19200)
-            .data_bits(serialport::DataBits::Eight)
-            .parity(serialport::Parity::None)
-            .stop_bits(serialport::StopBits::One)
-            .timeout(Duration::from_millis(500))
-            .open()
-            .map_err(|e| format!("Failed to open {}: {}", port_name, e))?;
-
+    /// Spawn the serial worker thread. Returns immediately; the
+    /// thread opens the port asynchronously and retries on failure,
+    /// so the caller does not need to handle a connection error here.
+    /// Use `status().connected` to observe whether the device is
+    /// currently reachable.
+    pub fn new(port_name: &str) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<AmplitecCmd>();
         let status = Arc::new(Mutex::new(AmplitecStatus::default()));
 
@@ -75,14 +71,11 @@ impl AmplitecSwitch {
         std::thread::Builder::new()
             .name("amplitec-serial".to_string())
             .spawn(move || {
-                amplitec_thread(port, cmd_rx, status_for_thread, &port_name_owned);
+                amplitec_thread(cmd_rx, status_for_thread, port_name_owned);
             })
-            .map_err(|e| format!("Failed to spawn amplitec thread: {}", e))?;
+            .expect("Failed to spawn amplitec thread");
 
-        // Initial query
-        let _ = cmd_tx.send(AmplitecCmd::Query);
-
-        Ok(Self { cmd_tx, status })
+        Self { cmd_tx, status }
     }
 
     pub fn send_command(&self, cmd: AmplitecCmd) {
@@ -94,72 +87,141 @@ impl AmplitecSwitch {
     }
 }
 
+/// Reconnect-interval bij offline device. 5 sec is een redelijke balans
+/// tussen "merken dat hij weer aan staat" en "geen log-spam tijdens
+/// langere uitval". De wachttijd wordt afgebroken zodra het
+/// command-channel sluit (server-stop), zodat de thread netjes exit.
+const AMPLITEC_RECONNECT_DELAY: Duration = Duration::from_secs(5);
+
+/// Polling-interval tijdens een actieve sessie. Iedere 2 sec een SCAN
+/// command voor positie-updates + heartbeat zodat een stille USB-fout
+/// snel gedetecteerd wordt.
+const AMPLITEC_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
 fn amplitec_thread(
-    mut port: Box<dyn serialport::SerialPort>,
     cmd_rx: mpsc::Receiver<AmplitecCmd>,
     status: Arc<Mutex<AmplitecStatus>>,
-    port_name: &str,
+    port_name: String,
 ) {
-    info!("Amplitec serial thread started on {}", port_name);
-    {
-        let mut s = status.lock().unwrap();
-        s.connected = true;
-    }
-
-    // Initial scan
-    if let Err(e) = send_and_scan(&mut port, &CMD_SCAN, &status) {
-        warn!("Amplitec initial scan failed: {}", e);
-    }
-
+    info!("Amplitec serial thread started for {}", port_name);
+    // Log-state per outage zodat we maar één warn per disconnect-event
+    // krijgen i.p.v. één per retry-poging (5 sec).
+    let mut have_logged_offline = false;
     loop {
-        // Check for commands (non-blocking with short timeout)
-        match cmd_rx.recv_timeout(Duration::from_secs(2)) {
+        // ── Probeer (her)openen ─────────────────────────────────────
+        let port = serialport::new(&port_name, 19200)
+            .data_bits(serialport::DataBits::Eight)
+            .parity(serialport::Parity::None)
+            .stop_bits(serialport::StopBits::One)
+            .timeout(Duration::from_millis(500))
+            .open();
+
+        let mut port = match port {
+            Ok(p) => {
+                info!("Amplitec port {} opened", port_name);
+                have_logged_offline = false;
+                {
+                    let mut s = status.lock().unwrap();
+                    s.connected = true;
+                }
+                p
+            }
+            Err(e) => {
+                if !have_logged_offline {
+                    warn!("Amplitec {} not reachable: {} (will retry every {}s)",
+                        port_name, e, AMPLITEC_RECONNECT_DELAY.as_secs());
+                    have_logged_offline = true;
+                } else {
+                    debug!("Amplitec {} still offline: {}", port_name, e);
+                }
+                mark_disconnected(&status);
+                // Pending commands droppen — verzending na power-cycle
+                // van een stale switch-cmd zou ongewenst zijn.
+                while cmd_rx.try_recv().is_ok() {}
+                // Wachten op retry óf op shutdown.
+                match cmd_rx.recv_timeout(AMPLITEC_RECONNECT_DELAY) {
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        info!("Amplitec command channel closed during reconnect-wait, stopping");
+                        return;
+                    }
+                    // Bij Timeout én bij een eventueel binnengekomen cmd
+                    // (drainen na retry) → opnieuw proberen te openen.
+                    _ => continue,
+                }
+            }
+        };
+
+        // ── Initial scan na succesvolle open ───────────────────────
+        if let Err(e) = send_and_scan(&mut port, &CMD_SCAN, &status) {
+            warn!("Amplitec initial scan on {} failed: {}", port_name, e);
+            mark_disconnected(&status);
+            drop(port);
+            continue; // terug naar (her)open
+        }
+
+        // ── Command/poll loop totdat een fout optreedt ─────────────
+        let session_outcome = run_amplitec_session(&mut port, &cmd_rx, &status);
+        drop(port);
+        mark_disconnected(&status);
+        match session_outcome {
+            SessionOutcome::Reconnect => {
+                warn!("Amplitec {} disconnected, retrying", port_name);
+                have_logged_offline = false;
+                // continue loop: opnieuw openen
+            }
+            SessionOutcome::Shutdown => {
+                info!("Amplitec serial thread stopping ({})", port_name);
+                return;
+            }
+        }
+    }
+}
+
+enum SessionOutcome {
+    /// Serial-fout opgetreden — port sluiten en opnieuw openen.
+    Reconnect,
+    /// Command-channel gesloten (server-stop). Thread mag eindigen.
+    Shutdown,
+}
+
+fn run_amplitec_session(
+    port: &mut Box<dyn serialport::SerialPort>,
+    cmd_rx: &mpsc::Receiver<AmplitecCmd>,
+    status: &Arc<Mutex<AmplitecStatus>>,
+) -> SessionOutcome {
+    loop {
+        match cmd_rx.recv_timeout(AMPLITEC_POLL_INTERVAL) {
             Ok(AmplitecCmd::SetSwitchA(pos)) => {
-                if pos >= 1 && pos <= 6 {
+                if (1..=6).contains(&pos) {
                     let cmd = CMD_SWITCH_A[(pos - 1) as usize];
-                    if let Err(e) = send_and_scan(&mut port, &cmd, &status) {
+                    if let Err(e) = send_and_scan(port, &cmd, status) {
                         warn!("Amplitec set A{} failed: {}", pos, e);
-                        mark_disconnected(&status);
-                        break;
+                        return SessionOutcome::Reconnect;
                     }
                     info!("Amplitec: Switch A → {}", pos);
                 }
             }
             Ok(AmplitecCmd::SetSwitchB(pos)) => {
-                if pos >= 1 && pos <= 6 {
+                if (1..=6).contains(&pos) {
                     let cmd = CMD_SWITCH_B[(pos - 1) as usize];
-                    if let Err(e) = send_and_scan(&mut port, &cmd, &status) {
+                    if let Err(e) = send_and_scan(port, &cmd, status) {
                         warn!("Amplitec set B{} failed: {}", pos, e);
-                        mark_disconnected(&status);
-                        break;
+                        return SessionOutcome::Reconnect;
                     }
                     info!("Amplitec: Switch B → {}", pos);
                 }
             }
-            Ok(AmplitecCmd::Query) => {
-                if let Err(e) = send_and_scan(&mut port, &CMD_SCAN, &status) {
-                    warn!("Amplitec query failed: {}", e);
-                    mark_disconnected(&status);
-                    break;
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Periodic poll every 2s
-                if let Err(e) = send_and_scan(&mut port, &CMD_SCAN, &status) {
-                    warn!("Amplitec periodic poll failed: {}", e);
-                    mark_disconnected(&status);
-                    break;
+            Ok(AmplitecCmd::Query) | Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Err(e) = send_and_scan(port, &CMD_SCAN, status) {
+                    warn!("Amplitec poll failed: {}", e);
+                    return SessionOutcome::Reconnect;
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                info!("Amplitec command channel closed, stopping");
-                break;
+                return SessionOutcome::Shutdown;
             }
         }
     }
-
-    mark_disconnected(&status);
-    info!("Amplitec serial thread stopped");
 }
 
 fn mark_disconnected(status: &Arc<Mutex<AmplitecStatus>>) {

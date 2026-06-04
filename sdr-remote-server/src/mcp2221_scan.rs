@@ -37,6 +37,53 @@ impl BoardInfo {
             format!("{}  —  {}", self.serial_number, self.product_string)
         }
     }
+
+    /// Classificeer een board op basis van zijn (geprogrammeerde) USB
+    /// serial. ThetisLink-conventie: `tun_<name>` = tuner-board,
+    /// `rot_<name>` = rotor-board, anders ongeprogrammeerd.
+    pub fn kind(&self) -> BoardKind {
+        BoardKind::from_serial(&self.serial_number)
+    }
+}
+
+/// Functionele classificatie van een MCP2221A board.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoardKind {
+    /// Board geprogrammeerd voor tuner-bediening (`tun_*` prefix).
+    Tuner,
+    /// Board geprogrammeerd voor rotor-bediening (`rot_*` prefix).
+    /// Runtime-support volgt in fase 4 — wizard accepteert de keuze
+    /// al maar Add is geblokkeerd in v2.0.5.
+    Rotor,
+    /// Geen `tun_`/`rot_` prefix gevonden. Een fresh-from-factory
+    /// Adafruit board of een board waarvan de serial nog handmatig
+    /// is gezet zonder ThetisLink-conventie.
+    Unprogrammed,
+}
+
+impl BoardKind {
+    /// Prefix-marker voor tuners.
+    pub const TUNER_PREFIX: &'static str = "tun_";
+    /// Prefix-marker voor rotors.
+    pub const ROTOR_PREFIX: &'static str = "rot_";
+
+    pub fn from_serial(serial: &str) -> Self {
+        if serial.starts_with(Self::TUNER_PREFIX) {
+            BoardKind::Tuner
+        } else if serial.starts_with(Self::ROTOR_PREFIX) {
+            BoardKind::Rotor
+        } else {
+            BoardKind::Unprogrammed
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BoardKind::Tuner => "Tuner",
+            BoardKind::Rotor => "Rotor",
+            BoardKind::Unprogrammed => "Ongeprogrammeerd",
+        }
+    }
 }
 
 /// Enumerate every MCP2221A currently visible on the USB bus.

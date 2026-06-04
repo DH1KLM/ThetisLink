@@ -175,15 +175,26 @@ fn internal_mode_to_yaesu(internal: u8) -> char {
 
 impl YaesuRadio {
     pub fn new(port_name: &str, baud: u32, audio_device: Option<&str>) -> Result<Self, String> {
-        // Open serial port (first time — must succeed)
-        let port = serialport::new(port_name, baud)
+        // Probe serial port (best-effort). If the Yaesu is off at server-start
+        // the reconnect thread will retry silently in the background until the
+        // radio appears — earlier behaviour was hard-fail here, which meant
+        // powering up the Yaesu after the server was running required a full
+        // server restart. Probe-open is just a courtesy log: drop immediately
+        // and let the reconnect thread re-open in its own loop.
+        let initial_port_ok = match serialport::new(port_name, baud)
             .data_bits(serialport::DataBits::Eight)
             .stop_bits(serialport::StopBits::One)
             .parity(serialport::Parity::None)
             .flow_control(serialport::FlowControl::Hardware)
             .timeout(Duration::from_millis(100))
             .open()
-            .map_err(|e| format!("Failed to open {}: {}", port_name, e))?;
+        {
+            Ok(port) => {
+                drop(port);
+                true
+            }
+            Err(_) => false,
+        };
 
         let status = Arc::new(Mutex::new(YaesuState::default()));
         let (cmd_tx, cmd_rx) = mpsc::channel();
@@ -201,9 +212,20 @@ impl YaesuRadio {
         let last_audio_time = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let memory_data: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
-        // Initial audio setup
-        let mut audio_rate = 0u32;
-        let mut tx_rate = 0u32;
+        // Initial audio setup.
+        //
+        // Default-rate is 48000 Hz omdat de Yaesu FT-991A USB Audio CODEC
+        // dat altijd levert (input 48kHz/F32/1ch, output 48kHz/F32/2ch).
+        // Bij cold-start (Yaesu uit) faalt de build_capture/output_stream
+        // hieronder en blijven we op default 48000. Dat is nodig zodat
+        // de eenmalig-gestarte `yaesu_audio_loop` (RX-richting) en de
+        // TX-resampler in network.rs met een geldige sample-rate
+        // initialiseren — niet met 0 wat tot `frame_samples = 0` en een
+        // gedeeld-door-nul resampler-ratio leidt. Latere reconnect-
+        // builds van de cpal streams gebruiken altijd 48000 zodat het
+        // matched.
+        let mut audio_rate = 48_000u32;
+        let mut tx_rate = 48_000u32;
         if let Some(dev) = audio_device {
             // Capture (RX from Yaesu)
             // Seed audio timestamp so watchdog can detect if stream never starts
@@ -256,12 +278,19 @@ impl YaesuRadio {
             });
         }
 
-        info!("Yaesu FT-991A connected on {} @ {} baud", port_name, baud);
+        if initial_port_ok {
+            info!("Yaesu FT-991A serial probed OK on {} @ {} baud", port_name, baud);
+        } else {
+            info!(
+                "Yaesu FT-991A serial not detected on {} — background retry until radio comes online",
+                port_name
+            );
+        }
 
-        // Start self-reconnecting serial + audio thread
-        // Note: Box<dyn SerialPort> is not Send, so we drop it and let the thread reopen.
-        // The port was already validated above, so the first open in the thread will succeed.
-        drop(port);
+        // Start self-reconnecting serial + audio thread. The thread does the
+        // real open (in a loop); the probe above was only a courtesy log so
+        // operator sees immediately whether the radio is reachable. If the
+        // probe failed the thread enters retry-mode silently.
         {
             let status = status.clone();
             let memory_data = memory_data.clone();
@@ -323,17 +352,27 @@ fn yaesu_reconnect_thread(
 ) {
     info!("Yaesu serial thread started on {}", port_name);
 
-    // First connect (port was already validated in new(), should succeed immediately)
+    // Connection-state tracking, lokaal aan deze thread:
+    //   `ever_connected` flipt naar true bij de eerste succesvolle open en
+    //   bepaalt of een open-failure cold-start (silent) of mid-runtime
+    //   disconnect (één warn) is.
+    //   `disconnect_logged` dedupliceert de disconnect-warn zodat we niet
+    //   elke 3 s log-spam genereren tijdens een langdurige outage.
+    //   `first` triggert het wait/drain blok alleen ná de eerste iteratie
+    //   (zodat de allereerste open-attempt geen 3 s wacht).
     let mut first = true;
+    let mut ever_connected = false;
+    let mut disconnect_logged = false;
 
     loop {
         if !first {
-            warn!("Yaesu disconnected, retry in 3s...");
-
-            // Drop old audio streams (device may have disappeared)
-            capture_stream.set(None);
-            output_stream.set(None);
-            *tx_producer.lock().unwrap() = None;
+            // Drop oude audio streams (alleen na succesvolle connect zinvol —
+            // tijdens cold-start retries is er niets om te droppen).
+            if ever_connected {
+                capture_stream.set(None);
+                output_stream.set(None);
+                *tx_producer.lock().unwrap() = None;
+            }
 
             std::thread::sleep(Duration::from_secs(3));
 
@@ -362,34 +401,88 @@ fn yaesu_reconnect_thread(
         {
             Ok(p) => p,
             Err(e) => {
-                log::debug!("Yaesu reconnect failed: {}", e);
+                // Pre-connect (cold-start, Yaesu nog niet aan): stil retry,
+                // geen log-spam per 3 s tick. Eén `debug!` voor wie met
+                // RUST_LOG=debug debugt.
+                // Post-connect (mid-runtime outage): één `warn!` bij het
+                // eerste failed-open na de disconnect, daarna stil tot
+                // re-connect of een nieuwe outage-cycle.
+                if ever_connected && !disconnect_logged {
+                    warn!("Yaesu disconnected, retrying in background");
+                    disconnect_logged = true;
+                }
+                log::debug!("Yaesu open attempt failed: {}", e);
                 continue;
             }
         };
 
-        if status.lock().unwrap().connected {
-            info!("Yaesu serial connected on {}", port_name);
-        } else {
+        // Open succeeded — log de transitie en reset het dedup-flag voor de
+        // volgende eventuele outage-cycle.
+        if ever_connected {
             info!("Yaesu serial reconnected on {}", port_name);
-            // Rebuild audio streams on reconnect (USB audio device should be back)
-            if let Some(ref dev) = audio_device {
-                // Small delay: USB audio device may appear after serial port
-                std::thread::sleep(Duration::from_secs(1));
+        } else {
+            info!("Yaesu serial connected on {}", port_name);
+            ever_connected = true;
+        }
+        disconnect_logged = false;
 
-                match build_capture_stream(dev, rx_audio_tx.clone(), last_audio_time.clone()) {
-                    Ok((stream, _rate)) => {
-                        capture_stream.set(Some(stream));
-                        info!("Yaesu audio capture reconnected");
-                    }
-                    Err(e) => warn!("Yaesu audio capture reconnect failed: {}", e),
+        // Rebuild audio streams onvoorwaardelijk na elke succesvolle open.
+        // Bij cold-start (Yaesu was uit toen new() draaide) is het USB
+        // audio device pas hier beschikbaar; bij mid-runtime reconnect kan
+        // het device kort verdwenen zijn.
+        //
+        // De Yaesu FT-991A presenteert de capture- en output-kant van zijn
+        // USB Audio CODEC als twee aparte cpal-devices die net niet
+        // gelijktijdig enumerable worden. In de praktijk komt capture
+        // ~100-300 ms eerder beschikbaar dan output; een back-to-back
+        // build van eerst capture en dan output faalt dan met
+        // "device is no longer available" op de output-kant. Daarom
+        // retried de output-build hieronder een paar keer met korte
+        // delay tussen pogingen.
+        if let Some(ref dev) = audio_device {
+            // Initial delay: USB audio device may appear after serial port
+            std::thread::sleep(Duration::from_secs(1));
+
+            match build_capture_stream(dev, rx_audio_tx.clone(), last_audio_time.clone()) {
+                Ok((stream, _rate)) => {
+                    capture_stream.set(Some(stream));
+                    info!("Yaesu audio capture reconnected");
                 }
+                Err(e) => warn!("Yaesu audio capture reconnect failed: {}", e),
+            }
+            // Output-stream retry-loop: tot 5 pogingen, 500 ms tussen elk.
+            // Logt alleen de uiteindelijke status (ok of de laatste fout) —
+            // tussenliggende attempts blijven op debug om server-log rust
+            // te houden.
+            let mut output_ok = false;
+            let mut last_err: Option<String> = None;
+            for attempt in 1..=5 {
                 match build_output_stream("USB Audio CODEC", tx_producer.clone()) {
                     Ok((stream, _rate)) => {
                         output_stream.set(Some(stream));
-                        info!("Yaesu audio output reconnected");
+                        if attempt == 1 {
+                            info!("Yaesu audio output reconnected");
+                        } else {
+                            info!("Yaesu audio output reconnected (attempt {})", attempt);
+                        }
+                        output_ok = true;
+                        break;
                     }
-                    Err(e) => warn!("Yaesu audio output reconnect failed: {}", e),
+                    Err(e) => {
+                        log::debug!(
+                            "Yaesu audio output attempt {}/5 failed: {}",
+                            attempt, e
+                        );
+                        last_err = Some(e.to_string());
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
                 }
+            }
+            if !output_ok {
+                warn!(
+                    "Yaesu audio output reconnect failed after 5 attempts: {}",
+                    last_err.unwrap_or_else(|| "unknown".to_string())
+                );
             }
         }
 

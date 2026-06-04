@@ -332,6 +332,11 @@ pub enum ControlId {
     /// stuurt de server geen `PacketType::Spot`-frames meer naar deze client
     /// — bandbreedte-besparing op metered links.
     DxSpotsEnabled = 0x65,
+    /// Thetis wideband-audio opt-in (value 0=narrowband 8 kHz default,
+    /// 1=wideband 16 kHz). Wanneer 1 stuurt de server RX1/RX2/BinR via
+    /// wideband Opus en accepteert TX-audio met `Flags::AUDIO_WIDEBAND`.
+    /// Vereist `Capabilities::WIDEBAND_AUDIO` op zowel server als client.
+    ThetisWidebandAudio = 0x66,
 }
 
 impl ControlId {
@@ -377,13 +382,20 @@ impl Capabilities {
     }
 }
 
-/// Flags byte — bit 0 = PTT active
+/// Flags byte
+///   bit 0 = PTT active
+///   bit 1 = AUDIO_WIDEBAND — Audio/AudioTx/AudioRx2 payload is wideband
+///           Opus (16 kHz), clear = narrowband (8 kHz). Geldt alleen voor
+///           Thetis-audio packets; AudioYaesu is altijd wideband en negeert
+///           de flag. Backwards-compat: oude implementaties (zonder
+///           wideband-cap) zien deze bit als 0 en blijven NB sturen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Flags(pub u8);
 
 impl Flags {
     pub const NONE: Self = Self(0);
     pub const PTT: Self = Self(0x01);
+    pub const AUDIO_WIDEBAND: Self = Self(0x02);
 
     pub fn ptt(self) -> bool {
         self.0 & 0x01 != 0
@@ -394,6 +406,18 @@ impl Flags {
             Self(self.0 | 0x01)
         } else {
             Self(self.0 & !0x01)
+        }
+    }
+
+    pub fn wideband(self) -> bool {
+        self.0 & 0x02 != 0
+    }
+
+    pub fn with_wideband(self, wideband: bool) -> Self {
+        if wideband {
+            Self(self.0 | 0x02)
+        } else {
+            Self(self.0 & !0x02)
         }
     }
 }
@@ -521,6 +545,10 @@ pub struct MultiChannelAudioPacket {
     pub sequence: u32,
     pub timestamp: u32,
     pub channels: Vec<(u8, Vec<u8>)>, // (channel_id, opus_data)
+    /// Flags-byte van de packet-header. Belangrijkste vlag voor dit
+    /// type is `Flags::AUDIO_WIDEBAND` (alle channels in deze packet
+    /// zijn wideband Opus 16 kHz); afwezigheid = narrowband 8 kHz.
+    pub flags: Flags,
 }
 
 impl MultiChannelAudioPacket {
@@ -532,7 +560,7 @@ impl MultiChannelAudioPacket {
         buf.resize(start + Self::HEADER_SIZE + payload_size, 0);
         let out = &mut buf[start..];
 
-        let header = Header::new(PacketType::AudioMultiCh, Flags::NONE);
+        let header = Header::new(PacketType::AudioMultiCh, self.flags);
         header.serialize(out);
         out[4..8].copy_from_slice(&self.sequence.to_be_bytes());
         out[8..12].copy_from_slice(&self.timestamp.to_be_bytes());
@@ -572,7 +600,7 @@ impl MultiChannelAudioPacket {
             pos += 3 + opus_len;
         }
 
-        Ok(Self { sequence, timestamp, channels })
+        Ok(Self { sequence, timestamp, channels, flags: header.flags })
     }
 }
 

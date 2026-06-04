@@ -2,6 +2,69 @@
 
 use super::*;
 
+/// Collapsible-section header met handmatig getekende gevulde
+/// driehoek-chevron. Gespiegeld van `sdr-remote-server/src/ui/utils.rs`
+/// zodat client en server dezelfde visuele stijl gebruiken — geen
+/// font-glyph dependency (egui's default font heeft geen ▼/▶).
+///
+/// - `open == false`: rechts-wijzende gevulde driehoek (▶), collapsed
+/// - `open == true`:  omlaag-wijzende gevulde driehoek (▼), expanded
+pub(super) fn chevron_label(
+    ui: &mut egui::Ui,
+    open: bool,
+    label: impl Into<egui::WidgetText>,
+) -> egui::Response {
+    let text: egui::WidgetText = label.into();
+    let chevron_size = ui.text_style_height(&egui::TextStyle::Button);
+    let spacing = ui.spacing().item_spacing.x;
+
+    let galley = text.into_galley(
+        ui,
+        Some(egui::TextWrapMode::Extend),
+        f32::INFINITY,
+        egui::TextStyle::Button,
+    );
+
+    let row_size = egui::vec2(
+        chevron_size + spacing + galley.size().x,
+        chevron_size.max(galley.size().y),
+    );
+    let (rect, response) = ui.allocate_exact_size(row_size, egui::Sense::click());
+
+    let color = if response.hovered() {
+        ui.visuals().widgets.hovered.fg_stroke.color
+    } else {
+        ui.visuals().text_color()
+    };
+
+    let chev_center = egui::pos2(rect.left() + chevron_size / 2.0, rect.center().y);
+    let scale = if response.hovered() { 1.35 } else { 1.0 };
+    let r = chevron_size * 0.28 * scale;
+    let points = if open {
+        vec![
+            egui::pos2(chev_center.x - r * 0.7, chev_center.y - r * 0.5),
+            egui::pos2(chev_center.x + r * 0.7, chev_center.y - r * 0.5),
+            egui::pos2(chev_center.x, chev_center.y + r * 1.0),
+        ]
+    } else {
+        vec![
+            egui::pos2(chev_center.x - r * 0.5, chev_center.y - r * 0.7),
+            egui::pos2(chev_center.x - r * 0.5, chev_center.y + r * 0.7),
+            egui::pos2(chev_center.x + r * 1.0, chev_center.y),
+        ]
+    };
+    ui.painter()
+        .add(egui::Shape::convex_polygon(points, color, egui::Stroke::NONE));
+
+    let label_pos = egui::pos2(
+        rect.left() + chevron_size + spacing,
+        rect.center().y - galley.size().y / 2.0,
+    );
+    ui.painter().galley(label_pos, galley, color);
+
+    response
+}
+
 /// Determine amateur band from frequency (returns None if outside bands)
 pub(crate) fn freq_to_band(hz: u64) -> Option<String> {
     match hz {
@@ -148,6 +211,7 @@ pub(crate) fn render_freq_scroll(ui: &mut egui::Ui, hz: u64) -> Option<i64> {
 
     // Render all chars, tracking digit index (0 = leftmost/highest digit)
     let mut digit_idx = 0;
+    let mut pointer_over_digit = false;
     for ch in formatted.chars() {
         let is_digit = ch.is_ascii_digit();
         let label = ui.add(
@@ -155,9 +219,10 @@ pub(crate) fn render_freq_scroll(ui: &mut egui::Ui, hz: u64) -> Option<i64> {
                 .sense(egui::Sense::hover()),
         );
         if is_digit {
-            if scroll_y != 0.0 {
-                if let Some(pos) = pointer_pos {
-                    if label.rect.contains(pos) {
+            if let Some(pos) = pointer_pos {
+                if label.rect.contains(pos) {
+                    pointer_over_digit = true;
+                    if scroll_y != 0.0 {
                         // digit_idx 0 = highest digit, num_digits-1 = ones
                         let power = (num_digits - 1 - digit_idx) as u32;
                         let step = 10i64.pow(power);
@@ -176,6 +241,15 @@ pub(crate) fn render_freq_scroll(ui: &mut egui::Ui, hz: u64) -> Option<i64> {
     // Mark scroll as consumed so other VFO and spectrum don't also fire
     if scroll_step.is_some() {
         ui.ctx().memory_mut(|mem| mem.data.insert_temp(egui::Id::new("freq_scroll_consumed"), true));
+    }
+    // Wanneer de muis exact boven een digit hangt, scroll-input op nul
+    // zetten zodat een parent ScrollArea (Yaesu-tab, popout, etc.) niet
+    // meescrollt terwijl de gebruiker de digit aan het tunen is.
+    if pointer_over_digit {
+        ui.ctx().input_mut(|i| {
+            i.raw_scroll_delta = egui::Vec2::ZERO;
+            i.smooth_scroll_delta = egui::Vec2::ZERO;
+        });
     }
     scroll_step
 }

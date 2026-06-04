@@ -14,7 +14,7 @@ Formaat: JSON-array, stable-sorted op `control × surface × channel × density`
 { "control": "band_selector", "surface": "PopoutSeparate", "channel": "Rx1", "density": "Extended", "guarded": true }
 ```
 
-### Gebruik (CI-gate — pending implementation door AI-3)
+### Gebruik (CI-gate — pending implementation)
 
 Runtime (debug-build of `feature = "ui-coverage"`): de client dumpt bij exit
 de actueel-geregistreerde sites naar `target/ui-coverage.json` via
@@ -32,5 +32,5 @@ verdwenen site).
 
 ### Toevoegen aan deze folder
 
-- `check-ui-coverage.sh` — CI-gate script (AI-3 domein, pending)
+- `check-ui-coverage.sh` — CI-gate script (pending)
 - Andere CI of devops-scripts naar eigen inzicht

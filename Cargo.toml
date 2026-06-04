@@ -5,11 +5,12 @@ members = [
     "sdr-remote-server",
     "sdr-remote-client",
     "sdr-remote-android",
+    "mcp2221-test",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "2.0.4"
+version = "2.1.0"
 edition = "2021"
 license = "GPL-2.0-or-later"
 

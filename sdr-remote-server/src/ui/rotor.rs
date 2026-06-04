@@ -118,7 +118,7 @@ fn render_compass(ui: &mut egui::Ui, angle_deg: f32, target_deg: Option<f32>, co
     painter.text(
         center + egui::vec2(0.0, radius * 0.55),
         egui::Align2::CENTER_CENTER,
-        format!("{:.1}\u{00B0}", angle_deg),
+        format!("{}\u{00B0}", angle_deg.round() as i32),
         egui::FontId::proportional(18.0),
         ui.visuals().text_color(),
     );

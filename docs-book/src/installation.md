@@ -1,10 +1,10 @@
-# ThetisLink v2.0.4 - Installation Guide
+# ThetisLink v2.1.0 - Installation Guide
 
 ThetisLink is a remote control application for the ANAN 7000DLE SDR with Thetis. Audio, spectrum, PTT and full radio control over the network via TCI WebSocket.
 
 **Compatibility:** ThetisLink talks only to **Thetis** (via TCI WebSocket) and not directly to the SDR hardware. It therefore works with any SDR device supported by **Thetis v2.10.3.15** (official release by ramdor) — both HPSDR Protocol 1 (Hermes, Angelia, Orion) and HPSDR Protocol 2 (ANAN-7000DLE, ANAN-8000DLE, ANAN-G2, Hermes-Lite 2, etc.). Optional: Yaesu FT-991A as a second radio (via COM port).
 
-**PA3GHM Thetis fork (optional, recommended for TL2 extensions):** ThetisLink v2.0.4 works fine with stock Thetis v2.10.3.15 over TCI alone — no separate CAT TCP connection is required. The PA3GHM fork is an **optional** drop-in replacement that adds ThetisLink-specific TL2 `_ex` extensions on top of stock Thetis: extended IQ bandwidth up to 1536 kHz (vs the 384 kHz stock cap), `tci_caps_ex` capability broadcast, server-side CTUN auto-recenter (`auto_recenter_ex`), filter-preset and per-RX DDC-rate push notifications, and diversity auto-null with live circle broadcast. All extensions sit behind the **"ThetisLink extensions"** checkbox in Thetis and are disabled by default; with the checkbox unchecked the TCI extension behaviour is preserved (stock v2.10.3.15 — note the fork still carries its own build tag, release notes and About metadata). See the User Manual (`User-Manual-EN.md`) for details.
+**PA3GHM Thetis fork (optional, recommended for TL2 extensions):** ThetisLink v2.1.0 works fine with stock Thetis v2.10.3.15 over TCI alone — no separate CAT TCP connection is required. The PA3GHM fork is an **optional** drop-in replacement that adds ThetisLink-specific TL2 `_ex` extensions on top of stock Thetis: extended IQ bandwidth up to 1536 kHz (vs the 384 kHz stock cap), `tci_caps_ex` capability broadcast, server-side CTUN auto-recenter (`auto_recenter_ex`), filter-preset and per-RX DDC-rate push notifications, and diversity auto-null with live circle broadcast. All extensions sit behind the **"ThetisLink extensions"** checkbox in Thetis and are disabled by default; with the checkbox unchecked the TCI extension behaviour is preserved (stock v2.10.3.15 — note the fork still carries its own build tag, release notes and About metadata). See the User Manual (`User-Manual-EN.md`) for details.
 
 **Disclaimer:** This software controls radio transmitters. Use at your own risk. The author is not responsible for damage to equipment, interference or violations of regulations resulting from the use of this software. Verify all safety features (PTT timeout, power limits) before transmitting.
 
@@ -16,7 +16,7 @@ ThetisLink is a remote control application for the ANAN 7000DLE SDR with Thetis.
 |------|-------------|
 | ThetisLink-Server.exe | ThetisLink Server - runs on the PC alongside Thetis |
 | ThetisLink-Client.exe | ThetisLink Desktop Client - Windows |
-| ThetisLink-2.0.3.apk | ThetisLink Android Client - phone/tablet |
+| ThetisLink-2.1.0.apk | ThetisLink Android Client - phone/tablet |
 | Installation.pdf | Installation guide (English, this document) |
 | User-Manual-EN.pdf | User manual (English) |
 | Technical-Reference.pdf | Technical reference (English) |
@@ -66,14 +66,14 @@ No administrator rights required for the ThetisLink Server or ThetisLink Clients
 
 ### 1.0 Installing the PA3GHM Thetis fork (recommended)
 
-The PA3GHM fork is a modified version of Thetis with ThetisLink-specific extensions. Installation:
+The PA3GHM fork is a modified version of Thetis with ThetisLink-specific extensions. **ThetisLink v2.1.0 works best with Thetis-fork build PA3GHM TL2-4** — that build ships the wideband-IQ extension + modulation-filter fan-out that this release relies on. Earlier fork builds also work, with progressively fewer fork-only features available (TL2-3 without wideband, TL2-2 without rx_only_ex push-notify, etc.); stock Thetis v2.10.3.15 remains the fallback. Installation:
 
 1. First install the official **Thetis v2.10.3.15** using the standard installer (if you have not already done so)
-2. Download `Thetis.exe` from the PA3GHM fork (branch `thetislink-tl2`)
+2. Download `Thetis.exe` from the PA3GHM fork — **release tag `TL2-4`** at [cjenschede/Thetis](https://github.com/cjenschede/Thetis/releases) (branch `thetislink-tl2`)
 3. Make a **backup** of the original `Thetis.exe` in the Thetis installation folder (e.g. rename to `Thetis-original.exe`)
 4. Copy the PA3GHM `Thetis.exe` to the Thetis installation folder (overwrite the original)
 5. Copy `ReleaseNotes.txt` to the same folder (overwrite the existing file)
-6. Start Thetis - the title bar will show "PA3GHM TL2-1" after the version number
+6. Start Thetis - the title bar will show "PA3GHM TL2-4" after the version number
 
 > The fork only modifies `Thetis.exe`. All other files (DLLs, database, settings) remain unchanged. You can always revert to the original version by restoring the backup.
 
@@ -99,7 +99,7 @@ Setup -> Serial/Network/Midi CAT -> Network -> **TCI Server** group:
 With the PA3GHM Thetis fork, on the same tab:
 1. Check **ThetisLink extensions**
 
-> ThetisLink v2.0.4 uses TCI exclusively for radio control. The TCP/IP CAT server in Thetis does not need to be enabled for ThetisLink — it is only required if you want to connect a separate logging program or third-party CAT client to Thetis directly.
+> ThetisLink v2.1.0 uses TCI exclusively for radio control. The TCP/IP CAT server in Thetis does not need to be enabled for ThetisLink — it is only required if you want to connect a separate logging program or third-party CAT client to Thetis directly.
 
 ---
 
@@ -133,9 +133,15 @@ In the ThetisLink Server GUI you can connect external devices. Each device has a
 | RF2K-S PA | HTTP REST | IP:port (e.g. `192.168.1.50:8080`) |
 | UltraBeam RCU-06 antenna controller | Serial (USB) | COM port |
 | EA7HG Visual Rotor | UDP | IP:port (e.g. `192.168.1.66:2570`) |
+| PstRotator (outgoing) | UDP/XML | host:port of the PstRotator PC (e.g. `192.168.1.70:12000`) + local feedback port `12001`; supports any rotor model PstRotator itself drives |
+| Yaesu G-1000DXC rotor (**) | USB-HID | Adafruit MCP2221A breakout in 5 V mode, BST82 gate switches on pin 1/2 + DAC on pin 3 + ADC via 1.8 k + 2.2 k divider on pin 4 |
 | Yaesu FT-991A | Serial (USB) | COM port (see below) |
 
 > (*) The StockCorner JC-4s and JC-3s tuners do not have a standard serial interface. From v2.0.3 each tuner is driven via an **Adafruit MCP2221A USB-to-HID breakout** with a transistor stage on the grey "start" wire and a 1 MΩ + 1 MΩ voltage divider on the yellow "tune-status" wire. Up to two tuners are supported in parallel; each board receives a unique USB serial number that you program from the server status panel. The full wiring and UI flow is documented in the User Manual (`User-Manual-EN.md`). This is not an off-the-shelf product — contact for details.
+
+> (**) From v2.1.0 the **Yaesu G-1000DXC** can also be driven directly from the ThetisLink server via an **Adafruit MCP2221A breakout in 5 V mode**, without EA7HG or any other controller software in the loop. The breakout carries two BST82 low-side switches (CW/CCW) plus a 5-bit DAC for the speed input and an ADC for position feedback through a 1.8 kΩ + 2.2 kΩ voltage divider (ratio 1.818) — some G-1000DXC units reach ~7.3 V on pin 4 at 450°, so the previously-common 1.8 kΩ + 10 kΩ divider clips at the high angles. The rotor backend supports soft-start/soft-stop ramp, adaptive ADC poll (30 Hz during motion / 1 Hz at idle with a median filter rejecting mains ripple), a shortest-route option for rotors with an overlap range (`max_deg > 360°`) and a Park CCW / Park CW calibration wizard. Full hardware specs and wiring are in the User Manual (`User-Manual-EN.md`, section "Yaesu G-1000DXC via Adafruit MCP2221A"). This is also not an off-the-shelf product — contact for details.
+
+> **Rotor backend choice**: in the Server GUI under *Rotor → backend* choose between **EA7HG Visual Rotor**, **PstRotator (XML/UDP)** or **Yaesu G-1000DXC (MCP2221A)**. One at a time is active; the client panel (compass, GoTo, Stop) looks the same regardless — the choice only affects how the server talks to the rotor hardware. For PstRotator setup see the User Manual, section "Rotor backends → PstRotator (XML/UDP)".
 
 #### Yaesu FT-991A USB driver
 
@@ -231,14 +237,14 @@ When the server itself runs on the Thetis PC, its window has two tabs: **Status*
 ### 4.1 Installing the APK
 
 **Via file manager:**
-1. Copy `ThetisLink-2.0.3.apk` to your phone (USB, email, or cloud)
+1. Copy `ThetisLink-2.1.0.apk` to your phone (USB, email, or cloud)
 2. Open the APK file on the phone
 3. Allow "Install from unknown sources" if prompted
 4. Install
 
 **Via ADB** (with USB debugging enabled):
 ```
-adb install ThetisLink-2.0.3.apk
+adb install ThetisLink-2.1.0.apk
 ```
 
 ### 4.2 Connecting — guided setup wizard

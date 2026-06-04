@@ -9,6 +9,11 @@ pub(crate) struct SpectrumPlotConfig {
     pub(crate) scroll_key: &'static str,
     pub(crate) drag_key: &'static str,
     pub(crate) click_key: &'static str,
+    /// Per-channel memory-keys voor filter-edge drag. Zonder per-channel
+    /// onderscheid (vorige situatie: globale hardcoded keys) pakte de
+    /// RX1-reader een RX2-spectrum-drag op als RX1-filter-update.
+    pub(crate) filter_low_key: &'static str,
+    pub(crate) filter_high_key: &'static str,
     pub(crate) show_band_markers: bool,
     pub(crate) is_popout: bool,
     pub(crate) color_floor: f32, // 0.0=full range (dark blue), 0.2=start at blue, 0.4=start at cyan
@@ -18,6 +23,8 @@ pub(crate) const RX1_PLOT_CONFIG: SpectrumPlotConfig = SpectrumPlotConfig {
     scroll_key: "spectrum_scroll_freq",
     drag_key: "spectrum_drag_freq",
     click_key: "spectrum_click_freq",
+    filter_low_key: "spectrum_filter_low",
+    filter_high_key: "spectrum_filter_high",
     show_band_markers: true,
     is_popout: false,
     color_floor: 0.25, // skip darkest portion of colormap
@@ -27,6 +34,8 @@ pub(crate) const RX2_PLOT_CONFIG: SpectrumPlotConfig = SpectrumPlotConfig {
     scroll_key: "rx2_spectrum_scroll_freq",
     drag_key: "rx2_spectrum_drag_freq",
     click_key: "rx2_spectrum_click_freq",
+    filter_low_key: "rx2_spectrum_filter_low",
+    filter_high_key: "rx2_spectrum_filter_high",
     show_band_markers: false,
     is_popout: true,
     color_floor: 0.25,
@@ -584,7 +593,11 @@ pub(crate) fn spectrum_plot(
                 // Persist which edge we're dragging
                 ui.memory_mut(|mem| mem.data.insert_temp(drag_state_id.with("is_low"), is_low));
 
-                let key = if is_low { "spectrum_filter_low" } else { "spectrum_filter_high" };
+                // Per-channel filter-edge memory key (zie SpectrumPlotConfig).
+                // RX1 schrijft naar "spectrum_filter_low/high", RX2 naar
+                // "rx2_spectrum_filter_low/high"; readers in mod.rs pakken
+                // ze als RX1 resp. RX2 filter-update op.
+                let key = if is_low { config.filter_low_key } else { config.filter_high_key };
                 ui.memory_mut(|mem| {
                     mem.data.insert_temp(egui::Id::new(key), offset_hz);
                 });

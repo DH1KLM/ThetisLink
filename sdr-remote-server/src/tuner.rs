@@ -231,7 +231,7 @@ impl Tuners {
     /// failures are logged and the slot is skipped (we don't fail the whole
     /// server start because one tuner is unplugged).
     pub fn new(
-        configs: &[TunerConfig; 2],
+        configs: &[TunerConfig],
         cat_tx: tokio::sync::mpsc::Sender<String>,
         spe: Option<Arc<SpeExpert>>,
         rf2k: Option<Arc<Rf2k>>,

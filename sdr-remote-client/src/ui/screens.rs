@@ -1930,9 +1930,7 @@ impl SdrRemoteApp {
                 // Down (RX) — klikbaar voor per-PacketType breakdown van
                 // de laatste 5 s. Gebruik tekst-prefix i.p.v. Unicode-pijl
                 // (egui's default font kan ↓/↑ niet renderen → tofu-glyph).
-                let arrow = if self.bw_breakdown_expanded { "v" } else { ">" };
-                let label = format!("{} Down (RX):", arrow);
-                if ui.add(egui::Label::new(label).sense(egui::Sense::click())).clicked() {
+                if super::helpers::chevron_label(ui, self.bw_breakdown_expanded, "Down (RX):").clicked() {
                     self.bw_breakdown_expanded = !self.bw_breakdown_expanded;
                 }
                 ui.label(format!("{} Kbit/s", self.down_kbps));
@@ -1973,6 +1971,16 @@ impl SdrRemoteApp {
         if ui.checkbox(&mut dx_spots, "DX spots ontvangen").changed() {
             self.dx_spots_enabled = dx_spots;
             let _ = self.cmd_tx.send(sdr_remote_logic::commands::Command::SetDxSpotsEnabled(dx_spots));
+        }
+
+        // Wideband Thetis audio opt-in: stuurt RX1/RX2/BinR in 16 kHz Opus
+        // i.p.v. 8 kHz default. Default UIT (verdubbelt bandbreedte per
+        // kanaal). Aanzetten voor FM/AM/broadcast-luisteren via ANAN.
+        let mut wb = self.thetis_wideband_audio;
+        if ui.checkbox(&mut wb, "Wideband Thetis audio (FM/AM helderder, ~2× data)").changed() {
+            self.thetis_wideband_audio = wb;
+            let _ = self.cmd_tx.send(sdr_remote_logic::commands::Command::SetThetisWidebandAudio(wb));
+            self.save_full_config();
         }
 
         // TCI Status
