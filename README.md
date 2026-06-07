@@ -1,20 +1,21 @@
 # ThetisLink
 
-> **Current release: [v2.1.0](https://github.com/cjenschede/ThetisLink/releases/tag/v2.1.0)** —
-> direct Yaesu G-1000DXC rotor control via an Adafruit MCP2221A breakout
-> (third rotor backend alongside EA7HG and PstRotator), with soft-start /
-> soft-stop ramp, adaptive ADC sample rate (30 Hz motion / 1 Hz idle),
-> shortest-route option for rotors with overlap range, and a full
-> calibration wizard. Plus: opt-in wideband Thetis RX audio (when paired
-> with the matching fork), modular multi-tuner wizard with per-slot
-> add/rename/delete, Amplitec 6/2 reconnect after power-cycle (and
-> server-start with the device offline), Yaesu RX2 mode-switch filter
-> restore and per-channel filter-drag isolation, plus a flurry of UI
-> polish (chevron headers, settings-tab ScrollArea, Amplitec antenna
-> rename, status-panel scroll stability). **Backwards-compatible with
-> v2.0.4** — wire-protocol unchanged; pair with **Thetis fork PA3GHM
+> **Current release: [v2.1.1](https://github.com/cjenschede/ThetisLink/releases/tag/v2.1.1)** —
+> PstRotator and Log4OM can now drive the rotor directly through a
+> parallel UDP+TCP listener on the server (port 12001) regardless of
+> which rotor backend is selected; auto-detects Yaesu GS-232A/B,
+> Prosistel/EA7HG, PstRotator-XML and AZ-text formats. Log4OM works
+> without an intermediate PstRotator instance (PstRotator-emulation).
+> Plus: direction-reversal ramp protection — a new GoTo with opposite
+> delta sign now ramps the DAC down to zero before flipping the
+> CW/CCW gates, preventing abrupt full-power direction reversal on
+> the Adafruit backend. And three Yaesu FT-991A memory-write fixes:
+> UDP packet-reorder race latch, MT-frame P9 spec compliance, and
+> FM/DATA-FM/AM-N/C4FM mode round-trip integrity (writes no longer
+> force-map FM to DATA-FM on storage). **Backwards-compatible with
+> v2.1.0** — wire-protocol unchanged; pair with **Thetis fork PA3GHM
 > TL2-4** for the full feature-set, stock Thetis remains supported.
-> Download `ThetisLink-2.1.0.zip` from the
+> Download `ThetisLink-2.1.1.zip` from the
 > [Releases page](https://github.com/cjenschede/ThetisLink/releases) — the ZIP
 > contains both Windows binaries, the Android APK, all six PDF manuals,
 > `LICENSE` and `SHA256SUMS.txt`. SBOM and third-party license artefacts are
@@ -55,7 +56,7 @@ ThetisLink talks to the radio through Thetis. It targets **Thetis v2.10.3.15**
 (the latest official release by ramdor) and works with stock Thetis out of the
 box. Optionally use the [PA3GHM Thetis fork](https://github.com/cjenschede/Thetis/tree/thetislink-tl2)
 (branch `thetislink-tl2`) for the additional `_ex` TCI extensions used by
-ThetisLink v2.1.0 (capability broadcast, per-RX filter preset, diversity
+ThetisLink v2.1.1 (capability broadcast, per-RX filter preset, diversity
 control suite, server-side DDC recenter, relaxed IQ-stream rate cap,
 wideband RX audio, modulation-change filter fan-out). All
 extensions are gated behind the **ThetisLink extensions** checkbox in Setup
