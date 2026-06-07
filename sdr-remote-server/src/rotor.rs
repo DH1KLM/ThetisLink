@@ -42,9 +42,18 @@ pub enum RotorCmd {
     Ccw,
 }
 
+#[derive(Clone)]
 pub struct Rotor {
     cmd_tx: mpsc::Sender<RotorCmd>,
     status: Arc<Mutex<RotorStatus>>,
+    /// Maximale rotatie van de onderliggende hardware in tienden van
+    /// graden. Standaard 3600 (360°) voor EA7HG/PstRotator/etc.; de
+    /// Adafruit MCP2221A-backend zet hem op `max_deg × 10` uit de
+    /// kalibratie (typisch 4500 voor Yaesu G-1000DXC). Externe input-
+    /// bronnen die compass-headings 0–360° leveren (PstRotator-listener)
+    /// gebruiken deze waarde om bij overlap-rotors de mech-target +360°
+    /// als alternatief te overwegen.
+    max_deg_x10: u16,
 }
 
 pub fn status_labels_string(s: &RotorStatus) -> String {
@@ -67,7 +76,7 @@ impl Rotor {
             })
             .expect("Failed to spawn rotor thread");
 
-        Self { cmd_tx, status }
+        Self { cmd_tx, status, max_deg_x10: 3600 }
     }
 
     pub fn send_command(&self, cmd: RotorCmd) {
@@ -78,11 +87,27 @@ impl Rotor {
         self.status.lock().unwrap().clone()
     }
 
+    /// Maximale rotatie in tienden van graden. Zie struct-doc.
+    pub fn max_deg_x10(&self) -> u16 {
+        self.max_deg_x10
+    }
+
     /// Build a `Rotor` facade around an externally-spawned worker. Used
     /// by the PstRotator backend (see `pstrotator.rs`) so its thread
     /// can share the same client-facing interface as the EA7HG path.
     pub fn from_handles(cmd_tx: mpsc::Sender<RotorCmd>, status: Arc<Mutex<RotorStatus>>) -> Self {
-        Self { cmd_tx, status }
+        Self { cmd_tx, status, max_deg_x10: 3600 }
+    }
+
+    /// Variant van `from_handles` met expliciete max-rotation (gebruikt
+    /// door de MCP2221A-rotor om de overlap-zone bekend te maken bij
+    /// externe input-bronnen zoals de PstRotator-listener).
+    pub fn from_handles_with_max(
+        cmd_tx: mpsc::Sender<RotorCmd>,
+        status: Arc<Mutex<RotorStatus>>,
+        max_deg_x10: u16,
+    ) -> Self {
+        Self { cmd_tx, status, max_deg_x10 }
     }
 }
 
@@ -175,6 +200,7 @@ fn handle_command(
         RotorCmd::GoTo(angle_x10) => {
             let angle = *angle_x10 / 10; // Prosistel uses integer degrees
             status.lock().unwrap().target_x10 = *angle_x10;
+            info!("Rotor (EA7HG) GoTo {}°", angle);
             send_prosistel(socket, remote, &format!("AAG{:03}", angle))
         }
         RotorCmd::Stop => {

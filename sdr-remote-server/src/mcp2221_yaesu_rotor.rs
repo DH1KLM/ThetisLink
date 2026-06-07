@@ -606,7 +606,20 @@ impl RotorInstance {
     /// De caller kan dezelfde Rotor in `ServerState.rotor` plaatsen
     /// als anders een EA7HG/PstRotator-instance.
     pub fn make_rotor_facade(&self) -> Rotor {
-        Rotor::from_handles(self.cmd_tx.clone(), self.rotor_status.clone())
+        // Geef de werkelijke max-rotatie door via de facade zodat externe
+        // input-bronnen (PstRotator-listener) bij overlap-rotors de
+        // mech-target+360° als alternatief kunnen overwegen.
+        let max_deg = self
+            .calibration
+            .lock()
+            .map(|c| c.max_deg)
+            .unwrap_or(450);
+        let max_deg_x10 = (max_deg as u16).saturating_mul(10);
+        Rotor::from_handles_with_max(
+            self.cmd_tx.clone(),
+            self.rotor_status.clone(),
+            max_deg_x10,
+        )
     }
 
     pub fn label(&self) -> &str {
@@ -981,29 +994,53 @@ fn rotor_poll_thread(
                 );
                 target_deg = None;
             } else {
-                // Richting kiezen (toggle GP0/1).
-                let cw = delta > 0.0;
-                let _ = driver.set_direction(cw, !cw);
-                // Decel-distance: bij ramp_pct_per_sec gaat current_dac
-                // van huidige fractie naar 0 in (frac × 100 / pct) sec.
-                // Gemiddelde snelheid tijdens ramp = MAX × frac / 2.
-                // Distance = avg_speed × time = MAX × frac² × 50 / pct.
-                // Plus `DECEL_SAFETY_FACTOR` om meet-lag + speed-onzekerheid
-                // te dekken — beter te vroeg afremmen dan te laat.
-                let frac = current_dac / DAC_MAX as f32;
-                let decel_time_sec =
-                    frac * 100.0 / cal_snap.ramp_pct_per_sec.max(1.0);
-                let decel_dist = MAX_ROTOR_DEG_PER_SEC
-                    * frac
-                    * 0.5
-                    * decel_time_sec
-                    * DECEL_SAFETY_FACTOR;
-                if delta.abs() <= decel_dist.max(GOTO_DEADBAND_DEG) {
-                    // Begin ramp-down naar 0 zodat we op min-DAC binnen
-                    // de deadband eindigen.
+                // Richting-omkering bescherming: een lopende GoTo die
+                // tijdens beweging een nieuwe target krijgt aan de
+                // andere kant (delta-teken flipt) moest voorheen direct
+                // de CW/CCW gates wisselen terwijl current_dac nog op
+                // MAX stond — abrupte motor-reversal op vol vermogen.
+                // Detecteer hier of de gewenste richting verschilt van
+                // de huidige gate-stand; als ja én current_dac > 0,
+                // houd huidige richting vast en ramp eerst DAC naar 0.
+                // Pas wanneer DAC ~0 is wisselen we de gates en starten
+                // de ramp-up in de nieuwe richting.
+                let desired_cw = delta > 0.0;
+                let direction_mismatch =
+                    (desired_cw && drv_snap.gp1_ccw_high)
+                        || (!desired_cw && drv_snap.gp0_cw_high);
+                if direction_mismatch && current_dac > 1.0 {
+                    // Soft-stop fase: gates blijven staan zoals ze
+                    // waren, dac_target naar 0. Volgende tick (of paar
+                    // ticks afhankelijk van ramp) komt current_dac
+                    // onder de drempel en valt de else-tak in met de
+                    // juiste gates.
                     dac_target = 0.0;
                 } else {
-                    dac_target = DAC_MAX as f32;
+                    // Veilig om richting te zetten: ofwel geen
+                    // mismatch (rotor staat al de goede kant op),
+                    // ofwel DAC is al ~0.
+                    let _ = driver.set_direction(desired_cw, !desired_cw);
+                    // Decel-distance: bij ramp_pct_per_sec gaat current_dac
+                    // van huidige fractie naar 0 in (frac × 100 / pct) sec.
+                    // Gemiddelde snelheid tijdens ramp = MAX × frac / 2.
+                    // Distance = avg_speed × time = MAX × frac² × 50 / pct.
+                    // Plus `DECEL_SAFETY_FACTOR` om meet-lag + speed-onzekerheid
+                    // te dekken — beter te vroeg afremmen dan te laat.
+                    let frac = current_dac / DAC_MAX as f32;
+                    let decel_time_sec =
+                        frac * 100.0 / cal_snap.ramp_pct_per_sec.max(1.0);
+                    let decel_dist = MAX_ROTOR_DEG_PER_SEC
+                        * frac
+                        * 0.5
+                        * decel_time_sec
+                        * DECEL_SAFETY_FACTOR;
+                    if delta.abs() <= decel_dist.max(GOTO_DEADBAND_DEG) {
+                        // Begin ramp-down naar 0 zodat we op min-DAC
+                        // binnen de deadband eindigen.
+                        dac_target = 0.0;
+                    } else {
+                        dac_target = DAC_MAX as f32;
+                    }
                 }
             }
         }

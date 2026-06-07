@@ -1646,6 +1646,12 @@ impl NetworkService {
         // Yaesu TX audio: forward AudioYaesu packets to a separate decode task
         let mut yaesu_ptt_active = false;
         let mut yaesu_write_pending: Option<String> = None;
+        // If the YaesuWriteMemories control arrives BEFORE the
+        // YaesuMemoryData packet (the data is ~2.7kB, IP-fragmented;
+        // control is ~8B, single packet — control can overtake on
+        // reorder), latch the intent and fire the write when the data
+        // finally lands. Otherwise the trigger was silently dropped.
+        let mut yaesu_write_armed = false;
         let yaesu_mic_gain = Arc::new(AtomicU32::new(20.0_f32.to_bits())); // default 20.0x
         let yaesu_tx_packet_tx = {
             let tx_audio_tx = yaesu.as_ref().and_then(|y| y.tx_audio_tx.clone());
@@ -2326,7 +2332,15 @@ impl NetworkService {
                                 }
                             } else {
                                 info!("Received Yaesu memory data from client ({}B)", text.len());
-                                yaesu_write_pending = Some(text);
+                                if yaesu_write_armed {
+                                    yaesu_write_armed = false;
+                                    if let Some(ref yaesu) = yaesu {
+                                        info!("Client {} writing Yaesu memories (deferred — data arrived after control)", addr);
+                                        yaesu.send_command(crate::yaesu::YaesuCmd::WriteAllMemories(text));
+                                    }
+                                } else {
+                                    yaesu_write_pending = Some(text);
+                                }
                             }
                         }
                         // Yaesu TX audio: forward to separate decode task
@@ -2933,13 +2947,18 @@ impl NetworkService {
                                     }
                                 }
                                 ControlId::YaesuWriteMemories => {
-                                    // Data comes via YaesuMemoryData packet (stored in pending_write)
+                                    // Data comes via YaesuMemoryData packet (stored in pending_write).
+                                    // If the data hasn't arrived yet (UDP reorder on
+                                    // 2.7kB fragmented vs 8B control), arm the latch so
+                                    // the YaesuMemoryData handler fires the write when
+                                    // the data lands. See `yaesu_write_armed` decl above.
                                     if let Some(ref yaesu) = yaesu {
                                         if let Some(text) = yaesu_write_pending.take() {
                                             info!("Client {} writing Yaesu memories", addr);
                                             yaesu.send_command(crate::yaesu::YaesuCmd::WriteAllMemories(text));
                                         } else {
-                                            warn!("Client {} write memories: no data pending", addr);
+                                            info!("Client {} write memories: data not yet received, arming latch", addr);
+                                            yaesu_write_armed = true;
                                         }
                                     }
                                 }

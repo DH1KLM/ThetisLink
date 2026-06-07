@@ -26,6 +26,7 @@ mod yaesu;
 mod ultrabeam;
 mod rotor;
 mod pstrotator;
+mod pstrotator_listen;
 mod ui;
 
 use std::collections::VecDeque;
@@ -357,6 +358,8 @@ fn main() -> Result<()> {
             pstrotator_port: defaults.pstrotator_port,
             pstrotator_feedback_port: defaults.pstrotator_feedback_port,
             pstrotator_has_elevation: defaults.pstrotator_has_elevation,
+            pstrotator_listen_enabled: defaults.pstrotator_listen_enabled,
+            pstrotator_listen_port: defaults.pstrotator_listen_port,
             tuner_window_pos: None,
             amplitec_window_pos: None,
             spe_window_pos: None,
@@ -785,6 +788,43 @@ pub async fn run_server_async(
         None
     };
 
+    // PstRotator UDP-listener (v2.1.1+): luistert parallel aan de
+    // actieve `rotor_backend` voor inkomende azimuth-broadcasts. Spawn
+    // alleen als er een actieve Rotor-facade is om het commando naartoe
+    // te sturen — zonder rotor geen punt.
+    let pstrotator_listen_shutdown = if config.pstrotator_listen_enabled {
+        if let Some(rotor_arc) = rotor_inst.as_ref() {
+            if config.rotor_backend == "pstrotator" {
+                warn!(
+                    "PstRotator listener: rotor_backend is ook 'pstrotator' — \
+                     mogelijk feedback-loop met outgoing replies. Listener \
+                     blijft actief maar wees alert op duplicaten."
+                );
+            }
+            match pstrotator_listen::spawn(
+                pstrotator_listen::ListenConfig { port: config.pstrotator_listen_port },
+                rotor_arc.as_ref().clone(),
+            ) {
+                Ok(shutdown) => Some(shutdown),
+                Err(e) => {
+                    warn!(
+                        "PstRotator listener bind on UDP {} faalde: {} (listener uitgeschakeld voor deze run)",
+                        config.pstrotator_listen_port, e
+                    );
+                    None
+                }
+            }
+        } else {
+            warn!(
+                "PstRotator listener ingeschakeld maar geen actieve rotor-backend — \
+                 ingeschakelde listener zonder doel doet niets, listener overgeslagen"
+            );
+            None
+        }
+    } else {
+        None
+    };
+
     // DX Cluster
     let dxcluster = if config.dxcluster_enabled {
         info!("DX Cluster: starting (server={}, callsign={}, expiry={}min)", config.dxcluster_server, config.dxcluster_callsign, config.dxcluster_expiry_min);
@@ -857,6 +897,14 @@ pub async fn run_server_async(
 
     // Ensure PTT is released on shutdown
     ptt.lock().await.release().await;
+
+    // PstRotator-listener (v2.1.1+): signal de UDP/TCP listener-threads
+    // dat de server stopt zodat ze poort 12001 vrijgeven binnen
+    // READ_TIMEOUT (~500 ms). Zonder dit bleef de poort vasthouden tot
+    // proces-exit en kon een directe server-herstart faken bind-failure.
+    if let Some(s) = pstrotator_listen_shutdown.as_ref() {
+        s.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 
     // PATCH-3: deregister the mDNS service so clients see the server
     // disappear instead of relying on TTL expiry.

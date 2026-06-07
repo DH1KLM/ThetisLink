@@ -1110,14 +1110,31 @@ fn write_all_memories(port: &mut Box<dyn serialport::SerialPort>, tab_text: &str
         };
         if freq_hz == 0 { continue; }
 
-        // FM is always sent as DATA-FM ('A') for USB mic compatibility
+        // Memory-storage modes: respect what the client provided. The
+        // FM → DATA-FM auto-toggle is a RUNTIME PTT-mechanic in
+        // `set_ptt()` (FM ↔ DATA-FM around the TX window for USB-mic
+        // compatibility), NOT a storage transform. Earlier code force-
+        // mapped all FM variants to 'A' here, which left every memory
+        // channel permanently in DATA-FM after a Write-radio cycle and
+        // disabled local FM-mic on those channels. Owner-feedback
+        // 2026-06-07.
+        // Mode-codes moeten round-trip kloppen met de read-parser
+        // hierboven (line ~1003-1007): '4'→FM, 'B'→FM-N, '5'→AM,
+        // 'D'→AM-N, 'A'→DATA-FM, 'E'→C4FM, etc. Eerdere code mapte
+        // AM-N→'5' (= AM) en C4FM→'A' (= DATA-FM), wat de read-na-write
+        // integriteit brak.
         let mode_char = match get(col_mode) {
             "LSB" => '1', "USB" => '2', "CW" => '3',
-            "FM" | "FM-N" | "DATA-FM" | "C4FM" => 'A', // ALL FM → DATA-FM
-            "AM" | "AM-N" => '5', "RTTY-LSB" => '6', "CW-R" => '7',
+            "FM" => '4',
+            "FM-N" => 'B',
+            "AM" => '5',
+            "AM-N" => 'D',
+            "RTTY-LSB" => '6', "CW-R" => '7',
             "DATA-LSB" => '8', "RTTY-USB" => '9',
+            "DATA-FM" => 'A',
             "DATA-USB" => 'C',
-            _ => 'A', // default DATA-FM
+            "C4FM" => 'E',
+            _ => '4', // default plain FM (most common memory mode)
         };
 
         let tone = match get(col_tone) {
@@ -1155,9 +1172,18 @@ fn write_all_memories(port: &mut Box<dyn serialport::SerialPort>, tab_text: &str
             format!("{:<12}", name)
         };
 
-        // MT set: P1(3) P2(9) P3(5) P4(1) P5(1) P6(1) P7(1:0) P8(1) P9(2) P10(1) P11(1) P12(12) ;
-        let mt_cmd = format!("MT{:03}{:09}+000000{}0{}{:02}{}0{};",
-            ch, freq_hz, mode_char, tone, tone_num, shift, tag);
+        // MT set: P1(3) P2(9) P3(5) P4(1) P5(1) P6(1) P7(1:0) P8(1) P9(2:00) P10(1) P11(1) P12(12) ;
+        //
+        // P9 is fixed "00" per FT-991A CAT spec (not the CTCSS-tone
+        // index). Earlier code formatted `tone_num` here, which produced
+        // a non-spec MT for any channel with Tone Mode != "None" and
+        // appears to have been silently rejected by the radio. The
+        // CTCSS tone index is configured separately via CN; MT carries
+        // only the tone-mode flag (P8). `tone_num` is kept for now —
+        // if a future patch wires up CN-write it can move there.
+        let _ = tone_num; // intentionally unused until CN-write lands
+        let mt_cmd = format!("MT{:03}{:09}+000000{}0{}00{}0{};",
+            ch, freq_hz, mode_char, tone, shift, tag);
 
         info!("MT write {:03}: [{}] ({}B)", ch, mt_cmd, mt_cmd.len());
 

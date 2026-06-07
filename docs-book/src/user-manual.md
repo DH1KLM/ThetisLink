@@ -476,6 +476,51 @@ PstRotator (yo3dmu) ondersteunt vrijwel alle merken rotor-hardware. Aanbevolen w
 - ThetisLink-server-PC: inbound UDP 12001 toestaan voor `ThetisLink-Server.exe`. Een app-toelating via Microsoft Defender Firewall (`Allow an app through firewall`) dekt dit automatisch.
 - PstRotator-PC: inbound UDP 12000 toestaan voor `PstRotator.exe` of `PstRotatorAZ.exe`. PstRotator vraagt hier vaak zelf om bij eerste start.
 
+**Bekende beperking — geen doel-lijn voor PstRotator-gestuurde GoTos.** Wanneer je een doel in PstRotator's eigen compass-cirkel klikt, ziet TL2 alleen de actuele positie-feedback (`AZ:nnn.n`) en niet het target. De doel-lijn in TL2's rotor-window wordt daarom niet getekend voor zo'n GoTo — alleen de naald loopt mee. Dit is een limiet van PstRotator's outgoing feedback-protocol, geen TL2-bug.
+
+### Externe input: PstRotator of Log4OM rechtstreeks op de Adafruit-rotor (v2.1.1+)
+
+Vanaf v2.1.1 luistert de server parallel aan de actieve rotor-backend op UDP+TCP poort `12001` (configureerbaar via `pstrotator_listen_enabled` / `pstrotator_listen_port` in `thetislink-server.conf`). Dat maakt het mogelijk om Log4OM of een externe PstRotator-instantie **direct de Adafruit-rotor** te laten besturen, zonder dat je de rotor-backend hoeft te switchen. De listener accepteert vier protocol-formaten (auto-detect per packet):
+
+| Protocol | Goto-commando | Query | Bron |
+|---|---|---|---|
+| Yaesu GS-232A/B | `M<nnn>\r` | `C\r` → `+<nnn>\r` | Vrijwel alle ham-software |
+| Prosistel binair (EA7HG) | `\x02AG<nnn>\r` of `AAG<nnn>\r` | `\x02A?\r` → `\x02A,?,<nnn>,<R\|B>\r` | PstRotator EA7HG-mode |
+| PstRotator native XML | `<PST><AZIMUTH>nnn</AZIMUTH></PST>` | `<PST>AZ?</PST>` → `AZ:<nnn.n>\r` | PstRotator native, Log4OM |
+| AZ-tekst | `AZ:nnn.n\r` | — | PstRotator UDP-output |
+
+De TCP-pad is bidirectioneel: als een TL2-client (desktop, Android, of server-UI) zelf een nieuw target zet, pusht de listener `M<nnn>\r` of `\x02AG<nnn>\r` (afhankelijk van het gedetecteerde protocol) terug naar PstRotator. **Let op:** PstRotator's client-mode UI laat zo'n extern gestuurde target meestal niet visueel zien — dat is een beperking van het GS-232A/Prosistel protocol-ontwerp, niet van TL2.
+
+#### Setup PstRotator → Adafruit rotor (zonder PstRotator als backend)
+
+Wanneer je rotor-backend op **Yaesu G-1000DXC (Adafruit MCP2221A)** staat:
+
+1. In TL2 server-UI: PstRotator listener aanvinken (default poort `12001`).
+2. In PstRotator: kies een controller-type. **Aanbevolen: TCP-client** (Setup → "Start as TCP client") met host = TL2-IP en poort `12001`. Alternatief is een controller met UDP-output (EA7HG, GS-232A) op dezelfde poort.
+3. PstRotator commandeert de Adafruit-rotor direct via de listener. Server-log toont `compass X° → mech Y°` voor elke klik.
+
+#### Setup Log4OM → Adafruit rotor (PstRotator helemaal niet meer nodig)
+
+Log4OM ondersteunt alleen PstRotator als rotor-protocol. Truc: laat Log4OM denken dat TL2 **PstRotator is**.
+
+1. **PstRotator afsluiten** op de Win4OM-PC (volledig stoppen).
+2. In **Log4OM → Settings → External Services → PstRotator** (of equivalent paneel):
+   - **Host** = TL2-server IP (bijv. `192.168.1.97`) — **wijzig van `localhost` / `127.0.0.1`**
+   - **Port** = `12001` (TL2's PstRotator listener-poort)
+3. Klaar — klik in Log4OM op een DX-spot, de Adafruit-rotor draait direct naar de berekende richting.
+
+Log4OM stuurt voor elke spot een handvol PstRotator-XML packets (azimuth + callsign + naam + QTH + frequentie + mode + grid + comment + continent). TL2 verwerkt alleen de azimuth en negeert de metadata-tags stil. Geen tussenliggend programma nodig, geen UDP-simulator-drift, één configuratie-stap.
+
+#### Beperkingen en bekende gedragsregels
+
+- **Aan/uitzetten vereist server-restart.** De listener-threads worden alleen gespawned bij server-start. Toggle `pstrotator_listen_enabled` in de UI of het conf-bestand werkt pas na een herstart van de server. Stoppen is wel direct (server-stop sluit de poort binnen ~500 ms).
+- **Manual rotate (`R\r` / `L\r` in GS-232A) wordt genegeerd.** De listener accepteert alleen target-gestuurde commando's. Continu draaien zonder eindpunt is een hardware-knop functie en moet via de rotor-UI van TL2 zelf gebeuren.
+- **Stop-commando's wél doorgezet** (`S\r` in GS-232A, `\x02AR\r` / `AAR\r` / `AG999` in Prosistel, `<STOP>` in PstRotator-XML) — die stoppen de rotor onmiddellijk via de actieve backend.
+
+#### Diagnose
+
+De RX-packet-log staat default op debug-level zodat de server-log niet vervuilt met de 2 Hz status-queries. Voor diagnose: start de server met `RUST_LOG=debug` voor de volledige RX-stream. Goto-events, connect/disconnect en parse-warnings blijven altijd op info-level zichtbaar.
+
 ---
 
 ## Yaesu FT-991A
@@ -487,7 +532,7 @@ ThetisLink kan een Yaesu FT-991A transceiver aansturen als tweede radio naast de
 - **Frequentie:** uitlezen en instellen van de huidige frequentie
 - **Mode:** uitlezen en instellen (LSB, USB, CW, AM, FM, DATA-FM, DIG)
 - **VFO A/B:** schakelen tussen VFO A en VFO B
-- **Geheugenkanalen:** worden automatisch ingeladen bij het inschakelen van de Yaesu in de server. Kanalen met naam worden weergegeven in de UI
+- **Geheugenkanalen:** worden automatisch ingeladen bij het inschakelen van de Yaesu in de server. Kanalen met naam worden weergegeven in de UI. Edit + "Write radio" past frequentie, naam, mode, shift en tone-mode (aan/uit) per kanaal aan. **Let op (v2.1.1+):** de specifieke CTCSS-tone-frequentie wordt niet door TL2 geschreven — alleen "tone aan/uit" gaat mee. Tone-frequentie per kanaal stel je in op de FT-991A zelf.
 - **Menu editor:** Yaesu menu-instellingen uitlezen en wijzigen via de server UI
 - **Audio:** de Yaesu USB audio wordt door de server gecaptured en via het AudioRx2 kanaal naar de client gestuurd, waar het gemixt wordt met het ANAN RX-signaal
 - **Auto-DFM tijdens TX (v2.0.0):** zie subsectie hieronder

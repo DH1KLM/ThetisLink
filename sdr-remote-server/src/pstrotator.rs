@@ -175,7 +175,8 @@ fn handle_command(
             // positie (incl. de decimaal) gebruiken voor CW/CCW.
             status.lock().unwrap().target_x10 = *angle_x10;
             let deg = *angle_x10 / 10;
-            debug!("PstRotator GoTo: {} deg → <PST><AZIMUTH>{}</AZIMUTH></PST>", deg, deg);
+            info!("Rotor (PstRotator) GoTo {}°", deg);
+            debug!("PstRotator GoTo: {} deg -> <PST><AZIMUTH>{}</AZIMUTH></PST>", deg, deg);
             send_xml(socket, remote, &format!("AZIMUTH>{}</AZIMUTH", deg));
             // `send_xml` wraps with <PST>…</PST>; we passed only the inner
             // element so the helper stays generic for STOP and AZ? too.

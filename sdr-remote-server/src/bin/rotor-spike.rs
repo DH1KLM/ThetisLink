@@ -57,6 +57,13 @@ mod rotor {
         ) -> Self {
             Self
         }
+        pub fn from_handles_with_max(
+            _tx: mpsc::Sender<RotorCmd>,
+            _status: Arc<Mutex<RotorStatus>>,
+            _max_deg_x10: u16,
+        ) -> Self {
+            Self
+        }
     }
 }
 

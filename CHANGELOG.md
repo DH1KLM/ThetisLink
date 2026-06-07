@@ -16,6 +16,131 @@ hardware notes, see `docs-book/src/technical-reference.md` and
 
 ---
 
+## [2.1.1] — 2026-06-07 (PstRotator + Log4OM direct rotor control)
+
+> **Backwards-compatible with 2.1.0.** Wire-protocol unchanged. Adds a
+> parallel UDP+TCP listener on the server so PstRotator (any mode) or
+> Log4OM (via PstRotator-emulation) can command the active rotor backend
+> directly. Existing TCI-client rotor control is unchanged.
+
+### Added — PstRotator listener (parallel input source)
+
+The server now opens a combined UDP + TCP listener (default port
+12001, configurable via `pstrotator_listen_enabled` / `pstrotator_listen_port`
+in `thetislink-server.conf`) that accepts rotor commands from PstRotator
+or any PstRotator-compatible application. Commands are routed through
+the active rotor backend (EA7HG, PstRotator-outgoing, or Adafruit
+MCP2221A) — so PstRotator can drive a G-1000DXC connected via the
+Adafruit breakout without any intermediate hardware.
+
+Supported protocol formats (auto-detected per packet):
+
+- **Yaesu GS-232A / GS-232B** (text): `M<nnn>\r` (goto), `S\r` (stop),
+  `C\r` (query → `+<nnn>\r`), `C2\r` (query → `+0aaa+0eee\r`)
+- **Prosistel binary / EA7HG**: `\x02AG<nnn>\r` or `AAG<nnn>\r` (goto),
+  `\x02A?\r` or `AA?\r` (query → `\x02A,?,<nnn>,<R|B>\r`),
+  `\x02AG999\r` or `AAR\r` (stop)
+- **PstRotator native XML**: `<PST><AZIMUTH>nnn.n</AZIMUTH></PST>`
+  (goto), `<PST>AZ?</PST>` (query → `AZ:<nnn.n>\r`),
+  `<PST><STOP>1</STOP></PST>` (stop)
+- **AZ-text broadcast**: `AZ:nnn.n\r` (PstRotator's simulator output,
+  treated as feedback within 30 s of a real goto to avoid override)
+
+The TCP path also pushes TL2-originated targets back to PstRotator
+(`M<nnn>\r` or `\x02AG<nnn>\r` depending on detected protocol), so
+PstRotator's compass shows the same target indicator regardless of
+which side initiated the move. **Note:** PstRotator's client-mode UI
+may not visualise externally-pushed targets — this is a protocol-side
+limitation of GS-232A / Prosistel, not a TL2 issue.
+
+### Added — Log4OM direct (PstRotator-emulation)
+
+Log4OM does not natively support `rotctld` or other generic rotor
+protocols — its only rotor option is PstRotator. To drive the rotor
+without a PstRotator instance running, point Log4OM's PstRotator
+settings at the TL2 server:
+
+1. In Log4OM: **Settings → External Services → PstRotator** (or
+   equivalent rotator-control panel)
+2. Set **Host** to the TL2 server's IP (e.g. `192.168.1.97`) — change
+   from `localhost` / `127.0.0.1`
+3. Set **Port** to TL2's PstRotator listener port (default `12001`)
+4. Stop PstRotator on the Win4OM PC if it is running (no longer needed)
+
+Log4OM now sends `<PST><AZIMUTH>nnn</AZIMUTH></PST>` directly to TL2.
+TL2 acts as a drop-in PstRotator replacement. Metadata tags Log4OM
+also sends (`<CALL>`, `<NAME>`, `<QTH>`, `<FREQUENCY>`, `<MODE>`,
+`<GRID>`, `<COMMENT>`, `<COUNTRY>`, `<CONTINENT>`) are silently
+ignored — no parse-fail warnings in the server log.
+
+### Fixed — Rotor target oscillation when PstRotator simulator broadcasts AZ:nn
+
+When PstRotator's "UDP output" was enabled in parallel with the
+EA7HG-UDP controller, PstRotator's internal rotor simulator
+broadcast `AZ:nn\r` packets ~1 Hz that the listener interpreted as
+new goto commands. Each simulator step pulled the rotor to that
+position, causing visible stepwise oscillation. The listener now
+classifies AZ-broadcasts that arrive within 30 s of a real
+`AAG`/`M` goto as simulator-feedback and silently drops them.
+AZ-broadcasts outside that window continue to work as goto commands
+for AZ-only PstRotator output configurations.
+
+### Changed — Server-log volume
+
+The high-frequency raw-packet log lines (`PstRotator listen RX from
+...`) are now emitted at `debug!` level instead of `info!`. The
+default-level log shows only actionable rotor events
+(`compass X° → mech Y°` on a real goto, connect/disconnect, parse
+warnings on truly unknown packets). Use `RUST_LOG=debug` to restore
+the full RX visibility for diagnostics.
+
+### Fixed — Rotor direction-reversal ramp protection
+
+When a running GoTo received a new target on the opposite side of the
+compass (delta sign flip), the Adafruit MCP2221A backend previously
+flipped the CW/CCW gates while the DAC was still at full speed,
+causing the motor to slam from full-power one direction to full-power
+the other. The poll-tick now detects a direction mismatch between the
+desired rotation and the active gate; while `current_dac` is above
+the dead-band it leaves the gates alone and ramps the DAC down to
+zero first. Once stopped, the gates switch to the new direction and
+the normal soft-start ramps back up. Existing `ramp_pct_per_sec`
+controls both phases — no separate reversal rate.
+
+### Fixed — Yaesu FT-991A memory write
+
+"Write radio" from the FT-991A memory-edit window previously reported
+success in the server log but the radio silently rejected the writes,
+and a follow-up "Read radio" surfaced the unchanged state. Three
+underlying issues, all addressed:
+
+- **UDP packet-reorder race.** The client sends the tab-text data
+  (~2.7 kB, IP-fragmented) and the write-trigger control (8 B) in
+  quick succession. The control routinely overtook the data on the
+  wire, so the server saw a trigger without data and dropped it. A
+  latch on the trigger now fires the write when the data arrives,
+  regardless of order.
+- **MT frame P9 violation.** The CTCSS-tone index was emitted in the
+  P9 field where the FT-991A spec requires literal `"00"`. Any
+  channel with `Tone ENC` (or any non-default tone-mode) was silently
+  rejected. P9 is now hard-coded to `"00"`; the per-channel
+  CTCSS-tone *frequency* is no longer transmitted via MT.
+- **FM force-mapped to DATA-FM on storage.** All `FM` / `FM-N` /
+  `DATA-FM` / `C4FM` channels were stored as DATA-FM, leaving the
+  radio in DATA-FM after every Write-radio cycle (USB-mic only,
+  no local mic). The mode-mapping now round-trips correctly: `FM`
+  stays `FM`, `FM-N` stays `FM-N`, `AM-N` stays `AM-N`, `C4FM` stays
+  `C4FM`. The runtime FM ↔ DATA-FM swap during remote PTT
+  (`set_ptt()`) is unchanged.
+
+**Note:** the per-channel CTCSS *frequency* is no longer written via
+MT — only the tone-mode (on/off, ENC/DCS) propagates. Set the CTCSS
+frequency from the radio's front-panel menu (or wait for a follow-up
+patch that drives the dedicated `CN` command). Tone-mode aan/uit
+works as expected.
+
+---
+
 ## [2.1.0] — 2026-06 (Yaesu rotor MCP2221A backend, wideband Thetis RX, Amplitec reliability)
 
 > **Backwards-compatible with 2.0.4.** Wire-protocol unchanged — a

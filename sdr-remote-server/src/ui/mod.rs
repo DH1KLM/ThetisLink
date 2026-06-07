@@ -144,6 +144,8 @@ pub struct ServerApp {
     pstrotator_port: u16,
     pstrotator_feedback_port: u16,
     pstrotator_has_elevation: bool,
+    pstrotator_listen_enabled: bool,
+    pstrotator_listen_port: u16,
     // Per-popout "init applied" flags — see mirror impl in
     // sdr-remote-client mod.rs apply_popout_geometry for the rationale.
     // Repeated `with_position()` calls every frame caused the windows to
@@ -303,6 +305,8 @@ impl ServerApp {
             pstrotator_port: config.pstrotator_port,
             pstrotator_feedback_port: config.pstrotator_feedback_port,
             pstrotator_has_elevation: config.pstrotator_has_elevation,
+            pstrotator_listen_enabled: config.pstrotator_listen_enabled,
+            pstrotator_listen_port: config.pstrotator_listen_port,
             tuner_window_init_applied: false,
             amplitec_window_init_applied: false,
             spe_window_init_applied: false,
@@ -376,6 +380,8 @@ impl ServerApp {
             pstrotator_port: self.pstrotator_port,
             pstrotator_feedback_port: self.pstrotator_feedback_port,
             pstrotator_has_elevation: self.pstrotator_has_elevation,
+            pstrotator_listen_enabled: self.pstrotator_listen_enabled,
+            pstrotator_listen_port: self.pstrotator_listen_port,
             tuner_window_pos: self.tuner_window_pos,
             amplitec_window_pos: self.amplitec_window_pos,
             spe_window_pos: self.spe_window_pos,
@@ -620,6 +626,11 @@ impl ServerApp {
                 }
             }
         }
+
+        // PstRotator UDP-listener (v2.1.1+) wordt server-side gespawnd in
+        // main.rs::run_server_async met de pre-built rotor_inst — daar
+        // hoort dit hoor; hier in ui/mod.rs zou een tweede spawn een
+        // "address already in use" bind-conflict op de poort geven.
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         self.shutdown_tx = Some(shutdown_tx);
@@ -913,7 +924,7 @@ impl eframe::App for ServerApp {
                         egui::ComboBox::from_id_salt("rotor_backend_combo")
                             .selected_text(match self.rotor_backend.as_str() {
                                 "pstrotator" => "PstRotator (XML/UDP)",
-                                "mcp2221_yaesu" => "Adafruit MCP2221A → Yaesu G-1000DXC",
+                                "mcp2221_yaesu" => "Adafruit MCP2221A -> Yaesu G-1000DXC",
                                 _ => "EA7HG Visual Rotor",
                             })
                             .show_ui(ui, |ui| {
@@ -930,7 +941,7 @@ impl eframe::App for ServerApp {
                                 ui.selectable_value(
                                     &mut self.rotor_backend,
                                     "mcp2221_yaesu".to_string(),
-                                    "Adafruit MCP2221A → Yaesu G-1000DXC",
+                                    "Adafruit MCP2221A -> Yaesu G-1000DXC",
                                 );
                             });
                         if backend_before != self.rotor_backend {
@@ -988,6 +999,41 @@ impl eframe::App for ServerApp {
                     }
                     if self.rotor_enabled {
                         ui.checkbox(&mut self.show_rotor_window, "Rotor venster openen bij starten");
+                    }
+
+                    // PstRotator listener — parallel input source bovenop
+                    // de actieve rotor-backend. Onafhankelijk van de
+                    // backend-keuze; werkt bv. om Log4OM → PstRotator de
+                    // Adafruit-rotor te laten besturen.
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.checkbox(
+                            &mut self.pstrotator_listen_enabled,
+                            "PstRotator listener (parallel)",
+                        )
+                        .on_hover_text(
+                            "Luistert op UDP-poort voor inkomende PstRotator azimuth-\n\
+                             broadcasts (text `AZ:nnn.n` of XML `<AZIMUTH>nnn.n</AZIMUTH>`).\n\
+                             Vertaalt ze naar GoTo-commando's op de actieve rotor-backend,\n\
+                             onafhankelijk van welke backend daarboven gekozen is."
+                        );
+                        ui.label("poort:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.pstrotator_listen_port)
+                                .range(1u16..=65535)
+                                .speed(1.0),
+                        );
+                    });
+                    if self.pstrotator_listen_enabled && self.rotor_backend == "pstrotator" {
+                        ui.label(
+                            egui::RichText::new(
+                                "Let op: rotor_backend is ook 'pstrotator' \u{2014} \
+                                 PstRotator's eigen replies kunnen via deze listener \
+                                 weer binnenkomen (loop-risico).",
+                            )
+                            .size(10.0)
+                            .color(egui::Color32::from_rgb(220, 160, 40)),
+                        );
                     }
 
                     ui.add_space(16.0);

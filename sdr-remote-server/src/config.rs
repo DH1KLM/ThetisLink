@@ -245,6 +245,16 @@ pub struct ServerConfig {
     pub pstrotator_feedback_port: u16,
     /// Polle ook `EL?` voor elevation-rotors. Default `false` (alleen AZ).
     pub pstrotator_has_elevation: bool,
+    /// PstRotator UDP-listener (v2.1.1+): luistert parallel aan de actieve
+    /// `rotor_backend` voor inkomende azimuth-broadcasts van bv. Log4OM →
+    /// PstRotator en zet ze om in `RotorCmd::GoTo` op de Rotor-facade.
+    /// Maakt het mogelijk om de Adafruit-rotor vanuit een logging-programma
+    /// te besturen zonder de outgoing PstRotator-backend te activeren.
+    pub pstrotator_listen_enabled: bool,
+    /// UDP-poort voor de listener. Default 12001 (=PstRotator's standaard
+    /// feedback-poort die de outgoing kant van zijn azimuth-updates
+    /// broadcastet).
+    pub pstrotator_listen_port: u16,
     /// Saved window positions: [x, y]
     pub tuner_window_pos: Option<[f32; 2]>,
     pub amplitec_window_pos: Option<[f32; 2]>,
@@ -334,6 +344,8 @@ impl Default for ServerConfig {
             pstrotator_port: 12000,
             pstrotator_feedback_port: 12001,
             pstrotator_has_elevation: false,
+            pstrotator_listen_enabled: false,
+            pstrotator_listen_port: 12001,
             tuner_window_pos: None,
             amplitec_window_pos: None,
             spe_window_pos: None,
@@ -766,6 +778,14 @@ fn load_unlocked() -> ServerConfig {
                     "pstrotator_has_elevation" => {
                         config.pstrotator_has_elevation = value.trim() == "true";
                     }
+                    "pstrotator_listen_enabled" => {
+                        config.pstrotator_listen_enabled = value.trim() == "true";
+                    }
+                    "pstrotator_listen_port" => {
+                        if let Ok(v) = value.trim().parse::<u16>() {
+                            if v > 0 { config.pstrotator_listen_port = v; }
+                        }
+                    }
                     "rotor_pos_x" => {
                         if let Ok(v) = value.trim().parse::<f32>() {
                             config.rotor_window_pos.get_or_insert([0.0, 0.0])[0] = v;
@@ -1016,6 +1036,14 @@ fn save_unlocked(config: &ServerConfig) {
     contents.push_str(&format!(
         "pstrotator_has_elevation={}\n",
         config.pstrotator_has_elevation
+    ));
+    contents.push_str(&format!(
+        "pstrotator_listen_enabled={}\n",
+        config.pstrotator_listen_enabled
+    ));
+    contents.push_str(&format!(
+        "pstrotator_listen_port={}\n",
+        config.pstrotator_listen_port
     ));
     // Per-tuner slots — tuner1_* / tuner2_* keys keep the file readable by hand.
     for (i, t) in config.tuners.iter().enumerate() {
