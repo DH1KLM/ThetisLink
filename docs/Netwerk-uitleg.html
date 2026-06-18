@@ -1,0 +1,579 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: GPL-2.0-or-later -->
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Van server naar client — hoe ThetisLink alles over het netwerk krijgt</title>
+<style>
+  :root{
+    --bg:#0f1320; --panel:#171c2e; --ink:#e8ecf6; --muted:#9aa6c4;
+    --accent:#4ea1ff; --accent2:#3ddc97; --warn:#ffb454; --line:#2a3350;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:16px/1.65 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+  header{padding:48px 24px 28px;text-align:center;
+    background:radial-gradient(900px 300px at 50% -40px,#1c2950,transparent),var(--bg);
+    border-bottom:1px solid var(--line)}
+  header h1{margin:0 0 8px;font-size:30px;letter-spacing:.2px}
+  header p{margin:0;color:var(--muted);max-width:720px;margin-inline:auto}
+  main{max-width:880px;margin:0 auto;padding:8px 24px 80px}
+  section{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+    padding:22px 26px;margin:26px 0;box-shadow:0 1px 0 #ffffff08 inset}
+  h2{font-size:22px;margin:.2em 0 .5em;color:#fff;border-left:4px solid var(--accent);
+    padding-left:12px}
+  h3{font-size:17px;color:var(--accent2);margin:1.2em 0 .3em}
+  p{margin:.6em 0}
+  .lead{color:var(--muted)}
+  a{color:var(--accent)}
+  ul{margin:.5em 0 .5em 0}
+  code{background:#0c1020;border:1px solid var(--line);border-radius:5px;padding:1px 6px;
+    font:14px/1.4 "SFMono-Regular",Consolas,monospace;color:#cfe0ff}
+  .fig{margin:18px 0;text-align:center}
+  .fig svg{max-width:100%;height:auto;background:#0c1020;border:1px solid var(--line);
+    border-radius:10px}
+  .cap{color:var(--muted);font-size:13.5px;margin-top:6px;font-style:italic}
+  .analogy{background:#15233f;border:1px solid #294067;border-left:4px solid var(--accent);
+    border-radius:10px;padding:12px 16px;margin:16px 0}
+  .analogy b{color:#bcd6ff}
+  .tl{background:#13261c;border:1px solid #235038;border-left:4px solid var(--accent2);
+    border-radius:10px;padding:12px 16px;margin:16px 0;font-size:15px}
+  .tl b{color:#8ff0c0}
+  .q{background:#2a2238;border:1px solid #4a3a63;border-left:4px solid #b98bff;
+    border-radius:10px;padding:12px 16px;margin:16px 0}
+  .q b{color:#d6bcff}
+  .toc{columns:2;column-gap:30px;color:var(--muted);font-size:15px}
+  .toc a{display:block;padding:3px 0;text-decoration:none;color:var(--muted)}
+  .toc a:hover{color:var(--accent)}
+  svg text{font:13px sans-serif;fill:var(--ink)}
+  svg .mut{fill:var(--muted);font-size:12px}
+  footer{color:var(--muted);text-align:center;font-size:13px;padding:30px 24px 60px}
+  @media(max-width:620px){.toc{columns:1}}
+</style>
+</head>
+<body>
+<header>
+  <h1>Van server naar client</h1>
+  <p>Hoe het gedemoduleerde geluid, het spectrum, de S-meter en alle knoppen tussen de
+  ThetisLink-server en jouw client heen en weer reizen — een uitleg in gewone taal. Met plaatjes.</p>
+  <p style="margin-top:10px;font-size:14px"><b>Nederlands</b> &nbsp;·&nbsp; <a href="Network-explained.html">English</a></p>
+</header>
+
+<main>
+
+<section id="intro">
+  <h2>Het grote idee</h2>
+  <p class="lead">De <b>server</b> staat thuis, vlak naast de radio en Thetis. De <b>client</b> (op je
+  laptop, pc of Android-telefoon) kan overal staan — in de woonkamer, op kantoor, aan de andere kant
+  van de wereld. Tussen die twee loopt één dunne netwerkverbinding. Daarover moet <b>alles</b>: het
+  geluid van de ontvanger, het spectrum- en watervalbeeld, de signaalsterkte, én elke knop die je
+  indrukt.</p>
+
+  <p>De grote uitdaging is <b>vertraging</b> (latency). Als je de zendknop indrukt of aan de
+  afstemknop draait, moet dat <i>nu</i> gebeuren — niet een halve seconde later. Daarom is heel
+  ThetisLink gebouwd rond één principe:</p>
+
+  <div class="tl"><b>Ontwerpprioriteit.</b> <b>Latency &gt; bandbreedte &gt; features.</b> Zo min
+  mogelijk vertraging in de audio en de zendknop staat bovenaan. Alles wat onnodig vertraging
+  toevoegt — extra buffers, wachtrijen, bevestigingen heen en weer — wordt vermeden.</p>
+
+  <div class="fig">
+    <svg viewBox="0 0 840 180" role="img" aria-label="Server naar client overzicht">
+      <g font-size="12" text-anchor="middle">
+        <rect x="14" y="58" width="96" height="50" rx="7" fill="#23314f" stroke="#3a4a73"/>
+        <text x="62" y="79">Radio</text><text x="62" y="95" class="mut">ANAN / Yaesu</text>
+        <rect x="132" y="58" width="96" height="50" rx="7" fill="#1d2742" stroke="#3a4a73"/>
+        <text x="180" y="79">Thetis</text><text x="180" y="95" class="mut">via TCI</text>
+        <rect x="250" y="58" width="110" height="50" rx="7" fill="#1d2742" stroke="#3a4a73"/>
+        <text x="305" y="79">TL2-server</text><text x="305" y="95" class="mut">Windows-pc</text>
+        <!-- network cloud -->
+        <ellipse cx="470" cy="83" rx="62" ry="34" fill="#15233f" stroke="#294067"/>
+        <text x="470" y="80">netwerk</text><text x="470" y="96" class="mut">UDP · poort 4580</text>
+        <rect x="582" y="40" width="118" height="40" rx="7" fill="#1c3a2a" stroke="#2e6a48"/>
+        <text x="641" y="64">client — laptop/pc</text>
+        <rect x="582" y="92" width="118" height="40" rx="7" fill="#1c3a2a" stroke="#2e6a48"/>
+        <text x="641" y="116">client — Android</text>
+        <rect x="722" y="58" width="104" height="50" rx="7" fill="#23314f" stroke="#3a4a73"/>
+        <text x="774" y="79">jij</text><text x="774" y="95" class="mut">koptelefoon</text>
+      </g>
+      <g stroke="#4ea1ff" stroke-width="2" fill="none" marker-end="url(#an)">
+        <path d="M110 83 H132"/><path d="M228 83 H250"/><path d="M360 83 H406"/>
+        <path d="M534 76 H582"/><path d="M534 96 H582"/><path d="M700 83 H722"/>
+      </g>
+      <defs><marker id="an" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+        <path d="M0,0 L7,3 L0,6 Z" fill="#4ea1ff"/></marker></defs>
+    </svg>
+    <div class="cap">Figuur 1 — De keten. De radio en Thetis maken het geluid en het spectrum; de
+    TL2-server pakt dat in en stuurt het over het netwerk; de client speelt het af en stuurt jouw
+    bedieningen terug.</div>
+  </div>
+
+  <p class="lead">Dit document gaat over het <b>rechterstuk</b>: de TL2-server → het netwerk → de
+  client. Hoe het <i>geluid</i> ontstaat (de demodulatie, de FFT-channelizer) staat in het
+  zusterdocument <a href="VRX-uitleg.html">&ldquo;Hoe een VRX werkt&rdquo;</a>.</p>
+</section>
+
+<section id="toc">
+  <h2>Inhoud</h2>
+  <nav class="toc">
+    <a href="#twee">1. Twee soorten verkeer</a>
+    <a href="#udp">2. Waarom UDP en geen TCP</a>
+    <a href="#vinden">3. De server vinden (auto-discovery)</a>
+    <a href="#envelop">4. Eén pakket, één envelop</a>
+    <a href="#audio">5. Audio: Opus over UDP</a>
+    <a href="#streams">6. Veel geluidsstromen over één lijn</a>
+    <a href="#jitter">7. De jitter-buffer</a>
+    <a href="#spectrum">8. Het spectrum over de lijn</a>
+    <a href="#smeter">9. De S-meter</a>
+    <a href="#knoppen">10. Instellingen en knoppen</a>
+    <a href="#ptt">11. De zendknop (PTT)</a>
+    <a href="#auth">12. Verbinden en beveiligen</a>
+    <a href="#latency">13. Het latency-budget</a>
+    <a href="#slot">Tot slot — alles samen</a>
+  </nav>
+</section>
+
+<section id="twee">
+  <h2>1. Twee soorten verkeer</h2>
+  <p>Alles wat over de lijn gaat valt in twee groepen, en die hebben heel verschillende eisen:</p>
+  <ul>
+    <li><b>Continue stromen</b> — het geluid, het spectrum, de S-meter. Die komen tientallen keren
+    per seconde, eindeloos. Hier telt: <b>op tijd</b> en <b>vloeiend</b>. Eén pakketje dat te laat
+    komt is waardeloos: het geluid van 100 ms geleden wil je niet meer horen, dan ben je liever
+    verder.</li>
+    <li><b>Losse opdrachten</b> — een frequentie zetten, een mode kiezen, het volume schuiven, de
+    zendknop. Die komen alleen als jij iets doet. Hier telt: <b>meteen</b> reageren.</li>
+  </ul>
+  <p>Beide groepen reizen over dezelfde verbinding, maar de manier waarop bepaalt of het systeem snel
+  en soepel aanvoelt. Dat brengt ons bij de belangrijkste keuze.</p>
+</section>
+
+<section id="udp">
+  <h2>2. Waarom UDP en geen TCP</h2>
+  <p>Er zijn twee manieren om data over internet te sturen. Een vergelijking met de post helpt:</p>
+  <ul>
+    <li><b>TCP</b> is als <b>aangetekende post</b>: elk pakket wordt bevestigd, en raakt er één kwijt,
+    dan wordt die opnieuw gestuurd en wacht <i>alles erachter</i> tot hij binnen is. Gegarandeerd
+    compleet — maar één hapering laat de hele stroom stokken.</li>
+    <li><b>UDP</b> is als <b>gewone briefkaarten</b>: je gooit ze op de bus en ze komen (meestal) aan,
+    maar er is geen bevestiging en geen herzending. Raakt er één kwijt, dan is hij gewoon weg — de
+    rest reist ongehinderd door.</li>
+  </ul>
+  <p>Voor live audio is dat tweede precies wat je wilt. Een verloren pakketje van 20 ms hoor je
+  hooguit als een minuscuul klikje; daar wachten zou veel erger zijn. <b>ThetisLink gebruikt daarom
+  UDP</b> — voor álle verkeer, audio én opdrachten.</p>
+
+  <div class="q"><b>Maar opdrachten mogen toch niet verloren gaan?</b> Klopt. Daarvoor is een ander
+  trucje: de server stuurt voortdurend de actuele stand terug (de frequentie, de mode…). Zie je na
+  een druk op de knop de waarde niet veranderen, dan stuurt de client hem desnoods opnieuw. Geen
+  trage bevestiging per pakket; wel zekerheid via de teruggemelde stand.</p>
+
+  <div class="tl"><b>In ThetisLink.</b> Eén UDP-socket op <b>poort 4580</b> draagt alles: audio,
+  spectrum, S-meter, instellingen en de zendknop. Geen aparte TCP-verbinding. De server vergroot wel
+  zijn UDP-buffers, want de standaard van Windows is te klein voor de grote spectrum-pakketten.</div>
+</section>
+
+<section id="vinden">
+  <h2>3. De server vinden (auto-discovery)</h2>
+  <p>Voordat er iets kan reizen, moet de client weten <i>waar</i> de server staat. Dat kan op twee
+  manieren:</p>
+  <ul>
+    <li><b>Automatisch (mDNS).</b> De server roept op het lokale netwerk om: &ldquo;hier ben ik, ik
+    ben een ThetisLink-server.&rdquo; De client luistert en toont hem in een lijstje — je hoeft geen
+    IP-adres te kennen. Hetzelfde mechanisme als waarmee je telefoon een printer of Chromecast vindt.</li>
+    <li><b>Handmatig.</b> Zit de client in een ander netwerk (via VPN, of over internet), dan werkt
+    dat omroepen niet — daar tik je het IP-adres en de poort gewoon zelf in.</li>
+  </ul>
+  <div class="tl"><b>In ThetisLink.</b> Auto-discovery gebruikt de standaard <code>mDNS</code>
+  (service-type <code>_thetislink._udp</code>); de server zet zijn versie en een vriendelijke naam in
+  de aankondiging. Buiten het lokale netwerk: handmatig adres en poort 4580.</div>
+</section>
+
+<section id="envelop">
+  <h2>4. Eén pakket, één envelop</h2>
+  <p>Omdat alles over dezelfde socket reist, moet de ontvanger van elk pakketje meteen kunnen zien
+  <i>wat</i> het is. Daarom begint elk pakket met een korte, vaste <b>kop</b> van 4 bytes — als het
+  adres op een envelop:</p>
+
+  <div class="fig">
+    <svg viewBox="0 0 760 150" role="img" aria-label="Pakket-kop">
+      <g text-anchor="middle" font-size="12">
+        <rect x="40"  y="50" width="120" height="46" rx="6" fill="#23314f" stroke="#3a4a73"/>
+        <text x="100" y="70">0xAA</text><text x="100" y="86" class="mut">herkenteken</text>
+        <rect x="166" y="50" width="120" height="46" rx="6" fill="#23314f" stroke="#3a4a73"/>
+        <text x="226" y="70">versie</text><text x="226" y="86" class="mut">protocol = 3</text>
+        <rect x="292" y="50" width="150" height="46" rx="6" fill="#1f3a5a" stroke="#4ea1ff"/>
+        <text x="367" y="70">type</text><text x="367" y="86" class="mut">audio? spectrum?…</text>
+        <rect x="448" y="50" width="120" height="46" rx="6" fill="#23314f" stroke="#3a4a73"/>
+        <text x="508" y="70">vlaggen</text><text x="508" y="86" class="mut">PTT, breedband…</text>
+        <rect x="574" y="50" width="146" height="46" rx="6" fill="#1c3a2a" stroke="#2e6a48"/>
+        <text x="647" y="70">inhoud</text><text x="647" y="86" class="mut">de rest van het pakket</text>
+      </g>
+      <text x="226" y="34" text-anchor="middle" class="mut">— 4 bytes kop —</text>
+      <line x1="40" y1="40" x2="568" y2="40" stroke="#566187" stroke-dasharray="4 3"/>
+    </svg>
+    <div class="cap">Figuur 2 — Elke envelop opent met een herkenteken, het protocolnummer, het
+    <b>type</b> (audio, spectrum, frequentie, S-meter, …) en een paar losse vlaggen. Daarna volgt de
+    inhoud die bij dat type hoort.</div>
+  </div>
+
+  <p>Het <b>type</b> is de kern: daaraan ziet de ontvanger of dit een stukje RX1-audio is, een
+  spectrumrij, een nieuwe frequentie, een S-meterstand of een druk op de zendknop. Zo kan één
+  socket tientallen verschillende soorten berichten door elkaar dragen zonder dat ze verward raken.</p>
+
+  <div class="analogy"><b>Analogie.</b> Eén brievenbus, maar elke brief heeft linksboven een duidelijk
+  label: &ldquo;GELUID&rdquo;, &ldquo;BEELD&rdquo;, &ldquo;KNOP&rdquo;. De postsorteerder hoeft de
+  brief niet eens te openen om te weten waar hij heen moet.</div>
+</section>
+
+<section id="audio">
+  <h2>5. Audio: Opus over UDP</h2>
+  <p>Het gedemoduleerde geluid (uit de VRX-keten, of rechtstreeks van Thetis of een Yaesu) is een
+  stroom audiomonsters. Die ongecomprimeerd versturen zou onnodig veel bandbreedte kosten. Daarom
+  wordt het eerst gecomprimeerd met de <b>Opus</b>-codec — een moderne, zeer efficiënte
+  audiocompressie die speciaal goed is in <b>lage vertraging</b>.</p>
+
+  <p>Het geluid wordt in hapjes van <b>20 ms</b> geknipt; elk hapje wordt apart als Opus-blokje
+  gecodeerd en in één UDP-pakket gestopt. Naast de Opus-bytes zelf zitten in dat pakket twee
+  belangrijke getallen:</p>
+  <ul>
+    <li>een <b>volgnummer</b> (sequence) — pakketje 1, 2, 3, … zodat de client de juiste volgorde
+    kent;</li>
+    <li>een <b>tijdstempel</b> — wanneer dit hapje hoort te spelen.</li>
+  </ul>
+
+  <div class="fig">
+    <svg viewBox="0 0 760 120" role="img" aria-label="Audio-pakket">
+      <g text-anchor="middle" font-size="12">
+        <rect x="40"  y="46" width="92"  height="44" rx="6" fill="#23314f" stroke="#3a4a73"/>
+        <text x="86" y="72">kop</text>
+        <rect x="138" y="46" width="120" height="44" rx="6" fill="#1d2742" stroke="#3a4a73"/>
+        <text x="198" y="66">volgnummer</text><text x="198" y="82" class="mut">seq</text>
+        <rect x="264" y="46" width="120" height="44" rx="6" fill="#1d2742" stroke="#3a4a73"/>
+        <text x="324" y="66">tijdstempel</text><text x="324" y="82" class="mut">timestamp</text>
+        <rect x="390" y="46" width="90" height="44" rx="6" fill="#2e2415" stroke="#ffb454"/>
+        <text x="435" y="66">lengte</text><text x="435" y="82" class="mut">opus-len</text>
+        <rect x="486" y="46" width="234" height="44" rx="6" fill="#1c3a2a" stroke="#2e6a48"/>
+        <text x="603" y="66">Opus-gecomprimeerd geluid</text><text x="603" y="82" class="mut">~20 ms audio</text>
+      </g>
+    </svg>
+    <div class="cap">Figuur 3 — Een audiopakket: de standaardkop, een volgnummer, een tijdstempel, de
+    lengte, en daarna het Opus-blokje met ongeveer 20 ms geluid. (Voor een VRX-kanaal zit er ook nog
+    een klein kanaalnummer bij, zodat VRX1 en VRX2 uit elkaar te houden zijn.)</div>
+  </div>
+
+  <h3>Smal of breed — dezelfde keuze als in de VRX-keten</h3>
+  <p>Net als bij de iFFT-keuze (zie het VRX-document) kan de audio <b>smalband</b> of <b>breedband</b>
+  zijn:</p>
+  <ul>
+    <li><b>Smalband:</b> 8 kHz audio, ~12,8 kbit/s — prima voor spraak, heel weinig data.</li>
+    <li><b>Breedband:</b> 16 kHz audio, ~20–24 kbit/s (afhankelijk van de stroom) — duidelijk
+    helderder, ongeveer het dubbele aan data.</li>
+  </ul>
+  <p>Welke van de twee bepaalt de client met één schakelaar; de server codeert daarop. (Op de TX-kant
+  — als je zelf zendt — wordt altijd breedband gebruikt voor de beste microfoonkwaliteit.)</p>
+
+  <div class="tl"><b>In ThetisLink.</b> Opus, 20 ms-frames. Voor de gewone Thetis-RX is de codec op
+  <b>spraak</b> afgesteld (met foutcorrectie/FEC en stilte-onderdrukking/DTX, zodat een verloren
+  pakketje deels herstelbaar is en stilte bijna geen data kost). Voor de <b>VRX-kanalen</b> staat de
+  stilte-onderdrukking juist <b>uit</b> (en geen FEC) — dat is continue ontvangst, geen telefoongesprek,
+  en je wilt ook de ruis tussendoor horen. De <b>Yaesu-audio</b> heeft een eigen afstelling per smal-
+  of breedband.</div>
+</section>
+
+<section id="streams">
+  <h2>6. Veel geluidsstromen over één lijn</h2>
+  <p>ThetisLink kan meer dan één ding tegelijk laten horen: de hoofdontvanger (RX1), de tweede
+  ontvanger (RX2/VFO-B), de virtuele ontvangers VRX1 en VRX2, en het geluid van een aangesloten
+  Yaesu-radio. Al die stromen reizen <b>door dezelfde socket</b>. Hoe blijven ze uit elkaar?</p>
+  <p>Heel simpel: elk soort stroom heeft zijn <b>eigen pakkettype</b> (en elk een eigen
+  volgnummer-teller). De client ziet aan het type-label meteen in welk audiokanaal een pakketje
+  thuishoort en stuurt het naar de juiste afspeel-buffer.</p>
+
+  <div class="fig">
+    <svg viewBox="0 0 760 170" role="img" aria-label="Meerdere stromen, één socket">
+      <g text-anchor="middle" font-size="11.5">
+        <rect x="30" y="20" width="92" height="26" rx="6" fill="#1f3a5a" stroke="#4ea1ff"/><text x="76" y="37">RX1</text>
+        <rect x="30" y="52" width="92" height="26" rx="6" fill="#1f3a5a" stroke="#4ea1ff"/><text x="76" y="69">RX2</text>
+        <rect x="30" y="84" width="92" height="26" rx="6" fill="#1f3a2e" stroke="#3ddc97"/><text x="76" y="101">VRX1 / VRX2</text>
+        <rect x="30" y="116" width="92" height="26" rx="6" fill="#2e2415" stroke="#ffb454"/><text x="76" y="133">Yaesu</text>
+        <!-- merge into socket -->
+        <rect x="300" y="62" width="120" height="46" rx="8" fill="#15233f" stroke="#294067"/>
+        <text x="360" y="82">één socket</text><text x="360" y="98" class="mut">poort 4580</text>
+        <!-- split at client -->
+        <rect x="600" y="20" width="130" height="26" rx="6" fill="#1f3a5a" stroke="#4ea1ff"/><text x="665" y="37">buffer RX1</text>
+        <rect x="600" y="52" width="130" height="26" rx="6" fill="#1f3a5a" stroke="#4ea1ff"/><text x="665" y="69">buffer RX2</text>
+        <rect x="600" y="84" width="130" height="26" rx="6" fill="#1f3a2e" stroke="#3ddc97"/><text x="665" y="101">buffer VRX1/2</text>
+        <rect x="600" y="116" width="130" height="26" rx="6" fill="#2e2415" stroke="#ffb454"/><text x="665" y="133">buffer Yaesu</text>
+      </g>
+      <g stroke="#566187" stroke-width="1.6" fill="none" marker-end="url(#an2)">
+        <path d="M122 33 C210 33 230 78 300 82"/>
+        <path d="M122 65 C210 65 240 82 300 86"/>
+        <path d="M122 97 C210 97 240 88 300 90"/>
+        <path d="M122 129 C210 129 230 96 300 94"/>
+      </g>
+      <g stroke="#566187" stroke-width="1.6" fill="none" marker-end="url(#an2)">
+        <path d="M420 82 C500 78 520 33 600 33"/>
+        <path d="M420 86 C500 82 520 65 600 65"/>
+        <path d="M420 90 C500 88 520 97 600 97"/>
+        <path d="M420 94 C500 96 520 129 600 129"/>
+      </g>
+      <text x="360" y="130" text-anchor="middle" class="mut">type-label houdt ze uit elkaar</text>
+      <defs><marker id="an2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+        <path d="M0,0 L6,3 L0,6 Z" fill="#566187"/></marker></defs>
+    </svg>
+    <div class="cap">Figuur 4 — Alle audiokanalen gaan door dezelfde socket en worden aan de
+    ontvangstkant op hun type-label weer uit elkaar gehaald, elk naar zijn eigen afspeel-buffer.</div>
+  </div>
+
+  <p>Daarnaast bestaat er een &ldquo;gebundelde&rdquo; variant die meerdere kanalen in één pakket
+  stopt met hetzelfde volgnummer en tijdstempel — handig als kanalen <b>exact gelijk</b> moeten lopen
+  (bijvoorbeeld een stereo links/rechts-beeld).</p>
+</section>
+
+<section id="jitter">
+  <h2>7. De jitter-buffer</h2>
+  <p>Pakketjes reizen niet allemaal even snel over het netwerk. De één doet er 8 ms over, de volgende
+  21 ms, soms komt er één <i>vóór</i> zijn voorganger aan. Die wisselende vertraging heet
+  <b>jitter</b>. Zou je elk pakketje meteen afspelen zodra het binnenkomt, dan klonk het hakkelig en
+  door elkaar.</p>
+  <p>De oplossing is een kleine <b>jitter-buffer</b> aan de clientkant: een wachtkamertje van een
+  handvol pakketjes. Binnenkomende pakketten worden daar op <b>volgnummer</b> op de juiste plek
+  gelegd; het afspelen loopt er met een vaste, rustige tik doorheen. Zo wordt een hobbelige aankomst
+  een vloeiende weergave.</p>
+
+  <div class="fig">
+    <svg viewBox="0 0 760 200" role="img" aria-label="Jitter-buffer">
+      <text x="160" y="22" text-anchor="middle" class="mut">aankomst — onregelmatig, soms verwisseld</text>
+      <g font-size="12" text-anchor="middle">
+        <rect x="40"  y="34" width="30" height="26" rx="4" fill="#1f3a5a" stroke="#4ea1ff"/><text x="55" y="52">1</text>
+        <rect x="92"  y="34" width="30" height="26" rx="4" fill="#1f3a5a" stroke="#4ea1ff"/><text x="107" y="52">2</text>
+        <rect x="176" y="34" width="30" height="26" rx="4" fill="#1f3a5a" stroke="#4ea1ff"/><text x="191" y="52">4</text>
+        <rect x="214" y="34" width="30" height="26" rx="4" fill="#1f3a5a" stroke="#4ea1ff"/><text x="229" y="52">3</text>
+        <rect x="300" y="34" width="30" height="26" rx="4" fill="#3a2030" stroke="#ff7a7a" stroke-dasharray="3 2"/><text x="315" y="52" fill="#ff9a9a">5?</text>
+      </g>
+      <!-- buffer -->
+      <rect x="40" y="86" width="300" height="40" rx="8" fill="#15233f" stroke="#294067"/>
+      <text x="190" y="110" text-anchor="middle">jitter-buffer — sorteert op volgnummer</text>
+      <g stroke="#566187" stroke-width="1.5" fill="none" marker-end="url(#aj)">
+        <path d="M55 60 V86"/><path d="M107 60 V86"/><path d="M191 60 V86"/><path d="M229 60 V86"/>
+      </g>
+      <!-- steady playout -->
+      <text x="560" y="22" text-anchor="middle" class="mut">weergave — gelijkmatig, op volgorde</text>
+      <g font-size="12" text-anchor="middle">
+        <rect x="430" y="34" width="30" height="26" rx="4" fill="#1c3a2a" stroke="#2e6a48"/><text x="445" y="52">1</text>
+        <rect x="468" y="34" width="30" height="26" rx="4" fill="#1c3a2a" stroke="#2e6a48"/><text x="483" y="52">2</text>
+        <rect x="506" y="34" width="30" height="26" rx="4" fill="#1c3a2a" stroke="#2e6a48"/><text x="521" y="52">3</text>
+        <rect x="544" y="34" width="30" height="26" rx="4" fill="#1c3a2a" stroke="#2e6a48"/><text x="559" y="52">4</text>
+        <rect x="582" y="34" width="30" height="26" rx="4" fill="#2e2415" stroke="#ffb454"/><text x="597" y="52">~5</text>
+      </g>
+      <path d="M340 106 C400 106 410 47 430 47" stroke="#3ddc97" stroke-width="2" fill="none" marker-end="url(#aj2)"/>
+      <text x="597" y="80" text-anchor="middle" class="mut" font-size="11">5 mist → kort</text>
+      <text x="597" y="94" text-anchor="middle" class="mut" font-size="11">opgevuld</text>
+      <text x="190" y="160" text-anchor="middle" class="mut">zo klein mogelijk gehouden — elke extra plek is extra vertraging</text>
+      <defs>
+        <marker id="aj" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#566187"/></marker>
+        <marker id="aj2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#3ddc97"/></marker>
+      </defs>
+    </svg>
+    <div class="cap">Figuur 5 — Pakketten komen ongelijk en soms verwisseld binnen (4 vóór 3). De
+    buffer sorteert ze op volgnummer en geeft ze gelijkmatig door. Mist er één, dan vult de codec dat
+    gaatje kort op in plaats van te stoppen.</div>
+  </div>
+
+  <p>Hier zit precies de afweging uit het begin: een <b>diepere</b> buffer is gladder maar trager;
+  een <b>ondiepe</b> buffer is sneller maar gevoeliger voor uitval. ThetisLink houdt de buffer
+  daarom <b>zo klein mogelijk</b> en past de diepte <b>automatisch</b> aan: meet hij weinig jitter,
+  dan krimpt de buffer (minder vertraging); wordt het netwerk grillig, dan groeit hij net genoeg om
+  haperingen te voorkomen.</p>
+
+  <div class="tl"><b>In ThetisLink.</b> De buffer meet de jitter continu (een voortschrijdend
+  gemiddelde, met een snelle reactie op pieken) en mikt op de kleinste diepte die nog vloeiend
+  speelt — doorgaans maar een paar frames, dus enkele tientallen milliseconden. Een verloren pakketje
+  vult Opus kort op door het gat te overbruggen (PLC); op de spraak-RX, waar FEC aanstaat, kan een deel
+  zelfs écht hersteld worden. Raakt de buffer toch leeg, dan wordt heel even gepauzeerd en bijgevuld in
+  plaats van te gaan stotteren.</div>
+</section>
+
+<section id="spectrum">
+  <h2>8. Het spectrum over de lijn</h2>
+  <p>Het spectrum- en watervalbeeld is een rij <b>bins</b> (zie het VRX-document): per bin een
+  waarde die zegt hoeveel energie daar zit. Zo'n rij kan groot zijn — duizenden tot tienduizenden
+  bins. Die elke keer volledig en op volle precisie sturen zou veel bandbreedte kosten, dus hier
+  speelt de tweede prioriteit: <b>bandbreedte</b>.</p>
+  <p>Twee knoppen houden dat in toom:</p>
+  <ul>
+    <li><b>Hoeveel bytes per bin.</b> De huidige server stuurt <b>1 byte</b> per bin (256 niveaus) —
+    ruim genoeg voor een vloeiend beeld. Het protocol kan ook 2 bytes per bin beschrijven voor meer
+    dynamiek, maar dat is voor de toekomst gereserveerd.</li>
+    <li><b>Hoe vaak per seconde.</b> Het beeld wordt standaard zo'n <b>15 keer per seconde</b>
+    ververst; dat is instelbaar (rustiger = minder data, sneller = vloeiender).</li>
+  </ul>
+  <p>In elk spectrumpakket zitten naast de bins ook de <b>middenfrequentie</b>, de <b>breedte</b>
+  (span) en een referentieniveau, zodat de client het beeld op de juiste plek en schaal kan tekenen.
+  En net als bij audio heeft elke bron — RX1, RX2, VRX1, VRX2 — zijn eigen pakkettype.</p>
+
+  <div class="tl"><b>In ThetisLink.</b> Het zoomen en pannen gebeurt grotendeels <b>op de server</b>:
+  de client vraagt &ldquo;ik wil dít stukje, op deze resolutie&rdquo;, en de server stuurt alleen dat
+  uitgesneden stuk in plaats van altijd het hele brede beeld. Dat scheelt fors in data zonder dat je
+  detail inlevert waar je naar kijkt.</div>
+</section>
+
+<section id="smeter">
+  <h2>9. De S-meter</h2>
+  <p>De signaalsterkte komt langs <b>drie</b> verschillende wegen binnen, afhankelijk van de bron:</p>
+  <ul>
+    <li><b>Hoofdontvanger (RX1/RX2):</b> de server stuurt een kant-en-klare waarde — het vermogen in
+    <b>dBm</b> — in een compact pakketje van een paar bytes. Afhankelijk van de gekozen meterbron is
+    dat een gemiddelde of piek uit Thetis, of een uit de spectrum-bins afgeleide waarde.</li>
+    <li><b>VRX-kanalen:</b> hiervoor stuurt de server <i>geen</i> aparte S-meter. De <b>client</b>
+    rekent de sterkte zelf uit het ontvangen spectrum: hij telt het vermogen van de bins binnen de
+    doorlaatband op en zet dat met een vaste ijk-correctie om naar dBm (zie het VRX-document,
+    hoofdstuk over de S-meter).</li>
+    <li><b>Yaesu-radio:</b> de meterwaarde zit ingebakken in de statusberichten van de radio en komt
+    rechtstreeks via CAT uit het toestel (een eigen schaal, geen dBm).</li>
+  </ul>
+  <p>De <b>schaal</b> (de vertrouwde S-units: S9 = −73 dBm, elke S-unit 6 dB) wordt altijd in de
+  <b>client</b> getekend. De server levert het rauwe getal; de client maakt er de naald van.</p>
+  <div class="tl"><b>In ThetisLink.</b> Wie de waarde berekent verschilt dus per bron, maar het
+  <i>tekenen</i> van de S-meter is overal in de client gelijk — zo ziet elke meter er hetzelfde uit.</div>
+</section>
+
+<section id="knoppen">
+  <h2>10. Instellingen en knoppen</h2>
+  <p>Draai je aan de afstemknop of kies je een mode, dan stuurt de client een klein
+  <b>opdracht-pakketje</b>: meestal niet meer dan een <b>identificatie</b> (&ldquo;dit is het
+  volume&rdquo;, &ldquo;dit is de mode&rdquo;, &ldquo;dit is de filterbreedte&rdquo;) plus een
+  <b>waarde</b>. Frequentie en mode hebben zelfs hun eigen pakkettype. Dat is alles — een paar bytes,
+  meteen verstuurd.</p>
+  <p>Zoals in hoofdstuk 2 al bleek: er komt geen aparte bevestiging terug. In plaats daarvan
+  <b>meldt de server voortdurend de actuele stand</b> terug. Die teruggemelde waarde is je
+  bevestiging: zie je de frequentie meeveranderen, dan is de opdracht aangekomen. Zo blijft de client
+  altijd in sync met wat de radio écht doet, ook als iemand aan de radio zelf draait.</p>
+
+  <div class="q"><b>Vraagt de client bij verbinden de hele stand op?</b> Nee. Er is geen grote
+  &ldquo;geef-mij-alles&rdquo;-uitwisseling. De server zendt zijn toestand toch al doorlopend uit, dus
+  binnen een seconde na verbinden heeft de client vanzelf de frequentie, mode, S-meter, spectrum en
+  apparaatstatus binnen.</div>
+
+  <div class="tl"><b>In ThetisLink.</b> Opdrachten zijn &ldquo;afvuren-en-vergeten&rdquo; (één id +
+  waarde). De teruggemelde stand dient als bevestiging; klopt die na een druk niet, dan kan de client
+  het zonder ophef opnieuw sturen.</div>
+</section>
+
+<section id="ptt">
+  <h2>11. De zendknop (PTT)</h2>
+  <p>De zendknop is het meest tijdkritische signaal van allemaal — hier telt elke milliseconde. Daarom
+  is er geen apart, traag knopbericht. In plaats daarvan zet de client een <b>vlag</b> in de
+  TX-audiopakketten: zodra je de knop indrukt, dragen je uitgaande audiopakketjes het PTT-vlaggetje,
+  en de server schakelt de radio naar zenden. Het indrukken en je spraak reizen zo in <b>één en
+  dezelfde stroom</b> mee — niets dat op elkaar hoeft te wachten.</p>
+  <p>Omdat meerdere clients tegelijk verbonden kunnen zijn, bewaakt de server dat er maar <b>één
+  tegelijk</b> zendt. Wil een tweede client zenden terwijl de eerste al bezig is, dan krijgt die een
+  kort &ldquo;geweigerd&rdquo;-bericht terug in plaats van dat ze door elkaar gaan praten.</p>
+
+  <h3>Veiligheid: de zender blijft niet ongewild aan staan</h3>
+  <p>Bij <b>remote</b> bediening is dit cruciaal: een zender die per ongeluk blijft
+  &ldquo;hangen&rdquo; (blijft zenden) is gevaarlijk — voor je apparatuur, voor de band en voor je
+  vergunning. Daarom is de zendknop bewust <b>geen aan/uit-grendel</b>, maar een vlag die de client
+  zo'n <b>50× per seconde</b> opnieuw meestuurt en bevestigt. De zender blijft dus alléén aan zolang
+  die stroom van &ldquo;PTT-aan&rdquo;-pakketjes blijft binnenkomen.</p>
+  <p>Valt de verbinding weg terwijl je zendt — wifi hapert, de laptop valt in slaap, de app crasht —
+  dan stopt die stroom vanzelf, en grijpen twee onafhankelijke vangnetten in:</p>
+  <ul>
+    <li><b>Pakket-timeout (~0,5 s):</b> komen er een halve seconde lang geen pakketten meer binnen,
+    dan laat de server de zender automatisch los.</li>
+    <li><b>Heartbeat-timeout (~2 s):</b> blijft ook de &ldquo;hartslag&rdquo; die de verbinding levend
+    houdt langer dan twee seconden weg, dan beschouwt de server de verbinding als verbroken — PTT los,
+    plus een alarm.</li>
+  </ul>
+  <p>Het ergste wat een netwerkstoring dus kan doen, is je zender binnen een fractie van een seconde
+  tot hooguit twee seconden terugzetten naar ontvangst — nooit eindeloos laten doorzenden. Dat is het
+  klassieke <b>dodemansknop</b>-principe (dead-man's switch).</p>
+
+  <div class="tl"><b>In ThetisLink.</b> Voor de <b>Thetis</b>-zender is PTT een vlag in de
+  TX-audiopakketten, geen losse handshake. De server regelt de exclusiviteit (één zender tegelijk) en
+  meldt een botsing met een PTT-geweigerd-bericht; tijdens zenden wisselt ook de S-meter van
+  ontvangst-sterkte (dBm) naar uitgangsvermogen (watt). Twee veiligheidstimers vangen een wegvallende
+  verbinding op: na ~500 ms zonder pakketten, of ~2 s zonder heartbeat, valt TX automatisch terug naar
+  RX (met alarm). Voor een aangesloten <b>Yaesu</b>-radio loopt de zendknop niet via de audiovlag maar
+  als losse opdracht, die de server als CAT-commando naar het toestel stuurt.</div>
+</section>
+
+<section id="auth">
+  <h2>12. Verbinden en beveiligen</h2>
+  <p>Bij het verbinden wisselen client en server eerst kort uit <b>wat ze allebei kunnen</b>. De
+  client vertelt welke mogelijkheden hij ondersteunt (breedband-audio, spectrum, een tweede
+  ontvanger…), de server antwoordt met de <b>doorsnede</b>: alleen wat ze allebei aankunnen wordt
+  gebruikt. Zo zet een nieuwere kant zijn extra's vanzelf uit tegenover een oudere — <i>binnen dezelfde
+  protocolversie</i>. Een heel andere protocolversie wordt wél geweigerd; server en clients moeten dan
+  samen worden bijgewerkt.</p>
+  <p>Staat de server open op internet, dan kun je een <b>wachtwoord</b> instellen. Het wachtwoord
+  zelf gaat nooit over de lijn: de server stuurt een willekeurige &ldquo;uitdaging&rdquo;, de client
+  beantwoordt die met een berekend antwoord op basis van het wachtwoord (HMAC), en optioneel komt er
+  nog een <b>tijdscode</b> (TOTP, zoals een authenticator-app) overheen.</p>
+  <div class="tl"><b>In ThetisLink.</b> De mogelijkheden-uitwisseling loopt mee in het
+  hartslag-bericht (heartbeat) dat de verbinding ook levend houdt. Authenticatie is optioneel en
+  alleen nodig als de server van buiten bereikbaar is.</div>
+</section>
+
+<section id="latency">
+  <h2>13. Het latency-budget</h2>
+  <p>Tel je alles bij elkaar op, dan zie je waar de vertraging tussen &ldquo;geluid bij de radio&rdquo;
+  en &ldquo;geluid in je koptelefoon&rdquo; vandaan komt:</p>
+  <div class="fig">
+    <svg viewBox="0 0 760 150" role="img" aria-label="Latency-budget">
+      <g font-size="12" text-anchor="middle">
+        <rect x="30"  y="50" width="150" height="44" rx="6" fill="#1f3a5a" stroke="#4ea1ff"/>
+        <text x="105" y="70">Opus-frame</text><text x="105" y="86" class="mut">~20 ms</text>
+        <rect x="196" y="50" width="180" height="44" rx="6" fill="#15233f" stroke="#294067"/>
+        <text x="286" y="70">netwerk (heen)</text><text x="286" y="86" class="mut">afhankelijk van afstand</text>
+        <rect x="392" y="50" width="180" height="44" rx="6" fill="#1c3a2a" stroke="#2e6a48"/>
+        <text x="482" y="70">jitter-buffer</text><text x="482" y="86" class="mut">paar frames, zo klein mogelijk</text>
+        <rect x="588" y="50" width="142" height="44" rx="6" fill="#2e2415" stroke="#ffb454"/>
+        <text x="659" y="70">afspelen</text><text x="659" y="86" class="mut">geluidskaart</text>
+      </g>
+      <g stroke="#4ea1ff" stroke-width="2" fill="none" marker-end="url(#al)">
+        <path d="M180 72 H196"/><path d="M376 72 H392"/><path d="M572 72 H588"/>
+      </g>
+      <text x="380" y="124" text-anchor="middle" class="mut">het netwerk-deel kun je niet wegnemen; al het andere wordt zo klein mogelijk gehouden</text>
+      <defs><marker id="al" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+        <path d="M0,0 L7,3 L0,6 Z" fill="#4ea1ff"/></marker></defs>
+    </svg>
+    <div class="cap">Figuur 6 — De vaste brokjes (één Opus-frame, de jitter-buffer, het afspelen) zijn
+    elk maar enkele tientallen milliseconden. De netwerkreis zelf is het enige stuk dat ThetisLink
+    niet in de hand heeft — daarom is al het overige zo strak mogelijk gehouden.</div>
+  </div>
+  <p>Dit is het <b>netwerk- en codecbudget</b>, vanaf het moment dat de audio klaarstaat om te
+  verzenden. Voor VRX-audio komt daar vóór de Opus-codering nog de <b>channelizer-blokvertraging</b>
+  bij (~16 ms, zie het <a href="VRX-uitleg.html">VRX-document</a>); voor de Yaesu-radio's spelen de
+  USB-CODEC en CAT mee.</p>
+  <p>Dit is waarom de keuzes in dit document zijn zoals ze zijn: UDP in plaats van TCP, korte
+  Opus-frames, een minimale adaptieve buffer, opdrachten zonder trage bevestiging, en de PTT-vlag mee
+  in de audiostroom. Stuk voor stuk dezelfde regel: <b>haal de vertraging weg die je kúnt weghalen.</b></p>
+</section>
+
+<section id="slot">
+  <h2>Tot slot — alles samen</h2>
+  <p>De server pakt het geluid (gecomprimeerd met Opus, in hapjes van 20 ms), het spectrum (bins,
+  compact gecodeerd) en de S-meter in genummerde pakketjes, en stuurt die over één UDP-verbinding op
+  poort 4580 naar de client. Jouw bedieningen reizen als kleine opdracht-pakketjes terug; de server
+  meldt de stand voortdurend, zodat client en radio in sync blijven. Een minimale jitter-buffer maakt
+  van de hobbelige aankomst weer vloeiend geluid, en overal staat hetzelfde voorop: zo min mogelijk
+  vertraging.</p>
+  <p class="lead">Samen met het zusterdocument <a href="VRX-uitleg.html">&ldquo;Hoe een VRX
+  werkt&rdquo;</a> heb je daarmee de hele keten te pakken: van radiogolf, via demodulatie, tot het
+  geluid en beeld op je scherm — waar je ook bent.</p>
+</section>
+
+</main>
+
+<footer>
+  ThetisLink — netwerk-uitleg · educatieve versie. Gemaakt door <b>Chiron van der Burgt (PA3GHM)</b>.
+  Zie ook het <a href="VRX-uitleg.html">VRX-document</a> voor de signaalbewerking.<br>
+  ThetisLink op GitHub: <a href="https://github.com/cjenschede/ThetisLink">github.com/cjenschede/ThetisLink</a>
+</footer>
+
+</body>
+</html>

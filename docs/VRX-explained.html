@@ -1,0 +1,964 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: GPL-2.0-or-later -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How a VRX works — from radio wave to sound</title>
+<style>
+  :root{
+    --bg:#0f1320; --panel:#171c2e; --ink:#e8ecf6; --muted:#9aa6c4;
+    --accent:#4ea1ff; --accent2:#3ddc97; --warn:#ffb454; --line:#2a3350;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:16px/1.65 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+  header{padding:48px 24px 28px;text-align:center;
+    background:radial-gradient(900px 300px at 50% -40px,#1c2950,transparent),var(--bg);
+    border-bottom:1px solid var(--line)}
+  header h1{margin:0 0 8px;font-size:30px;letter-spacing:.2px}
+  header p{margin:0;color:var(--muted);max-width:720px;margin-inline:auto}
+  main{max-width:880px;margin:0 auto;padding:8px 24px 80px}
+  section{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+    padding:22px 26px;margin:26px 0;box-shadow:0 1px 0 #ffffff08 inset}
+  h2{font-size:22px;margin:.2em 0 .5em;color:#fff;border-left:4px solid var(--accent);
+    padding-left:12px}
+  h3{font-size:17px;color:var(--accent2);margin:1.2em 0 .3em}
+  p{margin:.6em 0}
+  .lead{color:var(--muted)}
+  a{color:var(--accent)}
+  ul{margin:.5em 0 .5em 0}
+  code{background:#0c1020;border:1px solid var(--line);border-radius:5px;padding:1px 6px;
+    font:14px/1.4 "SFMono-Regular",Consolas,monospace;color:#cfe0ff}
+  .fig{margin:18px 0;text-align:center}
+  .fig svg{max-width:100%;height:auto;background:#0c1020;border:1px solid var(--line);
+    border-radius:10px}
+  .cap{color:var(--muted);font-size:13.5px;margin-top:6px;font-style:italic}
+  .analogy{background:#15233f;border:1px solid #294067;border-left:4px solid var(--accent);
+    border-radius:10px;padding:12px 16px;margin:16px 0}
+  .analogy b{color:#bcd6ff}
+  .tl{background:#13261c;border:1px solid #235038;border-left:4px solid var(--accent2);
+    border-radius:10px;padding:12px 16px;margin:16px 0;font-size:15px}
+  .tl b{color:#8ff0c0}
+  .q{background:#2a2238;border:1px solid #4a3a63;border-left:4px solid #b98bff;
+    border-radius:10px;padding:12px 16px;margin:16px 0}
+  .q b{color:#d6bcff}
+  details{background:#0c1020;border:1px solid var(--line);border-radius:10px;
+    padding:4px 16px;margin:16px 0}
+  summary{cursor:pointer;color:var(--accent);font-weight:600;padding:8px 0;list-style:revert}
+  summary:hover{color:#7bbcff}
+  details[open] summary{margin-bottom:4px}
+  .formula{font:15px/2 "SFMono-Regular",Consolas,monospace;color:#cfe0ff;
+    background:#0c1020;border:1px solid var(--line);border-radius:8px;padding:12px 16px;
+    margin:12px 0;overflow-x:auto;text-align:center}
+  .formula .lbl{color:var(--muted);font-style:italic}
+  table.spec{width:100%;border-collapse:collapse;margin:14px 0;font-size:14.5px}
+  table.spec th,table.spec td{border:1px solid var(--line);padding:7px 10px;text-align:left;
+    vertical-align:top}
+  table.spec th{background:#1b2236;color:#cfe0ff}
+  table.spec td:first-child{color:var(--muted);white-space:nowrap}
+  .toc{columns:2;column-gap:30px;color:var(--muted);font-size:15px}
+  .toc a{display:block;padding:3px 0;text-decoration:none;color:var(--muted)}
+  .toc a:hover{color:var(--accent)}
+  svg text{font:13px sans-serif;fill:var(--ink)}
+  svg .mut{fill:var(--muted);font-size:12px}
+  footer{color:var(--muted);text-align:center;font-size:13px;padding:30px 24px 60px}
+  @media(max-width:620px){.toc{columns:1}}
+</style>
+</head>
+<body>
+<header>
+  <h1>How a VRX works</h1>
+  <p>From a wide &ldquo;photo&rdquo; of the band to the sound in your headphones —
+  an explanation in plain language for those without a DSP background. With pictures.</p>
+  <p style="margin-top:10px;font-size:14px"><a href="VRX-uitleg.html">Nederlands</a> &nbsp;·&nbsp; <b>English</b></p>
+</header>
+
+<main>
+
+<section id="intro">
+  <h2>The big idea</h2>
+  <p class="lead">A <b>VRX</b> (virtual receiver) turns
+  one wide stream of radio data into, in principle, as many independent receivers as you like. The SDR digitises
+  an entire band in one go. The server holds on to that wide stream and &ldquo;cuts&rdquo; out a narrow
+  slice of its own for each listener — each on its own frequency, mode and bandwidth.
+  Nobody gets in anybody else's way.</p>
+
+  <div class="analogy"><b>Analogy.</b> Picture a satellite photo of an entire city.
+  One shot, but a hundred people can zoom in on it at the same time, each on their own street.
+  The VRX does that with radio spectrum instead of a photo.</div>
+
+  <div class="fig">
+    <svg viewBox="0 0 840 150" role="img" aria-label="Chain overview">
+      <g font-size="12" text-anchor="middle">
+        <rect x="10"  y="50" width="92" height="48" rx="7" fill="#1d2742" stroke="#3a4a73"/>
+        <text x="56" y="71">Wide IQ</text><text x="56" y="87" class="mut">from the SDR</text>
+        <rect x="126" y="50" width="92" height="48" rx="7" fill="#1d2742" stroke="#3a4a73"/>
+        <text x="172" y="71">FFT</text><text x="172" y="87" class="mut">&rarr; frequencies</text>
+        <rect x="242" y="50" width="100" height="48" rx="7" fill="#23314f" stroke="#3a4a73"/>
+        <text x="292" y="71">channel</text><text x="292" y="87" class="mut">select+filter</text>
+        <rect x="366" y="50" width="92" height="48" rx="7" fill="#1d2742" stroke="#3a4a73"/>
+        <text x="412" y="71">iFFT</text><text x="412" y="87" class="mut">&rarr; time</text>
+        <rect x="482" y="50" width="92" height="48" rx="7" fill="#23314f" stroke="#3a4a73"/>
+        <text x="528" y="71">fine-tune</text><text x="528" y="87" class="mut">(NCO)</text>
+        <rect x="598" y="50" width="100" height="48" rx="7" fill="#1d2742" stroke="#3a4a73"/>
+        <text x="648" y="71">demod +</text><text x="648" y="87" class="mut">volume (AGC)</text>
+        <rect x="722" y="50" width="106" height="48" rx="7" fill="#1c3a2a" stroke="#2e6a48"/>
+        <text x="775" y="71">sound</text><text x="775" y="87" class="mut">&rarr; client</text>
+      </g>
+      <g stroke="#4ea1ff" stroke-width="2" fill="none" marker-end="url(#ar)">
+        <path d="M102 74 H126"/><path d="M218 74 H242"/><path d="M342 74 H366"/>
+        <path d="M458 74 H482"/><path d="M574 74 H598"/><path d="M698 74 H722"/>
+      </g>
+      <defs><marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+        <path d="M0,0 L7,3 L0,6 Z" fill="#4ea1ff"/></marker></defs>
+    </svg>
+    <div class="cap">Figure 1 — The whole chain at a glance. Each block is explained below.</div>
+  </div>
+</section>
+
+<section id="toc">
+  <h2>Contents</h2>
+  <nav class="toc">
+    <a href="#iq">1. From radio wave to numbers (IQ)</a>
+    <a href="#wide">2. The wide, unfiltered signal</a>
+    <a href="#fft">3. The FFT — time becomes frequency</a>
+    <a href="#bins">4. The spectrum in small slices (bins)</a>
+    <a href="#window">5. Windowing — softening the edges</a>
+    <a href="#complex">6. One complex FFT (I and Q)</a>
+    <a href="#pick">7. You only want a small slice</a>
+    <a href="#ifft">8. The iFFT — back to sound</a>
+    <a href="#practice">9. In practice: fixed rate + zeros = filter</a>
+    <a href="#nco">10. Fine-tuning below the bin (NCO)</a>
+    <a href="#demod">11. Demodulation per mode</a>
+    <a href="#agc">12. AGC — automatic volume</a>
+    <a href="#rate">13. Narrowband vs wideband (8 / 16 kHz)</a>
+    <a href="#ola">14. Overlap-add — seamless sound</a>
+    <a href="#spectrum">15. The spectrum/waterfall display</a>
+    <a href="#smeter">16. Signal strength — the S-meter</a>
+    <a href="#why">17. Why this is so powerful</a>
+    <a href="#filter">18. Filter properties in detail</a>
+  </nav>
+</section>
+
+<section id="iq">
+  <h2>1. From radio wave to numbers (IQ)</h2>
+  <p>A modern SDR (Software Defined Radio) converts a wide chunk of the band directly into
+  numbers. At each moment it measures two values, called <b>I</b> and <b>Q</b>. Together these describe
+  not only <i>how strong</i> the signal is, but also its <i>phase</i> — and it is precisely that phase
+  we will need later on to recognise frequencies and modulation.</p>
+  <div class="analogy"><b>Analogy.</b> I and Q are like the x and y position of a hand on a clock.
+  One number (strength only) tells you how long the hand is; two numbers (I and Q) also tell you
+  <i>which</i> way it points. That direction (phase) is half the story.</div>
+</section>
+
+<section id="wide">
+  <h2>2. The wide, unfiltered signal</h2>
+  <p>It starts with an <b>unfiltered time signal</b>, and that is <b>wide</b> — in our case up to
+  as much as <b>1.536 MHz</b> wide. That is a fast stream of I/Q pairs (well over one and a half million per
+  second) containing <i>everything</i> there is to hear on that piece of band: all stations jumbled together, strong
+  and weak, next to and on top of each other. At this point nothing has been filtered out yet; it is the complete,
+  wide &ldquo;photo&rdquo; of the band.</p>
+  <p>Our goal: to later pull out one narrow radio channel from this (for example an SSB signal of 3 kHz),
+  neatly filtered, ready to listen to. To do that we first need to know <i>where</i> the
+  frequencies are — and that is exactly what the FFT does.</p>
+</section>
+
+<section id="fft">
+  <h2>3. The FFT — time becomes frequency</h2>
+  <p>The wide signal is a course over <b>time</b>. But we want to know <i>which frequencies</i>
+  are in it — where the stations are. To do that, the whole signal goes through an <b>FFT</b>, which converts the
+  time domain into the frequency domain (exactly the picture of a spectrum analyser).</p>
+
+  <p><b>FFT</b> stands for <b>Fast Fourier Transform</b>. Fourier is
+  a mathematical way to convert from the time domain to the frequency domain. It is a
+  <b>conversion to a different presentation</b>: the same information, displayed differently. Nothing is
+  lost and nothing is added — the signal &ldquo;in time&rdquo; and the same signal
+  &ldquo;in frequency&rdquo; contain exactly the same information.</p>
+
+  <p>Because this is a mathematical computation model, the conversion costs some <b>computation time</b>, and you first
+  need a whole block of samples before you can compute. That is the practical limitation: it costs a
+  little bit of <b>delay</b> (latency).</p>
+
+  <div class="analogy"><b>Analogy.</b> A <b>prism</b> splits white light into a rainbow of
+  colours. The FFT is the prism for radio: it splits the signal into all its frequencies. The light
+  before and after the prism is the same light — just presented differently.</div>
+
+  <h3>One and the same signal — in time and in frequency</h3>
+  <p>A few familiar signals, on the left as they look in time, on the right how those same signals
+  look in the frequency domain:</p>
+
+  <div class="fig">
+    <svg viewBox="0 0 760 380" role="img" aria-label="Time versus frequency for five signals">
+      <text x="215" y="22" text-anchor="middle">in time</text>
+      <text x="575" y="22" text-anchor="middle">in frequency</text>
+      <line x1="395" y1="34" x2="395" y2="366" stroke="#2a3350"/>
+      <g stroke="#2a3350" stroke-dasharray="2 4">
+        <line x1="70" y1="65"  x2="360" y2="65"/>  <line x1="430" y1="80"  x2="720" y2="80"/>
+        <line x1="70" y1="125" x2="360" y2="125"/> <line x1="430" y1="140" x2="720" y2="140"/>
+        <line x1="70" y1="185" x2="360" y2="185"/> <line x1="430" y1="200" x2="720" y2="200"/>
+        <line x1="70" y1="245" x2="360" y2="245"/> <line x1="430" y1="260" x2="720" y2="260"/>
+        <line x1="70" y1="305" x2="360" y2="305"/> <line x1="430" y1="320" x2="720" y2="320"/>
+      </g>
+      <g class="mut" text-anchor="start">
+        <text x="14" y="69">sine</text><text x="14" y="129">step</text>
+        <text x="14" y="189">square</text><text x="14" y="249">impulse</text>
+        <text x="14" y="309">sawtooth</text>
+      </g>
+      <!-- sine -->
+      <path d="M70 65 q18 -22 36 0 q18 22 36 0 q18 -22 36 0 q18 22 36 0 q18 -22 36 0 q18 22 36 0 q18 -22 36 0 q18 22 36 0"
+        fill="none" stroke="#4ea1ff" stroke-width="2"/>
+      <rect x="560" y="48" width="10" height="32" fill="#3ddc97"/>
+      <text x="565" y="44" text-anchor="middle" class="mut">1 frequency</text>
+      <!-- step -->
+      <path d="M70 135 H210 V108 H360" fill="none" stroke="#4ea1ff" stroke-width="2"/>
+      <g fill="#3ddc97"><rect x="432" y="104" width="9" height="36"/><rect x="444" y="120" width="9" height="20"/>
+        <rect x="456" y="128" width="9" height="12"/><rect x="468" y="132" width="9" height="8"/>
+        <rect x="480" y="135" width="9" height="5"/></g>
+      <text x="470" y="98" text-anchor="middle" class="mut">lots low, falling off fast</text>
+      <!-- block / square -->
+      <path d="M70 200 V170 H106 V200 H142 V170 H178 V200 H214 V170 H250 V200 H286 V170 H322 V200 H358"
+        fill="none" stroke="#4ea1ff" stroke-width="2"/>
+      <g fill="#3ddc97"><rect x="440" y="166" width="10" height="34"/><rect x="486" y="180" width="10" height="20"/>
+        <rect x="532" y="188" width="10" height="12"/><rect x="578" y="192" width="10" height="8"/>
+        <rect x="624" y="195" width="10" height="5"/></g>
+      <text x="540" y="160" text-anchor="middle" class="mut">fundamental + odd harmonics</text>
+      <!-- impulse -->
+      <line x1="70" y1="245" x2="360" y2="245" stroke="#4ea1ff" stroke-width="2"/>
+      <line x1="200" y1="245" x2="200" y2="218" stroke="#4ea1ff" stroke-width="2.5"/>
+      <g fill="#3ddc97"><rect x="436" y="247" width="9" height="13"/><rect x="468" y="247" width="9" height="13"/>
+        <rect x="500" y="247" width="9" height="13"/><rect x="532" y="247" width="9" height="13"/>
+        <rect x="564" y="247" width="9" height="13"/><rect x="596" y="247" width="9" height="13"/>
+        <rect x="628" y="247" width="9" height="13"/><rect x="660" y="247" width="9" height="13"/></g>
+      <text x="552" y="240" text-anchor="middle" class="mut">all frequencies equally strong (flat)</text>
+      <!-- sawtooth -->
+      <path d="M70 305 L106 282 V305 L142 282 V305 L178 282 V305 L214 282 V305 L250 282 V305 L286 282 V305 L322 282 V305 L358 282"
+        fill="none" stroke="#4ea1ff" stroke-width="2"/>
+      <g fill="#3ddc97"><rect x="440" y="286" width="10" height="34"/><rect x="470" y="298" width="10" height="22"/>
+        <rect x="500" y="305" width="10" height="15"/><rect x="530" y="309" width="10" height="11"/>
+        <rect x="560" y="312" width="10" height="8"/><rect x="590" y="314" width="10" height="6"/></g>
+      <text x="540" y="280" text-anchor="middle" class="mut">fundamental + <i>all</i> harmonics</text>
+    </svg>
+    <div class="cap">Figure 2 — The same signal, two presentations. A pure sine is one single
+    frequency; a short impulse instead contains <i>all</i> frequencies at once; square and sawtooth are a
+    fundamental plus a series of harmonics.</div>
+  </div>
+  <p>The output of the FFT is a row of <b>bins</b> (slots), each for a narrow frequency range.
+  That is what the next chapter is about.</p>
+
+  <details>
+    <summary>For the enthusiast: the formulas of the FFT and the iFFT</summary>
+    <p>The FFT is a fast way to compute the <b>discrete Fourier transform</b> (DFT). For
+    a block of <code>N</code> complex samples <code>x[0]…x[N&minus;1]</code> the forward path (time &rarr;
+    frequency) is:</p>
+    <div class="formula">
+      X[k] = &Sigma;<sub>n=0</sub><sup>N&minus;1</sup> x[n] &middot; e<sup>&minus;j&middot;2&pi;&middot;k&middot;n / N</sup>
+      &nbsp;&nbsp;<span class="lbl">for k = 0 … N&minus;1</span>
+    </div>
+    <p>and the reverse path (frequency &rarr; time) is almost the same sum, with a plus sign in the exponent and
+    a division by <code>N</code>:</p>
+    <div class="formula">
+      x[n] = (1/N) &middot; &Sigma;<sub>k=0</sub><sup>N&minus;1</sup> X[k] &middot; e<sup>+j&middot;2&pi;&middot;k&middot;n / N</sup>
+    </div>
+    <p>Each <code>X[k]</code> is a complex number (a hand, §1): the <b>length</b> is how much of
+    frequency <code>k</code> is present, the <b>angle</b> is the phase. Bin <code>k</code> belongs to
+    frequency <code>f<sub>k</sub> = k &middot; F<sub>s</sub> / N</code> (with <code>F<sub>s</sub></code>
+    the sample rate); bins above <code>N/2</code> count as negative frequencies (§6).</p>
+    <p>The core is the term <code>e<sup>&minus;j&middot;2&pi;&middot;k&middot;n/N</sup></code> — via Euler
+    <code>e<sup>j&theta;</sup> = cos&theta; + j&middot;sin&theta;</code> that is precisely a rotating
+    hand with speed <code>k</code>. The FFT in effect compares the signal against all those
+    rotation speeds at once and adds up where they &ldquo;keep pace&rdquo;. The <b>fast</b> in FFT is a
+    clever computation scheme that does this in <code>N&middot;log N</code> steps instead of
+    <code>N&sup2;</code> — most efficient when <code>N</code> is a power of 2 (§8).</p>
+    <p class="lead">In this chain the forward FFT runs at the wide block size <code>N<sub>fft</sub></code>
+    (after multiplication with the Hann window, §5); after selecting/zeroing bins (§7, §9) the
+    reverse iFFT runs at the smaller size <code>N<sub>ifft</sub></code> (128 or 256).</p>
+    <p class="lead">One warning if you put this next to the source code: the textbook iFFT above
+    divides by <code>N</code>, but the implementation scales by a fixed factor
+    <code>1/N<sub>fft</sub></code> (not <code>1/N<sub>ifft</sub></code>). The final level
+    is set by the AGC anyway, so that exact scale factor is not critical — but do not blindly
+    assume <code>1/N</code> for it.</p>
+  </details>
+</section>
+
+<section id="bins">
+  <h2>4. The spectrum in small slices (bins)</h2>
+  <p>Because we will later want to filter <b>sharply</b>, we chop the whole wide band into very
+  small frequency slices. Each slice is called a <b>bin</b>. In our case one bin is <b>62.5 Hz</b>
+  wide. The smaller the bin, the more sharply we can cut later.</p>
+
+  <p>The bin size follows directly from the FFT size: <code>bin = bandwidth / number&nbsp;of&nbsp;FFT&nbsp;points</code>.
+  To get that 62.5 Hz over a band of 1.536 MHz, we therefore need:</p>
+
+  <div class="fig">
+    <svg viewBox="0 0 760 84" role="img" aria-label="FFT size calculation">
+      <text x="380" y="40" text-anchor="middle" font-size="18" fill="#cfe0ff">
+        1,536,000 Hz &divide; 62.5 Hz = 24,576 FFT points</text>
+      <text x="380" y="66" text-anchor="middle" class="mut">&rarr; a large FFT (&approx; 24,576 bins)</text>
+    </svg>
+  </div>
+
+  <p>That is therefore a <b>large</b> FFT. (With a narrower band — for example 384 kHz — it is
+  correspondingly smaller: 384,000 / 62.5 = 6,144 points.) The bin size deliberately always stays 62.5 Hz, regardless of the
+  bandwidth, so that the rest of the arithmetic stays simple and consistent.</p>
+
+  <div class="fig">
+    <svg viewBox="0 0 760 150" role="img" aria-label="Bins and bin width">
+      <line x1="40" y1="110" x2="720" y2="110" stroke="#26304d"/>
+      <g stroke="#26304d">
+        <line x1="40" y1="40" x2="40" y2="110"/>
+        <line x1="92" y1="60" x2="92" y2="110"/><line x1="144" y1="60" x2="144" y2="110"/>
+        <line x1="196" y1="60" x2="196" y2="110"/><line x1="248" y1="60" x2="248" y2="110"/>
+        <line x1="300" y1="60" x2="300" y2="110"/><line x1="352" y1="60" x2="352" y2="110"/>
+        <line x1="404" y1="60" x2="404" y2="110"/><line x1="456" y1="60" x2="456" y2="110"/>
+        <line x1="508" y1="60" x2="508" y2="110"/><line x1="560" y1="60" x2="560" y2="110"/>
+        <line x1="612" y1="60" x2="612" y2="110"/><line x1="664" y1="60" x2="664" y2="110"/>
+        <line x1="716" y1="40" x2="716" y2="110"/>
+      </g>
+      <g fill="#3ddc97" opacity=".85">
+        <rect x="41" y="95" width="50" height="15"/><rect x="93" y="80" width="50" height="30"/>
+        <rect x="145" y="58" width="50" height="52"/><rect x="197" y="78" width="50" height="32"/>
+        <rect x="249" y="98" width="50" height="12"/><rect x="301" y="90" width="50" height="20"/>
+        <rect x="353" y="70" width="50" height="40"/><rect x="405" y="100" width="50" height="10"/>
+        <rect x="457" y="86" width="50" height="24"/><rect x="509" y="96" width="50" height="14"/>
+        <rect x="561" y="64" width="50" height="46"/><rect x="613" y="92" width="50" height="18"/>
+        <rect x="665" y="100" width="50" height="10"/>
+      </g>
+      <g stroke="#ffb454" stroke-width="1.5">
+        <line x1="145" y1="44" x2="195" y2="44"/>
+        <line x1="145" y1="40" x2="145" y2="48"/><line x1="195" y1="40" x2="195" y2="48"/>
+      </g>
+      <text x="170" y="34" text-anchor="middle" fill="#ffb454">1 bin = 62.5 Hz</text>
+      <text x="378" y="135" text-anchor="middle" class="mut">frequency &rarr;</text>
+    </svg>
+    <div class="cap">Figure 3 — The spectrum divided into bins of 62.5 Hz each.</div>
+  </div>
+</section>
+
+<section id="window">
+  <h2>5. Windowing — softening the edges</h2>
+  <p>The FFT works on a block of samples that we cut out hard. As a result, at the
+  <b>start</b> the signal jumps abruptly from <b>0</b> to its first value, and at the <b>end</b> it stops just as
+  abruptly back to 0. Those are two <b>steps</b>.</p>
+  <p>And you already saw in §3 what a step means according to Fourier: a <b>broad spread of
+  harmonics</b> (think of the step and the square in figure 2). Precisely those artificial harmonics —
+  caused by the abrupt edges, not by the signal itself — smear energy across bins that
+  do not belong. That is <b>spectral leakage</b>. The larger the value at which the block starts or
+  ends, the larger the step and the worse the leakage.</p>
+  <p>The solution: multiply the block by a soft curve that smoothly runs <b>to 0</b> at <i>both</i>
+  edges (a <b>Hann</b> window). Then there is no longer an abrupt step at start and
+  end &rarr; far fewer artificial harmonics &rarr; a much cleaner spectrum. (It does not become completely leak-free —
+  the window itself also has a shape — but the leakage drops drastically.)</p>
+  <div class="fig">
+    <svg viewBox="0 0 760 180" role="img" aria-label="Windowing">
+      <text x="190" y="24" text-anchor="middle">hard cut — starts at +1, ends at &minus;1</text>
+      <rect x="60" y="40" width="264" height="64" fill="none" stroke="#ff7a7a" stroke-dasharray="4 3"/>
+      <!-- 0-niveau buiten het blok -->
+      <line x1="40" y1="70" x2="60" y2="70" stroke="#566187" stroke-width="2"/>
+      <line x1="324" y1="70" x2="346" y2="70" stroke="#566187" stroke-width="2"/>
+      <!-- 5,5 golven: start op +1 (piek), eindig op -1 (dal) -->
+      <path d="M60 46 C70 46 74 94 84 94 C94 94 98 46 108 46 C118 46 122 94 132 94 C142 94 146 46 156 46 C166 46 170 94 180 94 C190 94 194 46 204 46 C214 46 218 94 228 94 C238 94 242 46 252 46 C262 46 266 94 276 94 C286 94 290 46 300 46 C310 46 314 94 324 94"
+        fill="none" stroke="#4ea1ff" stroke-width="2"/>
+      <!-- de grote stappen: 0→+1 aan het begin, -1→0 aan het einde -->
+      <line x1="60" y1="70" x2="60" y2="46" stroke="#ffb454" stroke-width="3.5"/>
+      <line x1="324" y1="94" x2="324" y2="70" stroke="#ffb454" stroke-width="3.5"/>
+      <text x="54" y="44" text-anchor="end" class="mut" font-size="11">+1</text>
+      <text x="332" y="98" text-anchor="start" class="mut" font-size="11">&minus;1</text>
+      <text x="60" y="120" text-anchor="middle" fill="#ffb454" font-size="11">big step</text>
+      <text x="324" y="120" text-anchor="middle" fill="#ffb454" font-size="11">big step</text>
+      <text x="190" y="150" text-anchor="middle" class="mut">big steps &rarr; strong harmonics &rarr; leakage</text>
+      <text x="570" y="24" text-anchor="middle">Hann window</text>
+      <!-- Hann-envelope (boven + onder, gestippeld): één zachte bel -->
+      <path d="M440 95 Q568 39 696 95" fill="none" stroke="#3ddc97" stroke-width="1.5" opacity=".8" stroke-dasharray="5 4"/>
+      <path d="M440 95 Q568 151 696 95" fill="none" stroke="#3ddc97" stroke-width="1.5" opacity=".8" stroke-dasharray="5 4"/>
+      <!-- sinus met afzwakkende amplitude: klein → groot → klein -->
+      <path d="M440 95 q16 -8 32 0 q16 22 32 0 q16 -42 32 0 q16 56 32 0 q16 -56 32 0 q16 42 32 0 q16 -22 32 0 q16 8 32 0"
+        fill="none" stroke="#4ea1ff" stroke-width="2"/>
+      <text x="570" y="150" text-anchor="middle" class="mut">&rarr; sharp, no leakage</text>
+    </svg>
+    <div class="cap">Figure 4 — Left: 5.5 waves that start at +1 and end at &minus;1. The block therefore starts
+    with a big step from 0 to +1 and stops with a big step from &minus;1 to 0; big steps =
+    strong harmonics = lots of leakage. Right: the Hann window smoothly tapers <i>both</i> edges to 0
+    &rarr; no abrupt step, far less leakage.</div>
+  </div>
+  <div class="tl"><b>In ThetisLink.</b> Both the audio channelizer and the spectrum display use a
+  Hann window. The audio channelizer overlaps successive blocks by 50% (see §14); the
+  spectrum display overlaps even more (~87.5%, a hop of ⅛ block) for a smoother image. Thanks to that
+  overlap, the tapered edges cost no information.</div>
+</section>
+
+<section id="complex">
+  <h2>6. One complex FFT (I and Q)</h2>
+  <div class="q"><b>Frequently asked question.</b> Does all of this go into one FFT?</div>
+  <p>Our time signal is <b>complex</b>: it consists of I and Q together (<code>I + jQ</code>, §1).
+  That is why we use a <b>complex FFT</b> — which processes I and Q together in one operation.</p>
+  <p>And whether you <i>implement</i> it as two ordinary (real) FFTs — one for I and one for Q —
+  or as one complex FFT, makes <b>no difference</b> to the final result: the outcome is exactly
+  the same, provided you <b>combine</b> the two outcomes correctly (the I outcome plus j × the
+  Q outcome). Only the implementation differs; the complex FFT is simply the natural,
+  compact form for a complex (I/Q) signal.</p>
+  <p>Why we need both I and Q in the first place: only <i>with</i> both can the FFT <b>tell positive and negative
+  frequencies apart</b> — see the frequencies <i>above</i> and <i>below</i> the tuning point
+  separately. With strength only (one real number) the spectrum becomes symmetric and you cannot distinguish left
+  and right of the centre; for an SDR that is useless, because there are
+  different stations there.</p>
+  <div class="analogy"><b>Analogy.</b> With strength only you know how loudly someone shouts, but not
+  whether it comes from the left or the right. With I and Q you hear the difference between left and right — between
+  frequencies above and below the centre.</div>
+</section>
+
+<section id="pick">
+  <h2>7. You only want a small slice</h2>
+  <p>After the FFT we have very many small slices of spectrum (bins). But you are only interested in a <b>very
+  small part</b>: one radio channel. An SSB signal, for example, is about <b>3 kHz</b>
+  wide — that is only a handful of bins (3000 / 62.5 &approx; 48 bins) out of the many thousands.</p>
+  <p>We want to get rid of all the other bins. How we turn those few wanted bins back into audible sound,
+  we'll see now.</p>
+</section>
+
+<section id="ifft">
+  <h2>8. The iFFT — back to sound</h2>
+  <p>You cannot hear frequencies; we have to go back to a signal in <b>time</b>. That is what the
+  <b>inverse FFT</b> (iFFT) does: precisely the reverse operation of the FFT. We take <i>only</i> the bins that
+  we want to hear and put them into an iFFT.</p>
+  <p>The iFFT computes most efficiently when you take a <b>power of 2</b> number of points (32, 64, 128, 256,
+  …). So: take the number of bins you want to hear and round it <b>up to the
+  nearest power of 2</b>. That is the <i>minimal</i> idea; in practice ThetisLink chooses, for
+  practical reasons, a slightly more generous, <b>fixed</b> size — why that is handy you can read in §9.</p>
+  <p>The result is the information of only that slice of frequency, converted back into a
+  time signal — the familiar I/Q signal. Neatly filtered to roughly the band you wanted to hear,
+  and with a <b>much lower sample rate</b> (because we went from millions of bins back to a few
+  hundred). The FFT + iFFT together therefore also immediately do the <b>decimation</b>: bringing the high
+  IQ rate down to a low audio rate.</p>
+  <div class="analogy"><b>Analogy.</b> The FFT takes the rainbow out of the light; the iFFT joins the
+  remaining colours back together into one beam. Because we filtered out almost all the colours, what comes out is
+  a narrow, clean signal: exactly the station you are listening to.</div>
+</section>
+
+<section id="practice">
+  <h2>9. In practice: fixed sample rate + zeros = filter</h2>
+  <p>In practice we do it just a bit differently, for two reasons:</p>
+  <ul>
+    <li>We want a <b>fixed, tidy sample rate</b> that fits nicely with the further audio processing
+    in the computer.</li>
+    <li>We want to be able to <b>vary the bandwidth quickly</b> — for example by dragging the
+    filter edge in the spectrum.</li>
+  </ul>
+  <p>That is why we do not take exactly &ldquo;the bins we want to hear&rdquo;, but a fixed number of bins
+  corresponding to, for example, <b>8 kHz</b>. That is more spectrum than we are interested in, but the
+  sample rate is now <b>fixed</b> at 8 kS/s. (8000 / 62.5 = 128 bins &rarr; an iFFT of 128 points, and
+  that is conveniently a tidy power of 2.)</p>
+  <p>Next, <b>we set zeros in that iFFT</b> on all the frequencies we do not want to hear. What
+  remains is, in time, a signal neatly filtered to ~3 kHz, and at the same time a constant
+  sample rate of 8 kS/s. <b>Setting to zero <i>is</i> therefore the filter</b> — razor-sharp, because we cut
+  exactly on bin boundaries.</p>
+  <p>Want to hear a <b>wider or narrower</b> slice? Then you simply fill in more or fewer zeros in
+  the right place in the iFFT. More bins open = wider passband; more zeros = narrower. That way you change
+  your bandwidth directly, without changing anything about the sample rate.</p>
+  <div class="fig">
+    <svg viewBox="0 0 760 165" role="img" aria-label="Fixed iFFT with zeros as filter">
+      <text x="380" y="22" text-anchor="middle" class="mut">the 128-bin iFFT (= 8 kHz, fixed rate)</text>
+      <line x1="40" y1="125" x2="720" y2="125" stroke="#26304d"/>
+      <rect x="300" y="34" width="160" height="91" fill="#1f3a5a" opacity=".5"/>
+      <text x="380" y="50" text-anchor="middle" fill="#bcd6ff">open (~3 kHz)</text>
+      <g fill="#566187" opacity=".55">
+        <rect x="50" y="117" width="30" height="8"/><rect x="86" y="115" width="30" height="10"/>
+        <rect x="122" y="118" width="30" height="7"/><rect x="158" y="116" width="30" height="9"/>
+        <rect x="194" y="118" width="30" height="7"/><rect x="230" y="117" width="30" height="8"/>
+        <rect x="266" y="115" width="30" height="10"/>
+        <rect x="468" y="117" width="30" height="8"/><rect x="504" y="116" width="30" height="9"/>
+        <rect x="540" y="118" width="30" height="7"/><rect x="576" y="115" width="30" height="10"/>
+        <rect x="612" y="117" width="30" height="8"/><rect x="648" y="118" width="30" height="7"/>
+        <rect x="684" y="116" width="30" height="9"/>
+      </g>
+      <g fill="#3ddc97">
+        <rect x="302" y="74" width="30" height="51"/><rect x="338" y="54" width="30" height="71"/>
+        <rect x="374" y="46" width="30" height="79"/><rect x="410" y="64" width="30" height="61"/>
+      </g>
+      <text x="150" y="150" text-anchor="middle" class="mut">zeroed (gone)</text>
+      <text x="600" y="150" text-anchor="middle" class="mut">zeroed (gone)</text>
+    </svg>
+    <div class="cap">Figure 5 — A fixed iFFT (here 128 bins = 8 kHz). Only the bins within the chosen
+    passband remain; the rest is set to zero. More or fewer zeros = narrower or wider bandwidth.</div>
+  </div>
+  <div class="tl"><b>In ThetisLink.</b> The iFFT is 128 bins in narrowband (= 8 kHz) or 256 bins in
+  wideband (= 16 kHz). You drag the filter edges on the spectrum; the client/server translate that into
+  &ldquo;how many bins open&rdquo; (in steps of 62.5 Hz). SSB keeps one sideband open, AM/FM both.</div>
+</section>
+
+<section id="nco">
+  <h2>10. Fine-tuning below the bin (the NCO)</h2>
+  <p>One problem: bins lie on a fixed grid of 62.5 Hz. But an SSB station is almost never
+  exactly on such a grid point — and 62.5 Hz off, a voice already sounds clearly too high or too low. So we
+  must be able to tune more finely than the bin grid allows.</p>
+  <div class="analogy"><b>Analogy.</b> The bins bring you to the nearest
+  <b>parking space</b> (on 62.5 Hz). But you want to be right at the door. The <b>NCO</b> is the last bit of
+  walking: it shifts the signal that small remainder further (down to a fraction of a Hz).</div>
+  <div class="fig">
+    <svg viewBox="0 0 760 150" role="img" aria-label="NCO fine-tuning">
+      <line x1="40" y1="100" x2="720" y2="100" stroke="#26304d"/>
+      <g stroke="#3a4a73">
+        <line x1="120" y1="90" x2="120" y2="100"/><line x1="240" y1="90" x2="240" y2="100"/>
+        <line x1="360" y1="90" x2="360" y2="100"/><line x1="480" y1="90" x2="480" y2="100"/>
+        <line x1="600" y1="90" x2="600" y2="100"/>
+      </g>
+      <text x="120" y="120" text-anchor="middle" class="mut">bin</text>
+      <text x="360" y="120" text-anchor="middle" class="mut">bin</text>
+      <text x="600" y="120" text-anchor="middle" class="mut">bin</text>
+      <circle cx="360" cy="100" r="6" fill="#566187"/>
+      <text x="360" y="60" text-anchor="middle" class="mut">nearest bin</text>
+      <circle cx="415" cy="100" r="7" fill="#ffb454"/>
+      <text x="430" y="84" fill="#ffb454">desired frequency</text>
+      <path d="M360 100 H408" stroke="#3ddc97" stroke-width="2.5" fill="none" marker-end="url(#ar3)"/>
+      <text x="384" y="138" text-anchor="middle" fill="#3ddc97">NCO shifts this remainder (&le; 31 Hz)</text>
+      <defs><marker id="ar3" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+        <path d="M0,0 L7,3 L0,6 Z" fill="#3ddc97"/></marker></defs>
+    </svg>
+    <div class="cap">Figure 6 — The bin gets you close; the NCO shifts the last remainder (at most half a bin).</div>
+  </div>
+  <p>An NCO (numerically controlled oscillator) is in effect a small, perfectly pure tone that we
+  multiply against our signal. As a result the whole signal shifts by exactly as many Hz as
+  we want — smoothly, without clicks, and with arbitrarily fine precision.</p>
+</section>
+
+<section id="demod">
+  <h2>11. Demodulation — getting sound out of the signal</h2>
+  <p>We now have a clean, narrow I/Q signal on the right frequency. <b>Demodulation</b> extracts
+  the audible sound from it, and that works just a bit differently per mode, because the information
+  is hidden in it differently.</p>
+  <h3>SSB (USB / LSB) — just the real part</h3>
+  <p>With single sideband, the speech is directly in the signal once it has been
+  shifted to zero frequency (that was already done by the bin selection and the NCO). The sound is simply the <b>real part</b>
+  of the signal. Upper (USB) or lower (LSB) sideband you already determined by choosing <i>which</i> bins
+  you kept.</p>
+  <h3>AM — reading the envelope</h3>
+  <p>With AM the information is in the <b>strength</b> (amplitude). We measure the magnitude of the signal —
+  the envelope — and subtract the constant carrier (DC), so that only the speech/music remains.</p>
+  <h3>FM — how fast the phase rotates</h3>
+  <p>With FM the information is in the <b>frequency</b>: the transmitter pushes the frequency back and forth with
+  the sound. Frequency is &ldquo;how fast the phase rotates&rdquo;. We measure from sample to sample
+  how much the phase rotated — that difference <i>is</i> the sound.</p>
+  <div class="fig">
+    <svg viewBox="0 0 760 200" role="img" aria-label="AM and FM demodulation">
+      <text x="190" y="24" text-anchor="middle">AM: read the envelope</text>
+      <path d="M40 110 q6 -28 12 0 q6 38 12 0 q6 -48 12 0 q6 56 12 0 q6 -64 12 0 q6 70 12 0 q6 -74 12 0 q6 78 12 0 q6 -80 12 0 q6 80 12 0 q6 -78 12 0 q6 74 12 0 q6 -70 12 0 q6 64 12 0 q6 -56 12 0 q6 48 12 0 q6 -38 12 0 q6 28 12 0"
+        fill="none" stroke="#4ea1ff" stroke-width="1.6"/>
+      <!-- bovenste omhullende: raakt de pieken van de draaggolf -->
+      <path d="M46 96 C54 92 62 89 70 86 C78 83 86 80 94 78 C102 76 110 74 118 73 C126 71 134 70 142 70 C150 70 158 70 166 71 C174 72 182 73 190 75 C198 77 206 79 214 82 C222 85 230 88 238 91"
+        fill="none" stroke="#ffb454" stroke-width="2.2"/>
+      <!-- onderste omhullende: spiegelbeeld, raakt de dalen -->
+      <path d="M58 129 C66 133 74 135 82 138 C90 141 98 143 106 145 C114 147 122 148 130 149 C138 150 146 150 154 150 C162 150 170 149 178 147 C186 145 194 144 202 142 C210 139 218 137 226 134 C234 131 242 127 250 124"
+        fill="none" stroke="#ffb454" stroke-width="2.2" opacity=".75"/>
+      <text x="190" y="180" text-anchor="middle" class="mut">the orange envelope (top + bottom) touches the peaks — that is the sound</text>
+      <text x="570" y="24" text-anchor="middle">FM: how fast the hand rotates</text>
+      <circle cx="570" cy="105" r="55" fill="none" stroke="#2a3350"/>
+      <line x1="570" y1="105" x2="610" y2="68" stroke="#3ddc97" stroke-width="3"/>
+      <path d="M598 60 a55 55 0 0 1 18 30" fill="none" stroke="#3ddc97" stroke-width="2" marker-end="url(#ar4)"/>
+      <text x="570" y="180" text-anchor="middle" class="mut">fast rotation = high tone, slow = low tone</text>
+      <defs><marker id="ar4" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+        <path d="M0,0 L7,3 L0,6 Z" fill="#3ddc97"/></marker></defs>
+    </svg>
+    <div class="cap">Figure 7 — AM: the sound is the envelope (orange). FM: the sound is how fast the phase hand rotates.</div>
+  </div>
+  <div class="tl"><b>In ThetisLink.</b> Supported: USB, LSB, AM, SAM and FM. SSB = real part,
+  AM = magnitude, FM = phase difference between successive samples. <b>SAM</b> keeps — like AM — both
+  sidebands, but does not read the envelope: it takes the real part (a coherent detector) and
+  subtracts a slowly tracking DC value. That gives less distortion than ordinary AM, provided you are sitting
+  neatly on the carrier (this implementation does not yet have automatic carrier tracking/PLL).</div>
+</section>
+
+<section id="agc">
+  <h2>12. AGC — automatic volume</h2>
+  <p>One station is blasting, another is a whisper. The <b>AGC</b> (automatic gain control) adjusts
+  the volume automatically: weak signals are amplified, strong ones turned down, so that everything comes
+  through at a pleasant, even level in your headphones.</p>
+  <div class="analogy"><b>Analogy.</b> Like a sound engineer at an interview: if someone blasts out loud,
+  you turn down quickly (&ldquo;attack&rdquo;); if it goes quiet, you bring it back up calmly
+  (&ldquo;decay&rdquo;). The AGC does that automatically — here turning down quickly (10 ms) and up
+  slowly (500 ms), so that a short peak does not immediately mute everything.</div>
+</section>
+
+<section id="rate">
+  <h2>13. Narrowband vs wideband (8 or 16 kHz)</h2>
+  <p>The iFFT choice from §9 directly determines the audio sample rate. Two settings:</p>
+  <ul>
+    <li><b>Narrowband — 128 bins = 8 kHz:</b> audio up to ~4 kHz, fine for speech (telephone quality),
+    little data.</li>
+    <li><b>Wideband — 256 bins = 16 kHz:</b> audio up to ~8 kHz, noticeably clearer, ~2× as much data.</li>
+  </ul>
+  <p>The same trade-off as always: quality versus data usage. On a wired network,
+  wideband is almost free; on a tight connection you choose narrowband.</p>
+  <div class="tl"><b>In ThetisLink.</b> One switch in the client puts the RX audio — the
+  Thetis reception and the VRX channels — on narrow- or wideband (reception only; transmitting stays
+  wideband). The latency stays the same; only the amount of data changes.</div>
+</section>
+
+<section id="ola">
+  <h2>14. Overlap-add — seamless sound</h2>
+  <p>We process the signal in little blocks. If you simply stick them end to end, you hear a little click at every
+  seam — especially because the window already tapered the edges (§5). Solution: let each block <b>overlap</b>
+  the previous one by half and add them together. Where one block fades out, the next one
+  comes up — together a smooth, uninterrupted stream.</p>
+  <div class="fig">
+    <svg viewBox="0 0 760 160" role="img" aria-label="Overlap-add">
+      <path d="M40 120 q70 -90 140 0" fill="none" stroke="#4ea1ff" stroke-width="2" opacity=".8"/>
+      <path d="M110 120 q70 -90 140 0" fill="none" stroke="#3ddc97" stroke-width="2" opacity=".8"/>
+      <path d="M180 120 q70 -90 140 0" fill="none" stroke="#4ea1ff" stroke-width="2" opacity=".8"/>
+      <path d="M250 120 q70 -90 140 0" fill="none" stroke="#3ddc97" stroke-width="2" opacity=".8"/>
+      <path d="M320 120 q70 -90 140 0" fill="none" stroke="#4ea1ff" stroke-width="2" opacity=".8"/>
+      <path d="M390 120 q70 -90 140 0" fill="none" stroke="#3ddc97" stroke-width="2" opacity=".8"/>
+      <line x1="40" y1="55" x2="600" y2="55" stroke="#ffb454" stroke-width="2.5" stroke-dasharray="6 4"/>
+      <text x="320" y="44" text-anchor="middle" fill="#ffb454">sum = smooth, constant audio</text>
+      <text x="320" y="148" text-anchor="middle" class="mut">each block overlaps the previous one by 50%</text>
+    </svg>
+    <div class="cap">Figure 8 — Overlapping, tapered little blocks add up to a flat, seamless audio stream.</div>
+  </div>
+</section>
+
+<section id="spectrum">
+  <h2>15. The spectrum and waterfall display</h2>
+  <p>The nice picture in the client — the <b>spectrum</b> (energy per frequency) and the <b>waterfall</b>
+  (the same, scrolling downward over time) — comes from a <i>separate</i>, much higher-resolution FFT.
+  The audio needs small, fast little blocks (low delay); the display instead wants large blocks (sharp
+  resolution). Two different trade-offs, two separate FFTs.</p>
+  <ul>
+    <li><b>dB scale:</b> strength logarithmic, so that a whisper and a cannon shot are both
+    visible at once.</li>
+    <li><b>Peak-hold with decay:</b> peaks jump up immediately and then sink away calmly —
+    calmer on the eye.</li>
+    <li><b>Zoom and pan:</b> zooming in on a slice of band; the display centres around your tuning frequency.</li>
+    <li><b>Dragging filter edges:</b> the translucent bar shows your passband. Drag the edges and you
+    set your bandwidth directly — exactly the open bins from §9.</li>
+  </ul>
+  <div class="analogy"><b>Analogy.</b> The spectrum is a snapshot (a bar chart of
+  &ldquo;how much signal where&rdquo;); the waterfall is a timeline scrolling downward, so that you
+  still see a short beep from seconds ago.</div>
+</section>
+
+<section id="smeter">
+  <h2>16. Signal strength — the S-meter</h2>
+  <p>How strong is a signal? The basis is surprisingly simple: the <b>power</b> (the
+  &ldquo;power&rdquo;) of a complex sample is <code>I² + Q²</code> — the <i>length of the hand
+  squared</i> (think back to the clock analogy from §1). The longer the hand, the stronger the
+  signal.</p>
+
+  <p>For a whole <b>channel</b> you do not measure one sample, but add up the power of <b>all bins
+  within your passband</b> — the fine spectrum bins from §15 (not the coarser audio bins from §9).
+  That sum is the strength
+  of precisely that channel — signal and noise together, within your filter. That is immediately handy: if you set your
+  filter narrower, you measure less noise along with it.</p>
+
+  <div class="fig">
+    <svg viewBox="0 0 760 175" role="img" aria-label="S-meter from passband power">
+      <!-- spectrum left -->
+      <line x1="40" y1="120" x2="300" y2="120" stroke="#26304d"/>
+      <rect x="150" y="40" width="80" height="80" fill="#1f3a5a" opacity=".5"/>
+      <g fill="#566187" opacity=".55">
+        <rect x="48" y="112" width="16" height="8"/><rect x="70" y="110" width="16" height="10"/>
+        <rect x="92" y="113" width="16" height="7"/><rect x="114" y="111" width="16" height="9"/>
+        <rect x="136" y="113" width="16" height="7"/>
+        <rect x="240" y="112" width="16" height="8"/><rect x="262" y="111" width="16" height="9"/>
+        <rect x="284" y="113" width="16" height="7"/>
+      </g>
+      <g fill="#3ddc97">
+        <rect x="152" y="78" width="16" height="42"/><rect x="174" y="58" width="16" height="62"/>
+        <rect x="196" y="66" width="16" height="54"/><rect x="218" y="84" width="16" height="36"/>
+      </g>
+      <text x="190" y="34" text-anchor="middle" class="mut">power of the bins in the band</text>
+      <text x="170" y="142" text-anchor="middle" class="mut">&rarr; add up &rarr; dBm</text>
+      <!-- arrow -->
+      <path d="M312 90 H372" stroke="#4ea1ff" stroke-width="2" fill="none" marker-end="url(#ar5)"/>
+      <!-- s-meter scale right -->
+      <line x1="400" y1="92" x2="712" y2="92" stroke="#9aa6c4" stroke-width="2"/>
+      <g stroke="#9aa6c4">
+        <line x1="410" y1="86" x2="410" y2="98"/><line x1="450" y1="86" x2="450" y2="98"/>
+        <line x1="490" y1="86" x2="490" y2="98"/><line x1="530" y1="86" x2="530" y2="98"/>
+        <line x1="582" y1="82" x2="582" y2="102" stroke="#e8ecf6" stroke-width="2.5"/>
+      </g>
+      <g stroke="#ff7a7a"><line x1="625" y1="86" x2="625" y2="98"/>
+        <line x1="665" y1="86" x2="665" y2="98"/><line x1="705" y1="86" x2="705" y2="98"/></g>
+      <g class="mut" text-anchor="middle" font-size="11">
+        <text x="410" y="116">S1</text><text x="450" y="116">3</text><text x="490" y="116">5</text>
+        <text x="530" y="116">7</text><text x="582" y="116" fill="#e8ecf6">S9</text>
+      </g>
+      <g text-anchor="middle" font-size="11" fill="#ff9a9a">
+        <text x="625" y="116">+20</text><text x="665" y="116">+40</text><text x="705" y="116">+60</text>
+      </g>
+      <polygon points="560,70 568,82 552,82" fill="#ffb454"/>
+      <text x="582" y="48" text-anchor="middle" class="mut">S9 = &minus;73 dBm</text>
+      <defs><marker id="ar5" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+        <path d="M0,0 L7,3 L0,6 Z" fill="#4ea1ff"/></marker></defs>
+    </svg>
+    <div class="cap">Figure 9 — The strength of a channel = the summed power of the bins in the
+    passband, converted to dBm and plotted on the familiar S scale.</div>
+  </div>
+
+  <p>Because signals span an <b>enormous</b> range (from a whisper just above the
+  noise to a deafening station), we use — just as with sound — a <b>logarithmic</b> scale: dB,
+  and in this case <b>dBm</b> (power relative to 1 milliwatt). Radio amateurs read this off as
+  <b>S-units</b>: on HF, <code>S9 = &minus;73 dBm</code>, and each S-unit lower is 6 dB weaker. Above S9
+  one counts further in dB (&ldquo;S9 + 20 dB&rdquo;).</p>
+
+  <p>One more thing: the FFT gives a <b>relative</b> power (a number without an absolute unit). To
+  turn that into a real <b>dBm</b>, the scale must be <b>calibrated</b>. That is done with a
+  fixed <b>calibration offset</b>, so that the displayed value matches the actual
+  signal strength. And to prevent the meter from twitching nervously, the value is <b>averaged</b>
+  (and/or the peak held briefly) — just like the slow mechanism of an old-fashioned needle S-meter.</p>
+
+  <div class="tl"><b>In ThetisLink.</b> For the VRX channels, the <b>client itself</b> computes the S-meter:
+  it integrates the power of the received spectrum bins within the passband, converts that with
+  a fixed (empirically calibrated) offset to dBm, and applies meter ballistics — fast attack, slow
+  decay, plus a short peak-hold. The ordinary main RX (RX1/RX2) has its own route: there the
+  server delivers a ready-made value.</div>
+</section>
+
+<section id="why">
+  <h2>17. Why this is so powerful — one FFT, many receivers</h2>
+  <p>The real advantage of this method becomes apparent as soon as you want to hear <b>many different,
+  independent signals at the same time</b>.</p>
+
+  <p>The <b>classic</b> way: each receiver gets its own <b>expensive high-speed
+  downconverter and filters</b> — physical hardware, anew for each receiver. Ten listeners = ten
+  times that expensive chain. That quickly gets out of hand and scales poorly.</p>
+
+  <p>This method turns it around: you compute the <b>large FFT only once</b> and <b>share</b> it.
+  Each listener pulls their own narrow slice out of it with a <b>small iFFT</b>. And pulling that slice
+  out costs — in proportion to that one large FFT — <b>very little computation</b>. So you do the expensive
+  part once; every extra listener after that is almost free.</p>
+
+  <div class="fig">
+    <svg viewBox="0 0 760 250" role="img" aria-label="One FFT feeds multiple iFFTs">
+      <text x="380" y="22" text-anchor="middle">one large FFT — all bins, shared by everyone</text>
+      <!-- full spectrum area -->
+      <path d="M40 96
+        L60 90 L78 70 L96 92 L116 60 L134 88 L152 84 L172 50 L190 86 L208 80 L228 92
+        L246 66 L266 90 L284 88 L304 74 L324 92 L344 58 L362 90 L382 84 L402 92
+        L422 72 L442 90 L462 86 L482 64 L502 92 L522 88 L542 78 L562 56 L582 90
+        L602 84 L622 92 L642 70 L662 90 L682 86 L702 92 L720 90 L720 96 Z"
+        fill="#1f3a2e" stroke="#3ddc97" stroke-width="1.2"/>
+      <line x1="40" y1="96" x2="720" y2="96" stroke="#26304d"/>
+      <!-- three highlighted sub-bands -->
+      <rect x="104" y="42" width="60" height="54" fill="#4ea1ff" opacity=".28" stroke="#4ea1ff"/>
+      <rect x="316" y="42" width="60" height="54" fill="#3ddc97" opacity=".28" stroke="#3ddc97"/>
+      <rect x="544" y="42" width="60" height="54" fill="#ffb454" opacity=".28" stroke="#ffb454"/>
+      <!-- arrows down -->
+      <g stroke-width="2" fill="none" marker-end="url(#ar6)">
+        <path d="M134 100 V146" stroke="#4ea1ff"/>
+        <path d="M346 100 V146" stroke="#3ddc97"/>
+        <path d="M574 100 V146" stroke="#ffb454"/>
+      </g>
+      <!-- small iFFT boxes -->
+      <g text-anchor="middle" font-size="12">
+        <rect x="100" y="148" width="68" height="34" rx="6" fill="#14213a" stroke="#4ea1ff"/>
+        <text x="134" y="169">small iFFT</text>
+        <rect x="312" y="148" width="68" height="34" rx="6" fill="#13261c" stroke="#3ddc97"/>
+        <text x="346" y="169">small iFFT</text>
+        <rect x="540" y="148" width="68" height="34" rx="6" fill="#2e2415" stroke="#ffb454"/>
+        <text x="574" y="169">small iFFT</text>
+      </g>
+      <!-- arrows to listeners -->
+      <g stroke="#9aa6c4" stroke-width="1.6" fill="none" marker-end="url(#ar7)">
+        <path d="M134 182 V206"/><path d="M346 182 V206"/><path d="M574 182 V206"/>
+      </g>
+      <g text-anchor="middle" class="mut" font-size="12">
+        <text x="134" y="222">listener 1</text><text x="134" y="238">3.630 LSB</text>
+        <text x="346" y="222">listener 2</text><text x="346" y="238">3.700 USB</text>
+        <text x="574" y="222">listener 3</text><text x="574" y="238">3.800 AM</text>
+      </g>
+      <defs>
+        <marker id="ar6" markerWidth="9" markerHeight="9" refX="4" refY="7" orient="auto">
+          <path d="M0,0 L7,0 L3.5,7 Z" fill="#9aa6c4"/></marker>
+        <marker id="ar7" markerWidth="9" markerHeight="9" refX="4" refY="7" orient="auto">
+          <path d="M0,0 L7,0 L3.5,7 Z" fill="#9aa6c4"/></marker>
+      </defs>
+    </svg>
+    <div class="cap">Figure 10 — The principle: compute the large FFT once; after that each
+    listener taps off their slice with their own small, cheap iFFT — each on a different frequency,
+    mode and bandwidth.</div>
+  </div>
+
+  <p>That is why this method <b>scales</b> so well: all the heavy work is in that one large FFT, and <i>every</i>
+  extra listener after that is almost free. Want a hundred people listening in at the same time, each on their own
+  frequency? Then you still compute only one large FFT — not a hundred expensive
+  receive chains. <i>That</i> is the power of this approach.</p>
+  <div class="analogy"><b>Back to the satellite photo.</b> You take that one expensive photo once.
+  Letting a hundred people zoom in on it afterwards costs almost nothing — exactly like one FFT feeding a hundred
+  cheap iFFT cut-outs.</div>
+  <div class="tl"><b>In ThetisLink (TL2).</b> This is the <i>principle</i> that makes the method so powerful
+  with very many simultaneous users. TL2 itself uses it more modestly: there is one VRX per
+  receiver — VRX1 on VFO-A (RX1) and VRX2 on VFO-B (RX2). Multiple clients <i>can</i> listen in to the same
+  VRX, but they then share the settings of that channel. The scalability above is the
+  headroom this architecture offers, not a limit that is already being approached.</div>
+</section>
+
+<section id="filter">
+  <h2>18. Filter properties in detail</h2>
+  <p>In §9 we saw that &ldquo;setting bins to zero&rdquo; amounts to filtering. But what kind of filter
+  do you then get exactly? Below are the properties you also encounter in a receiver specification
+  — <b>filter shape</b>, <b>dynamic range</b> and <b>group delay</b> — with the numbers
+  included. This is deeper material; you do not need it for the big picture.</p>
+
+  <h3>Filter shape and steepness</h3>
+  <p>Selecting bins is a <b>rectangular mask</b> in the frequency domain: a bin participates
+  fully (×1) or not at all (×0). The filter edge therefore lies on a grid of one bin:</p>
+  <div class="formula">
+    bin width = F<sub>s</sub> / N<sub>fft</sub> = 1,536,000 / 24,576 = <b>62.5 Hz</b>
+  </div>
+  <p>The mask choice itself is rock-hard, but the <i>actual</i> transition is partly determined by the
+  main lobe of the Hann window (§5): that is ~1–2 bins wide, so the slope runs over about 60–125 Hz.
+  (It is the same window property that also sets the stopband floor — see the next paragraph.) For
+  an SSB filter of 2.4 kHz that is a transition region of only ~3–5% of the passband width — much
+  steeper than a crystal or mechanical filter in a classic receiver (transition often 10–30%).</p>
+  <p>That transition in <b>Hz</b> is roughly constant (that ~bin), regardless of how wide your filter is set.
+  For wide filters the <b>shape factor</b> (ratio of the width at a deep level to
+  that at &minus;6 dB) is therefore very close to <b>1</b> — almost an ideal rectangle. For a very
+  <i>narrow</i> filter (CW, e.g. 300 Hz) that same fixed ~62.5 Hz slope becomes a larger fraction of
+  the passband, and the shape factor as a ratio increases — although the slope in Hz remains equally steep.</p>
+
+  <h3>Dynamic range and ultimate suppression</h3>
+  <p>Two things bound the dynamic range (amplitude range):</p>
+  <ul>
+    <li><b>The computational side is hardly a limit.</b> Everything runs in 32-bit floating point; the ~24
+    bit mantissa gives, around a chosen scale, about <b>144 dB</b> of relative precision (the numerical
+    noise floor), so the computational precision is rarely the first limit. The real ceiling lies before the
+    channelizer: the ADC/DDC of the SDR (the ANAN has a 16-bit ADC ≈ 96 dB instantaneous, and in a
+    narrow channel effectively more thanks to process gain).</li>
+    <li><b>The ultimate out-of-band suppression is set by the window, not by the
+    bin mask.</b> A strong signal just outside your passband leaks via the <i>sidelobes</i> of the
+    Hann window (§5) a little bit into the passband bins anyway. For a Hann window that first
+    sidelobe lies at about <b>&minus;31 dB</b>, with a further roll-off of ~18 dB per octave. A neighbour at
+    &minus;31 dBc just next to the band is therefore the practical limit — further away it drops quickly.</li>
+  </ul>
+  <p>Want to suppress deeper? Then that is the classic <b>window trade-off</b>: a Blackman-Harris
+  window achieves ~&minus;90 dB sidelobes, but the main lobe (and thus the transition region) becomes ~2× as
+  wide. Steeper <i>and</i> deeper at the same time is possible with post-processing — see below.</p>
+
+  <div class="fig">
+    <svg viewBox="0 0 760 362" role="img" aria-label="Filter response built up from the sub-filters">
+      <!-- dB-gridlijnen -->
+      <g stroke="#26304d">
+        <line x1="80" y1="40" x2="712" y2="40"/><line x1="80" y1="80" x2="712" y2="80"/>
+        <line x1="80" y1="120" x2="712" y2="120"/><line x1="80" y1="160" x2="712" y2="160"/>
+        <line x1="80" y1="200" x2="712" y2="200"/><line x1="80" y1="240" x2="712" y2="240"/>
+        <line x1="80" y1="280" x2="712" y2="280"/>
+      </g>
+      <g class="mut" text-anchor="end">
+        <text x="72" y="44">0</text><text x="72" y="84">&minus;10</text><text x="72" y="124">&minus;20</text>
+        <text x="72" y="164">&minus;30</text><text x="72" y="204">&minus;40</text>
+        <text x="72" y="244">&minus;50</text><text x="72" y="284">&minus;60</text>
+      </g>
+      <text x="26" y="160" class="mut" transform="rotate(-90 26 160)" text-anchor="middle">attenuation (dB)</text>
+      <!-- bandrand-hulplijnen -->
+      <g stroke="#3a4a73" stroke-dasharray="3 3">
+        <line x1="262" y1="40" x2="262" y2="288"/><line x1="458" y1="40" x2="458" y2="288"/>
+      </g>
+      <text x="360" y="303" text-anchor="middle" class="mut">passband</text>
+      <text x="165" y="303" text-anchor="middle" class="mut">stopband</text>
+      <text x="585" y="303" text-anchor="middle" class="mut">stopband</text>
+      <!-- A: ideaal bin-masker (rechthoek) -->
+      <path d="M80 288 L262 288 L262 40 L458 40 L458 288 L712 288"
+        fill="none" stroke="#566187" stroke-width="1.4" stroke-dasharray="5 4"/>
+      <!-- B: Hann-venster-vloer (~-31 dB) -->
+      <path d="M80 214 L255 164" fill="none" stroke="#3ddc97" stroke-width="1.5" stroke-dasharray="4 3" opacity=".85"/>
+      <path d="M465 164 L712 214" fill="none" stroke="#3ddc97" stroke-width="1.5" stroke-dasharray="4 3" opacity=".85"/>
+      <!-- D: met optionele FIR -->
+      <path d="M80 284 L255 280 L268 180 L273 60 L279 40 L437 40 L443 60 L448 180 L461 280 L712 284"
+        fill="none" stroke="#ffb454" stroke-width="1.7" stroke-dasharray="2 3" opacity=".9"/>
+      <!-- C: resultante (totaal) -->
+      <path d="M80 220 L210 176 L252 166 L258 150 L262 80 L265 52 L270 43 L286 42 L360 40 L434 42 L450 43 L455 52 L458 80 L462 150 L468 166 L510 176 L640 216 L712 220"
+        fill="none" stroke="#4ea1ff" stroke-width="2.6"/>
+      <!-- legenda -->
+      <g font-size="12">
+        <line x1="96" y1="328" x2="126" y2="328" stroke="#566187" stroke-width="1.4" stroke-dasharray="5 4"/>
+        <text x="132" y="332" class="mut">ideal bin mask</text>
+        <line x1="300" y1="328" x2="330" y2="328" stroke="#3ddc97" stroke-width="1.5" stroke-dasharray="4 3"/>
+        <text x="336" y="332" class="mut">Hann floor (&asymp; &minus;31 dB)</text>
+        <line x1="96" y1="350" x2="126" y2="350" stroke="#4ea1ff" stroke-width="2.6"/>
+        <text x="132" y="354">resultant (total)</text>
+        <line x1="300" y1="350" x2="330" y2="350" stroke="#ffb454" stroke-width="1.7" stroke-dasharray="2 3"/>
+        <text x="336" y="354" class="mut">resultant with FIR (future)</text>
+      </g>
+    </svg>
+    <div class="cap">Figure 11 — The filter response in the frequency domain, built up from the
+    sub-filters. The <b>ideal bin mask</b> (grey) is a perfect rectangle; the
+    <b>Hann window</b> sets a sidelobe/leakage floor around &minus;31 dB (green); the <b>resultant</b>
+    (thick, blue) is their combination — flat in the passband, a slope of ~1–2 bins, and in the
+    stopband riding on the window floor. An <b>optional FIR</b> (orange, dashed) could push the stopband
+    far deeper.</div>
+  </div>
+
+  <h3>Group delay — flat, like a linear-phase FIR</h3>
+  <p>This is a strong asset of the method. The bin mask is <b>real</b> (a bin participates or not —
+  a number without phase rotation), the Hann window is symmetric, and the NCO is a pure
+  frequency shift (only phase rotation, no amplitude). Together these add no skewed phase:
+  in the passband the response is <b>linear in phase</b> — just like a FIR filter. Consequence:</p>
+  <ul>
+    <li>The <b>group delay is flat</b> across the whole passband: all frequencies come through equally fast,
+    so no phase distortion. A very steep filter edge does still give some post-/pre-ringing, but
+    thanks to the linear phase it is <i>symmetric</i> — not the skewed, smeared-to-one-side
+    distortion of an analogue or IIR filter.</li>
+    <li>Two numbers you should not confuse: the <b>group delay</b> itself is about
+    <b>half a block length</b> (~8 ms). The <b>total</b> algorithmic delay is larger, because you must
+    first fill a whole block before you can compute:
+    <code>N<sub>fft</sub> / F<sub>s</sub> = 1 / bin width = 1 / 62.5 Hz ≈ 16 ms</code>. Both are
+    larger than with an analogue filter, but they are constant.</li>
+  </ul>
+  <p>A classic receiver filter (crystal, mechanical, or an IIR DSP filter) instead has a
+  <b>low</b> absolute delay, but exhibits a <b>group-delay peak</b> around the band edges — the
+  phase does not run neatly linearly there, which smears transients. The FFT method swaps that around: a
+  slightly <b>higher but flat</b> delay, without phase distortion. For listening to SSB, AM and FM
+  that delay is inaudible; the flat phase you instead hear as a clean, &ldquo;tight&rdquo;
+  sound.</p>
+
+  <h3>Optional: a FIR after the iFFT</h3>
+  <p>The bin selection already gives a steep, near-rectangular passband, but the exact shape is
+  determined by the window (a slightly sloping edge, a sidelobe floor around &minus;31 dB). Want to give the
+  transfer a <b>precisely specified</b> shape? Then you can put a
+  <b>FIR filter</b> after the iFFT. That is relatively cheap, because after the iFFT everything runs at the low
+  output rate (8 or 16 kHz). Such a FIR could:</p>
+  <ul>
+    <li>flatten the slightly sloping passband edge;</li>
+    <li>push the stopband far below the window floor (real &minus;60…&minus;80 dB);</li>
+    <li>set the transition region to exactly the right size.</li>
+  </ul>
+  <p>Because a symmetric FIR is <i>also</i> linear in phase, the flat group delay is preserved — you
+  only stack an extra, precisely shaped stage on top of the coarse channelizer. This is the well-known
+  recipe: <i>coarse</i> channel selection + decimation with the FFT, <i>fine</i> shaping with a FIR.</p>
+
+  <div class="tl"><b>In ThetisLink.</b> The current chain uses a Hann analysis window with 50%
+  overlap-add and the rectangular bin mask — no extra FIR and no synthesis window. For
+  amateur SSB/AM/FM that response is more than enough; the steep slopes (~62.5 Hz transition) and the flat
+  group delay come for free. A post-processing FIR is the logical knob if a
+  textbook-exact passband shape or deeper stopband is ever needed.</div>
+</section>
+
+<section id="slot">
+  <h2>In closing — everything together</h2>
+  <p>One wide time signal (up to 1.536 MHz) goes through a large complex FFT and is laid out in bins of
+  62.5 Hz; we keep only the bins of the desired channel and set the rest to zero
+  (= filtering); a fixed iFFT (128/256 bins) converts that back into an I/Q time signal with a constant
+  sample rate; the NCO shifts it precisely onto frequency; per mode we demodulate it; the AGC controls
+  the volume; and as compact audio compressed with <b>Opus</b>, it goes to the client. Because this is a separate
+  cut-out per listener, many people can listen at the same time and independently within the same band.</p>
+  <p>And unfortunately it is not <b>free</b>. The FFT and iFFT cost computation time that grows with the
+  size (roughly proportionally — strictly speaking N·log N). But the delay sits mostly elsewhere: you
+  must first collect a whole block of samples before you can compute, and <b>the more finely you split up the spectrum
+  (narrower bins), the longer that block must be</b>. Fine frequency detail and low latency
+  therefore pull against each other — the classic <b>time-frequency trade-off</b>. (In this chain it is fixed
+  at 62.5 Hz per bin ≈ 16 ms block; a higher DDC rate makes the FFT larger and the view wider at
+  the same detail and the same latency, but costs more computing power.) So a
+  <b>balance</b> must always be found between <b>delay (latency)</b> and <b>spectrum detail</b> — precisely
+  the trade-off that keeps coming back throughout this whole story.</p>
+  <p class="lead">That is, in a nutshell, how a VRX gets from radio wave to sound. Want to know how
+  that sound (plus the spectrum, the S-meter and all the controls) then reaches your client over the
+  network? That is in the sister document <a href="Network-explained.html">&ldquo;From server to
+  client&rdquo;</a>.</p>
+</section>
+
+</main>
+<footer>
+  ThetisLink — VRX explained · educational version. Made by <b>Chiron van der Burgt (PA3GHM)</b>.<br>
+  ThetisLink on GitHub: <a href="https://github.com/cjenschede/ThetisLink">github.com/cjenschede/ThetisLink</a>
+</footer>
+</body>
+</html>

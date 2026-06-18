@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: GPL-2.0-or-later -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ThetisLink — technical documentation</title>
+<style>
+  :root{
+    --bg:#0f1320; --panel:#171c2e; --ink:#e8ecf6; --muted:#9aa6c4;
+    --accent:#4ea1ff; --accent2:#3ddc97; --warn:#ffb454; --line:#2a3350;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:16px/1.65 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+  header{padding:54px 24px 30px;text-align:center;
+    background:radial-gradient(900px 300px at 50% -40px,#1c2950,transparent),var(--bg);
+    border-bottom:1px solid var(--line)}
+  header h1{margin:0 0 8px;font-size:32px;letter-spacing:.2px}
+  header p{margin:0;color:var(--muted);max-width:720px;margin-inline:auto}
+  main{max-width:880px;margin:0 auto;padding:14px 24px 70px}
+  h2{font-size:20px;margin:1.4em 0 .3em;color:#fff;border-left:4px solid var(--accent);
+    padding-left:12px}
+  a{color:var(--accent);text-decoration:none}
+  .card{display:block;background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    padding:16px 20px;margin:12px 0;transition:border-color .15s,background .15s}
+  .card:hover{border-color:var(--accent);background:#1b2236}
+  .card .t{font-size:17px;color:#fff;font-weight:600}
+  .card .d{color:var(--muted);font-size:14.5px;margin-top:3px}
+  .lang{color:var(--muted);font-size:14px;text-align:center;margin-top:6px}
+  footer{color:var(--muted);text-align:center;font-size:13px;padding:30px 24px 60px;
+    border-top:1px solid var(--line);margin-top:30px}
+</style>
+</head>
+<body>
+<header>
+  <h1>ThetisLink — technical documentation</h1>
+  <p>Educational explanations of how ThetisLink turns a radio signal into sound and carries it,
+  the spectrum, the S-meter and the controls between the server and your client.
+  In plain language, with pictures.</p>
+  <p class="lang">English &nbsp;·&nbsp; Nederlands</p>
+</header>
+
+<main>
+  <h2>English</h2>
+  <a class="card" href="VRX-explained.html">
+    <div class="t">How a VRX works — from radio wave to sound</div>
+    <div class="d">The signal processing: FFT channelizer, windowing, filtering, demodulation,
+    AGC, spectrum, S-meter and filter properties.</div>
+  </a>
+  <a class="card" href="Network-explained.html">
+    <div class="t">From server to client</div>
+    <div class="d">The network/transport: Opus audio over UDP, jitter buffer, spectrum, S-meter,
+    settings, the transmit key (PTT) and the latency budget.</div>
+  </a>
+
+  <h2>Nederlands</h2>
+  <a class="card" href="VRX-uitleg.html">
+    <div class="t">Hoe een VRX werkt — van radiogolf tot geluid</div>
+    <div class="d">De signaalbewerking: FFT-channelizer, windowing, filteren, demodulatie,
+    AGC, spectrum, S-meter en filtereigenschappen.</div>
+  </a>
+  <a class="card" href="Netwerk-uitleg.html">
+    <div class="t">Van server naar client</div>
+    <div class="d">Het netwerk/transport: Opus-audio over UDP, jitter-buffer, spectrum, S-meter,
+    instellingen, de zendknop (PTT) en het latency-budget.</div>
+  </a>
+</main>
+
+<footer>
+  ThetisLink — educational documentation. Made by <b>Chiron van der Burgt (PA3GHM)</b>.<br>
+  ThetisLink on GitHub: <a href="https://github.com/cjenschede/ThetisLink">github.com/cjenschede/ThetisLink</a>
+</footer>
+</body>
+</html>
