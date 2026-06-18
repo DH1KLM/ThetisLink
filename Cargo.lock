@@ -4782,7 +4782,7 @@ dependencies = [
 
 [[package]]
 name = "sdr-remote-android"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "android_logger",
  "anyhow",
@@ -4797,7 +4797,7 @@ dependencies = [
 
 [[package]]
 name = "sdr-remote-client"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4824,7 +4824,7 @@ dependencies = [
 
 [[package]]
 name = "sdr-remote-core"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "audiopus",
@@ -4840,7 +4840,7 @@ dependencies = [
 
 [[package]]
 name = "sdr-remote-logic"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4854,7 +4854,7 @@ dependencies = [
 
 [[package]]
 name = "sdr-remote-server"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -4880,6 +4880,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "url",
+ "vrx-rs",
  "winresource",
 ]
 
@@ -6278,6 +6279,16 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vrx-rs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "audiopus",
+ "log",
+ "rustfft",
+]
 
 [[package]]
 name = "walkdir"

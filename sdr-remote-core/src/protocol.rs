@@ -98,6 +98,41 @@ pub enum PacketType {
     TotpChallenge = 0x33,
     /// TOTP response (client → server, 6-digit code as UTF-8 string)
     TotpResponse = 0x34,
+    /// VRX audio (server → client) — Virtual RX audio stream, Opus-encoded
+    /// narrowband (8 kHz mono). Carries a `vrx_id` byte so multiple VRX
+    /// channels can be multiplexed on the same UDP socket. Currently
+    /// experimental (M2b spike), single hardcoded VRX in v2.1.1+.
+    AudioVrx = 0x21,
+    /// VRX absolute frequency set (client → server). Uses VrxFrequencyPacket
+    /// layout: header(4) + vrx_id(1) + frequency_hz(8) = 13 bytes. The server
+    /// computes the bin-offset relative to the current DDC center.
+    FrequencyVrx = 0x22,
+    /// VRX1 high-res extracted spectrum view (server → client). Layout
+    /// matches `SpectrumPacket`. Sent periodically by the server when a
+    /// client has VRX1-high-res enabled (`ControlId::VrxSpectrumEnable`).
+    /// Center is at VRX1 freq + caller-requested span.
+    SpectrumVrx1 = 0x23,
+    /// VRX2 high-res extracted spectrum view (server → client).
+    SpectrumVrx2 = 0x24,
+
+    // ── Dual-radio slot 1 (PATCH-dual-radio-991a-ftx1, Optie B-prime) ──
+    // Slot 0 = bestaande Yaesu-packets (0x16-0x19), byte-identiek/ongewijzigd.
+    // Slot 1 = tweede radio, eigen packet-varianten op het vrije gat 0x25-0x28.
+    // Back-compat by construction: oude clients kennen deze types niet, parsen
+    // ze als "unknown packet type" (geen crash) en abonneren nooit op slot 1.
+    /// Slot-1 radio audio (server → client, zelfde layout als AudioYaesu).
+    AudioYaesu2 = 0x25,
+    /// Slot-1 radio state (server → client, zelfde layout als YaesuState).
+    YaesuState2 = 0x26,
+    /// Slot-1 frequentie set (client → server, zelfde layout als FrequencyYaesu).
+    FrequencyYaesu2 = 0x27,
+    /// Slot-1 memory data (server → client, tab-separated text, zelfde layout als YaesuMemoryData).
+    YaesuMemoryData2 = 0x28,
+    /// Per-radio model info (server → client): laat de client het gedetecteerde
+    /// model per slot weten voor de paneel-naamgeving ("991A 1"/"FTX1" etc.).
+    /// Apart packet zodat de byte-identieke slot-0 YaesuState ongemoeid blijft
+    /// (B-prime); oude clients negeren dit onbekende type.
+    RadioInfo = 0x29,
 }
 
 impl PacketType {
@@ -337,6 +372,86 @@ pub enum ControlId {
     /// wideband Opus en accepteert TX-audio met `Flags::AUDIO_WIDEBAND`.
     /// Vereist `Capabilities::WIDEBAND_AUDIO` op zowel server als client.
     ThetisWidebandAudio = 0x66,
+
+    /// VRX enable (client → server, value 0/1, vrx_id implicit = 0 for single-VRX
+    /// M2b.4 spike). When 1, the server runs the FFT-channelizer on RX1 IQ and
+    /// streams Opus VRX audio. When 0, channelizer is paused.
+    VrxEnable = 0x67,
+    /// VRX mode (client → server, value 0=USB, 1=LSB). Matches `vrx::VrxMode`
+    /// enum on the server side.
+    VrxMode = 0x68,
+    /// VRX volume (client → server, value = volume × 100, range 0..=200 =
+    /// 0%..200%). Applied server-side before VRX is mixed into the RX1
+    /// audio stream. Build 45+: VRX audio routes through the RX1 Opus
+    /// encoder instead of its own stream.
+    VrxVolume = 0x69,
+    /// VRX2 enable (client → server, value 0/1). Mirrors `VrxEnable` for
+    /// the second virtual receiver (running on the RX2 IQ stream + VFO-B).
+    VrxEnable2 = 0x6A,
+    /// VRX2 mode (client → server, value 0=USB, 1=LSB). Mirrors `VrxMode`.
+    VrxMode2 = 0x6B,
+    /// VRX2 volume placeholder — present for protocol symmetry with VRX1.
+    /// Build 50+: local mix gain on the client; not currently applied
+    /// server-side (channel is its own UDP stream).
+    VrxVolume2 = 0x6C,
+    /// VRX1 SSB filter low edge in Hz (signed i16 packed into u16).
+    /// USB convention: positive; LSB convention: negative.
+    VrxFilterLow = 0x6D,
+    /// VRX1 SSB filter high edge in Hz (signed i16 packed into u16).
+    VrxFilterHigh = 0x6E,
+    /// VRX2 SSB filter low edge (mirror of VrxFilterLow).
+    VrxFilterLow2 = 0x6F,
+    /// VRX2 SSB filter high edge (mirror of VrxFilterHigh).
+    VrxFilterHigh2 = 0x70,
+    /// VRX1 high-res spectrum extraction enable (client → server, 0/1).
+    /// When 1, server periodically emits SpectrumVrx1 packets matching
+    /// the current VrxSpectrumSpan width centered on VrxFrequency.
+    VrxSpectrumEnable = 0x71,
+    /// VRX2 high-res spectrum extraction enable (client → server).
+    VrxSpectrumEnable2 = 0x72,
+    /// VRX1 high-res spectrum span in kHz (client → server, u16 kHz).
+    /// Used as the visible-window width for the server-side extraction.
+    VrxSpectrumSpanKhz = 0x73,
+    /// VRX2 high-res spectrum span in kHz (client → server).
+    VrxSpectrumSpanKhz2 = 0x74,
+
+    // ── Dual-radio slot 1 (PATCH-dual-radio-991a-ftx1, Optie B-prime) ──
+    // 1:1 spiegel van de slot-0 Yaesu-controls (0x20-0x2F) op de vrije range
+    // 0x80-0x8F. NIET 0x30-0x3F (bezet door AGC/RIT/DDC/Rx2-controls).
+    // Yaesu2Enable is tevens de slot-1 subscription-gate: een sessie krijgt pas
+    // slot-1 state/audio/memory nadat ze deze control met value=1 stuurt.
+    /// Slot-1 stream enable + subscription-gate (value 0/1). Spiegel van YaesuEnable.
+    Yaesu2Enable = 0x80,
+    /// Slot-1 PTT (value 0/1). Spiegel van YaesuPtt.
+    Yaesu2Ptt = 0x81,
+    /// Slot-1 frequentie set (uses FrequencyYaesu2 packet). Spiegel van YaesuFreq.
+    Yaesu2Freq = 0x82,
+    /// Slot-1 ThetisLink mic gain (value × 10). Spiegel van YaesuMicGain.
+    Yaesu2MicGain = 0x83,
+    /// Slot-1 operating mode (value: internal mode number). Spiegel van YaesuMode.
+    Yaesu2Mode = 0x84,
+    /// Slot-1 read all memories. Spiegel van YaesuReadMemories.
+    Yaesu2ReadMemories = 0x85,
+    /// Slot-1 recall memory channel (1-99). Spiegel van YaesuRecallMemory.
+    Yaesu2RecallMemory = 0x86,
+    /// Slot-1 write all memories. Spiegel van YaesuWriteMemories.
+    Yaesu2WriteMemories = 0x87,
+    /// Slot-1 select VFO (0=A, 1=B, 2=swap). Spiegel van YaesuSelectVfo.
+    Yaesu2SelectVfo = 0x88,
+    /// Slot-1 squelch (0-255). Spiegel van YaesuSquelch.
+    Yaesu2Squelch = 0x89,
+    /// Slot-1 RF gain (0-255). Spiegel van YaesuRfGain.
+    Yaesu2RfGain = 0x8A,
+    /// Slot-1 radio mic gain (0-100). Spiegel van YaesuRadioMicGain.
+    Yaesu2RadioMicGain = 0x8B,
+    /// Slot-1 RF power (0-100). Spiegel van YaesuRfPower.
+    Yaesu2RfPower = 0x8C,
+    /// Slot-1 raw CAT button. Spiegel van YaesuButton.
+    Yaesu2Button = 0x8D,
+    /// Slot-1 read all EX menus. Spiegel van YaesuReadMenus.
+    Yaesu2ReadMenus = 0x8E,
+    /// Slot-1 set EX menu item. Spiegel van YaesuSetMenu.
+    Yaesu2SetMenu = 0x8F,
 }
 
 impl ControlId {
@@ -494,7 +609,8 @@ impl AudioPacket {
     pub fn deserialize(buf: &[u8]) -> Result<Self> {
         let header = Header::deserialize(buf)?;
         if header.packet_type != PacketType::Audio && header.packet_type != PacketType::AudioRx2
-            && header.packet_type != PacketType::AudioYaesu && header.packet_type != PacketType::AudioBinR {
+            && header.packet_type != PacketType::AudioYaesu && header.packet_type != PacketType::AudioBinR
+            && header.packet_type != PacketType::AudioYaesu2 {
             bail!("expected Audio packet, got {:?}", header.packet_type);
         }
         if buf.len() < Self::HEADER_SIZE {
@@ -525,6 +641,97 @@ impl AudioPacket {
             timestamp,
             opus_data,
         })
+    }
+}
+
+/// VRX audio packet: server → client, narrowband Opus audio for one
+/// Virtual RX channel. Layout:
+///   header(4) + sequence(4) + timestamp(4) + vrx_id(1) + opus_len(2) + opus_data(N)
+/// Total: 15 + N bytes.
+#[derive(Debug, Clone)]
+pub struct VrxAudioPacket {
+    pub sequence: u32,
+    pub timestamp: u32,
+    pub vrx_id: u8,
+    pub opus_data: Vec<u8>,
+    /// True if Opus payload is 16 kHz wideband. False = 8 kHz narrowband.
+    /// Carried in the header's `Flags::AUDIO_WIDEBAND` bit, not in the
+    /// body — same convention as the main RX1 audio path.
+    pub wideband: bool,
+}
+
+impl VrxAudioPacket {
+    pub const HEADER_SIZE: usize = Header::SIZE + 4 + 4 + 1 + 2; // 15 bytes
+
+    pub fn serialize(&self, buf: &mut Vec<u8>) {
+        let start = buf.len();
+        buf.resize(start + Self::HEADER_SIZE + self.opus_data.len(), 0);
+        let out = &mut buf[start..];
+        let flags = if self.wideband { Flags::AUDIO_WIDEBAND } else { Flags::NONE };
+        let header = Header::new(PacketType::AudioVrx, flags);
+        header.serialize(out);
+        out[4..8].copy_from_slice(&self.sequence.to_be_bytes());
+        out[8..12].copy_from_slice(&self.timestamp.to_be_bytes());
+        out[12] = self.vrx_id;
+        out[13..15].copy_from_slice(&(self.opus_data.len() as u16).to_be_bytes());
+        out[15..15 + self.opus_data.len()].copy_from_slice(&self.opus_data);
+    }
+
+    pub fn deserialize(buf: &[u8]) -> Result<Self> {
+        let header = Header::deserialize(buf)?;
+        if header.packet_type != PacketType::AudioVrx {
+            bail!("expected AudioVrx packet, got {:?}", header.packet_type);
+        }
+        if buf.len() < Self::HEADER_SIZE {
+            bail!("vrx audio packet too short: {} < {}", buf.len(), Self::HEADER_SIZE);
+        }
+        let sequence = u32::from_be_bytes(buf[4..8].try_into().unwrap());
+        let timestamp = u32::from_be_bytes(buf[8..12].try_into().unwrap());
+        let vrx_id = buf[12];
+        let opus_len = u16::from_be_bytes(buf[13..15].try_into().unwrap()) as usize;
+        if buf.len() < Self::HEADER_SIZE + opus_len {
+            bail!(
+                "vrx audio packet truncated: {} < {}",
+                buf.len(),
+                Self::HEADER_SIZE + opus_len
+            );
+        }
+        let opus_data = buf[15..15 + opus_len].to_vec();
+        let wideband = (header.flags.0 & Flags::AUDIO_WIDEBAND.0) != 0;
+        Ok(Self { sequence, timestamp, vrx_id, opus_data, wideband })
+    }
+}
+
+/// VRX frequency packet (client → server). Sets the absolute listen frequency
+/// for one VRX channel. Layout:
+///   header(4) + vrx_id(1) + frequency_hz(8) = 13 bytes
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VrxFrequencyPacket {
+    pub vrx_id: u8,
+    pub frequency_hz: u64,
+}
+
+impl VrxFrequencyPacket {
+    pub const SIZE: usize = Header::SIZE + 1 + 8; // 13 bytes
+
+    pub fn serialize(&self, buf: &mut [u8; Self::SIZE]) {
+        let header = Header::new(PacketType::FrequencyVrx, Flags::NONE);
+        header.serialize(buf);
+        buf[4] = self.vrx_id;
+        buf[5..13].copy_from_slice(&self.frequency_hz.to_be_bytes());
+    }
+
+    pub fn deserialize(buf: &[u8]) -> Result<Self> {
+        let header = Header::deserialize(buf)?;
+        if header.packet_type != PacketType::FrequencyVrx {
+            bail!("expected FrequencyVrx packet, got {:?}", header.packet_type);
+        }
+        if buf.len() < Self::SIZE {
+            bail!("vrx frequency packet too short: {} < {}", buf.len(), Self::SIZE);
+        }
+        let vrx_id = buf[4];
+        let frequency_hz = u64::from_be_bytes(buf[5..13].try_into().unwrap());
+        Ok(Self { vrx_id, frequency_hz })
     }
 }
 
@@ -843,7 +1050,7 @@ impl FrequencyPacket {
 
     pub fn deserialize(buf: &[u8]) -> Result<Self> {
         let header = Header::deserialize(buf)?;
-        if header.packet_type != PacketType::Frequency && header.packet_type != PacketType::FrequencyRx2 && header.packet_type != PacketType::FrequencyYaesu {
+        if header.packet_type != PacketType::Frequency && header.packet_type != PacketType::FrequencyRx2 && header.packet_type != PacketType::FrequencyYaesu && header.packet_type != PacketType::FrequencyYaesu2 {
             bail!("expected Frequency/FrequencyRx2 packet, got {:?}", header.packet_type);
         }
         if buf.len() < Self::SIZE {
@@ -985,7 +1192,7 @@ impl SpectrumPacket {
 
     pub fn deserialize(buf: &[u8]) -> Result<Self> {
         let header = Header::deserialize(buf)?;
-        if !matches!(header.packet_type, PacketType::Spectrum | PacketType::FullSpectrum | PacketType::SpectrumRx2 | PacketType::FullSpectrumRx2) {
+        if !matches!(header.packet_type, PacketType::Spectrum | PacketType::FullSpectrum | PacketType::SpectrumRx2 | PacketType::FullSpectrumRx2 | PacketType::SpectrumVrx1 | PacketType::SpectrumVrx2) {
             bail!("expected Spectrum packet variant, got {:?}", header.packet_type);
         }
         if buf.len() < Self::HEADER_SIZE {
@@ -1438,7 +1645,13 @@ impl YaesuStatePacket {
     pub const SIZE: usize = Header::SIZE + 8 + 8 + 1 + 2 + 1 + 1 + 1 + 1 + 1 + 2 + 1 + 1 + 1 + 1 + 1; // 35 bytes
 
     pub fn serialize(&self, buf: &mut [u8; Self::SIZE]) {
-        let header = Header::new(PacketType::YaesuState, Flags::NONE);
+        self.serialize_as_type(buf, PacketType::YaesuState);
+    }
+
+    /// Serialize under a caller-chosen packet type so slot 1 can emit the same
+    /// state layout under `PacketType::YaesuState2` (dual-radio Optie B-prime).
+    pub fn serialize_as_type(&self, buf: &mut [u8; Self::SIZE], ptype: PacketType) {
+        let header = Header::new(ptype, Flags::NONE);
         header.serialize(buf);
         let mut pos = Header::SIZE;
         buf[pos..pos + 8].copy_from_slice(&self.freq_a.to_be_bytes()); pos += 8;
@@ -1570,6 +1783,8 @@ pub enum Packet {
     SmeterRx2MaxBin(SmeterPacket),
     SpectrumRx2(SpectrumPacket),
     FullSpectrumRx2(SpectrumPacket),
+    SpectrumVrx1(SpectrumPacket),
+    SpectrumVrx2(SpectrumPacket),
     Spot(SpotPacket),
     TxProfiles(TxProfilesPacket),
     AudioYaesu(AudioPacket),
@@ -1578,11 +1793,21 @@ pub enum Packet {
     YaesuState(YaesuStatePacket),
     FrequencyYaesu(FrequencyPacket),
     YaesuMemoryData(String),
+    // Dual-radio slot 1 (Optie B-prime): zelfde payload-structs, eigen packet-types.
+    AudioYaesu2(AudioPacket),
+    YaesuState2(YaesuStatePacket),
+    FrequencyYaesu2(FrequencyPacket),
+    YaesuMemoryData2(String),
+    /// Per-radio model info (server → client): (slot, model_code). model_code:
+    /// 0 = FT-991A, 1 = FTX-1. Voor paneel-naamgeving in de client.
+    RadioInfo { slot: u8, model: u8 },
     AuthChallenge([u8; 16]),    // nonce
     AuthResponse([u8; 32]),     // HMAC
     AuthResult(u8),             // 0=rejected, 1=accepted, 2=totp_required
     TotpChallenge,              // server requests TOTP code
     TotpResponse(String),       // 6-digit TOTP code
+    AudioVrx(VrxAudioPacket),
+    FrequencyVrx(VrxFrequencyPacket),
 }
 
 /// AuthResult codes
@@ -1618,13 +1843,31 @@ impl Packet {
             PacketType::SmeterRx2 => Ok(Packet::SmeterRx2(SmeterPacket::deserialize(buf)?)),
             PacketType::SpectrumRx2 => Ok(Packet::SpectrumRx2(SpectrumPacket::deserialize(buf)?)),
             PacketType::FullSpectrumRx2 => Ok(Packet::FullSpectrumRx2(SpectrumPacket::deserialize(buf)?)),
+            PacketType::SpectrumVrx1 => Ok(Packet::SpectrumVrx1(SpectrumPacket::deserialize(buf)?)),
+            PacketType::SpectrumVrx2 => Ok(Packet::SpectrumVrx2(SpectrumPacket::deserialize(buf)?)),
             PacketType::Spot => Ok(Packet::Spot(SpotPacket::deserialize(buf)?)),
             PacketType::TxProfiles => Ok(Packet::TxProfiles(TxProfilesPacket::deserialize(buf)?)),
             PacketType::AudioYaesu => Ok(Packet::AudioYaesu(AudioPacket::deserialize(buf)?)),
             PacketType::AudioBinR => Ok(Packet::AudioBinR(AudioPacket::deserialize(buf)?)),
+            PacketType::AudioVrx => Ok(Packet::AudioVrx(VrxAudioPacket::deserialize(buf)?)),
+            PacketType::FrequencyVrx => Ok(Packet::FrequencyVrx(VrxFrequencyPacket::deserialize(buf)?)),
             PacketType::AudioMultiCh => Ok(Packet::AudioMultiCh(MultiChannelAudioPacket::deserialize(buf)?)),
             PacketType::YaesuState => Ok(Packet::YaesuState(YaesuStatePacket::deserialize(buf)?)),
             PacketType::FrequencyYaesu => Ok(Packet::FrequencyYaesu(FrequencyPacket::deserialize(buf)?)),
+            PacketType::AudioYaesu2 => Ok(Packet::AudioYaesu2(AudioPacket::deserialize(buf)?)),
+            PacketType::YaesuState2 => Ok(Packet::YaesuState2(YaesuStatePacket::deserialize(buf)?)),
+            PacketType::FrequencyYaesu2 => Ok(Packet::FrequencyYaesu2(FrequencyPacket::deserialize(buf)?)),
+            PacketType::YaesuMemoryData2 => {
+                if buf.len() < 6 { bail!("YaesuMemoryData2 too short"); }
+                let len = u16::from_be_bytes(buf[4..6].try_into().unwrap()) as usize;
+                if buf.len() < 6 + len { bail!("YaesuMemoryData2 truncated"); }
+                let text = String::from_utf8_lossy(&buf[6..6+len]).to_string();
+                Ok(Packet::YaesuMemoryData2(text))
+            }
+            PacketType::RadioInfo => {
+                if buf.len() < Header::SIZE + 2 { bail!("RadioInfo too short"); }
+                Ok(Packet::RadioInfo { slot: buf[Header::SIZE], model: buf[Header::SIZE + 1] })
+            }
             PacketType::AuthChallenge => {
                 if buf.len() < 20 { bail!("AuthChallenge too short"); }
                 let mut nonce = [0u8; 16];

@@ -72,7 +72,7 @@ pub(crate) fn render_mode_selector(
             } else {
                 egui::Button::new(RichText::new(label).size(label_size))
             };
-            let resp = ui.add_enabled(ctx.connected, btn);
+            let resp = ui.add_enabled(ctx.connected, btn).on_hover_text("Set receive mode.");
             if resp.clicked() {
                 ctx.events.emit(UiEvent::ClickReceived {
                     control_id: "mode_selector",

@@ -194,6 +194,11 @@ fn main() -> Result<()> {
     }
     let native_options = eframe::NativeOptions {
         viewport,
+        // eframe's eigen window-state-restore overschrijft anders onze
+        // with_inner_size/with_position uit de conf → window-geometrie werd niet
+        // onthouden. Wij beheren de geometrie zelf (load_window_size/pos +
+        // save_full_config), dus eframe's persist uit.
+        persist_window: false,
         ..Default::default()
     };
 

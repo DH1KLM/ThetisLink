@@ -83,7 +83,39 @@ pub enum Command {
     SetYaesuFreq(u64),
     SetYaesuMode(u8),
     SetYaesuMenu(u16, String), // (menu number, P2 value)
+    // Dual-radio slot 1 (PATCH-dual-radio-991a-ftx1) — spiegel van de slot-0
+    // Yaesu-commando's, geroute naar radio 1 (Yaesu2*-controls / FrequencyYaesu2).
+    SetYaesu2Enable(bool),
+    SetYaesu2Volume(f32),
+    SetYaesu2Ptt(bool),
+    SetYaesu2Freq(u64),
+    SetYaesu2Mode(u8),
+    SetYaesu2TxGain(f32),
+    SetYaesu2EqBand(u8, f32),
+    SetYaesu2EqEnabled(bool),
+    /// FTX-1 EX-menu set (Fase C): (adres "p1p2p3", waarde). Reist als
+    /// YaesuMemoryData2 met "SETMENU:"-prefix naar de server.
+    SetYaesu2Menu(String, String),
+    // VRX1 (Virtual RX on RX1 IQ + VFO-A)
+    SetVrxEnabled(bool),
+    SetVrxMode(u8),    // 0=USB, 1=LSB
+    SetVrxFrequency(u64),
+    SetVrxVolume(f32), // local mix gain, 0.0..=2.0
+    /// (vrx_id 0|1, filter_low_hz, filter_high_hz). Server quantises to
+    /// 62.5 Hz audio bins; client should pre-snap so visual = audio.
+    SetVrxFilter(u8, i32, i32),
+    /// (vrx_id 0|1, enabled, span_khz). When enabled, server emits
+    /// SpectrumVrx1/SpectrumVrx2 packets containing a high-resolution
+    /// extracted view centered on the VRX freq with the given span.
+    /// span_khz=0 with enabled=true defaults to 24 kHz server-side.
+    SetVrxHighResSpectrum(u8, bool, u16),
+    // VRX2 (Virtual RX on RX2 IQ + VFO-B)
+    SetVrx2Enabled(bool),
+    SetVrx2Mode(u8),
+    SetVrx2Frequency(u64),
+    SetVrx2Volume(f32),
     WriteYaesuMemories(String), // tab-separated text to write to radio
+    WriteYaesu2Memories(String), // idem radio 2 (Fase B)
     SetYaesuTxGain(f32),
     // Yaesu EQ: (band 0-4, gain_db -12..+12)
     SetYaesuEqBand(u8, f32),

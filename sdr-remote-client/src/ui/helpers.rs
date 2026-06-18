@@ -119,6 +119,56 @@ pub(crate) fn is_cw_mode(mode: u8) -> bool {
     mode == 3 || mode == 4
 }
 
+// ── VRX-specific mode helpers ──────────────────────────────────────────
+// VRX mode numbering (different from Thetis to keep backward-compat with
+// older client config files): 0=USB, 1=LSB, 2=AM, 3=SAM, 4=FM.
+// Display order matches VFO A+B (LSB first), with mode value sorted accordingly.
+pub(crate) const VRX_MODES: &[(u8, &str)] = &[
+    (1, "LSB"), (0, "USB"), (2, "AM"), (3, "SAM"), (4, "FM"),
+];
+
+pub(crate) fn vrx_mode_label(mode: u8) -> &'static str {
+    match mode {
+        0 => "USB", 1 => "LSB", 2 => "AM", 3 => "SAM", 4 => "FM",
+        _ => "?",
+    }
+}
+
+/// Default (filter_low_hz, filter_high_hz) for a VRX mode. Preserves
+/// the current SSB bandwidth on USB↔LSB swap; uses mode-specific
+/// defaults for AM/SAM/FM (their natural bandwidths differ from SSB).
+pub(crate) fn vrx_mode_default_filter(new_mode: u8, current_bw: i32) -> (i32, i32) {
+    let bw = if current_bw > 0 { current_bw } else { 3000 };
+    match new_mode {
+        0 => (0, bw),                // USB
+        1 => (-bw, 0),               // LSB
+        2 | 3 => (-3000, 3000),      // AM/SAM: 6 kHz symmetric
+        4 => (-4000, 4000),          // FM: ±4 kHz (max channelizer can pass)
+        _ => (0, bw),
+    }
+}
+
+/// Filter presets to show in VRX BW dropdown (mode-dependent).
+pub(crate) fn vrx_filter_presets(mode: u8) -> &'static [i32] {
+    match mode {
+        2 | 3 => AM_PRESETS,  // AM / SAM
+        4 => FM_PRESETS,      // FM
+        _ => SSB_PRESETS,     // USB / LSB
+    }
+}
+
+/// Convert a "total bandwidth" preset to (filter_low_hz, filter_high_hz)
+/// for a given VRX mode. SSB modes use one side; AM-family + FM are
+/// symmetric around carrier.
+pub(crate) fn vrx_filter_from_preset(mode: u8, preset_bw: i32) -> (i32, i32) {
+    match mode {
+        0 => (0, preset_bw),                          // USB
+        1 => (-preset_bw, 0),                         // LSB
+        2 | 3 | 4 => (-preset_bw / 2, preset_bw / 2), // AM/SAM/FM symmetric
+        _ => (0, preset_bw),
+    }
+}
+
 pub(crate) fn format_bandwidth(hz: i32, cw: bool) -> String {
     if cw || hz < 1000 {
         format!("{} Hz", hz)

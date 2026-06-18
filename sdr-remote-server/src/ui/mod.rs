@@ -356,6 +356,13 @@ impl ServerApp {
             yaesu_enabled: self.yaesu_enabled,
             yaesu_baud: 38400,
             yaesu_audio_device: if self.yaesu_audio_device.is_empty() { None } else { Some(self.yaesu_audio_device.clone()) },
+            // Dual-radio slot 1: round-trip via disk tot de settings-UI yaesu2_*
+            // toont (taak #6) — zelfde patroon als de multi-tuner schema hieronder.
+            yaesu2_port: crate::config::load().yaesu2_port,
+            yaesu2_enabled: crate::config::load().yaesu2_enabled,
+            yaesu2_baud: crate::config::load().yaesu2_baud,
+            yaesu2_audio_device: crate::config::load().yaesu2_audio_device,
+            yaesu2_audio_channel: crate::config::load().yaesu2_audio_channel,
             amplitec_port: if amp_port.is_empty() { None } else { Some(amp_port.clone()) },
             amplitec_enabled: self.amplitec_enabled,
             amplitec_labels: self.amplitec_labels.clone(),
@@ -436,7 +443,15 @@ impl ServerApp {
             let port_log = port.clone();
             let audio_dev = self.yaesu_audio_device.clone();
             let audio_dev_opt = if audio_dev.is_empty() { None } else { Some(audio_dev) };
-            match with_timeout(com_timeout, move || crate::yaesu::YaesuRadio::new(&port, baud, audio_dev_opt.as_deref())) {
+            // Slot-0 model per-poort autodetect (dual-radio): zo werkt élke
+            // combinatie incl. een FTX-1 als primaire radio. Detect + open
+            // draaien in de timeout-thread (blokkeert de UI-thread niet).
+            // Faalt detect (radio uit) → 991A-aanname-label; bring-up logt echt ID.
+            match with_timeout(com_timeout, move || {
+                let (model, det_baud) = crate::yaesu::detect_model(&port, baud)
+                    .unwrap_or((crate::yaesu::RadioModel::Ft991a, baud));
+                crate::yaesu::YaesuRadio::new_with_model(&port, det_baud, audio_dev_opt.as_deref(), model, 0, 0)
+            }) {
                 Ok(radio) => {
                     // YaesuRadio is fail-soft: the underlying serial open
                     // may have failed at probe-time. The actual connect/

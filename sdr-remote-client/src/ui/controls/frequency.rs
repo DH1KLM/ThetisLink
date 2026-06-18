@@ -89,7 +89,7 @@ pub(crate) fn render_freq_step_controls(
     let mut action: Option<FreqStepAction> = None;
     ui.horizontal(|ui| {
         let minus = egui::Button::new(RichText::new(" - ").size(size));
-        if ui.add_enabled(ctx.connected, minus).clicked() {
+        if ui.add_enabled(ctx.connected, minus).on_hover_text("Tune down one step.").clicked() {
             ctx.events.emit(UiEvent::ClickReceived {
                 control_id: "freq_step_arrows",
                 channel: ctx.channel,
@@ -111,7 +111,7 @@ pub(crate) fn render_freq_step_controls(
             };
             // Step-size selectie werkt offline: geen add_enabled guard,
             // geen command, geen intent-emission. Alleen lokale UI-state.
-            if ui.add(btn).clicked() {
+            if ui.add(btn).on_hover_text("Frequency step size.").clicked() {
                 ctx.events.emit(UiEvent::ClickReceived {
                     control_id: "freq_step_size",
                     channel: ctx.channel,
@@ -127,7 +127,7 @@ pub(crate) fn render_freq_step_controls(
         }
 
         let plus = egui::Button::new(RichText::new(" + ").size(size));
-        if ui.add_enabled(ctx.connected, plus).clicked() {
+        if ui.add_enabled(ctx.connected, plus).on_hover_text("Tune up one step.").clicked() {
             ctx.events.emit(UiEvent::ClickReceived {
                 control_id: "freq_step_arrows",
                 channel: ctx.channel,
@@ -280,7 +280,8 @@ pub(crate) fn render_frequency_display(
                     RichText::new(format!("{}  ", prefix)).size(18.0).strong(),
                 )
                 .sense(egui::Sense::click());
-                let prefix_resp = ui.add_enabled(ctx.connected, prefix_widget);
+                let prefix_resp = ui.add_enabled(ctx.connected, prefix_widget)
+                    .on_hover_text("Click to edit frequency; scroll over a digit to tune.");
                 if prefix_resp.clicked() {
                     out = DisplayOutcome::StartEdit;
                 }

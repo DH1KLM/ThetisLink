@@ -1,10 +1,10 @@
-# ThetisLink v2.1.0 - Technical Reference
+# ThetisLink v2.2.0 - Technical Reference
 
 ## 1. Overview
 
 ThetisLink is a system for remote operation of an ANAN 7000DLE + Thetis SDR receiver and a Yaesu FT-991A transceiver over a network connection. It provides bidirectional real-time audio streaming, PTT control, DDC spectrum/waterfall display, full RX2/VFO-B support, diversity, Yaesu memory channel management and radio settings editor over UDP with Opus codec.
 
-**Version:** v2.1.0 (shared version number in `sdr-remote-core::VERSION`)
+**Version:** v2.2.0 (shared version number in `sdr-remote-core::VERSION`)
 **Development language:** Rust + Kotlin (Android UI)
 **Target platform:** Windows 10/11, macOS (Intel/Apple Silicon), Android 8+ (arm64)
 **Design priority:** latency > bandwidth > features
@@ -26,9 +26,17 @@ All extensions are behind the **"ThetisLink extensions"** checkbox in Setup → 
 The default IQ sample rate is 384 kHz. With ThetisLink extensions the user can choose from: 48, 96, 192, 384, 768 or **1536 kHz** — selectable per receiver via the DDC sample rate dropdown in the client.
 
 **Repos:**
-- ThetisLink: [cjenschede/ThetisLink](https://github.com/cjenschede/ThetisLink) (public release repo, tag `v2.1.0`)
+- ThetisLink: [cjenschede/ThetisLink](https://github.com/cjenschede/ThetisLink) (public release repo, tag `v2.2.0`)
 - Thetis fork: [cjenschede/Thetis](https://github.com/cjenschede/Thetis) (branch `thetislink-tl2`)
 - Original Thetis: [ramdor/Thetis](https://github.com/ramdor/Thetis)
+
+### v2.2.0 highlights
+
+**Virtual receivers (VRX) and a second Yaesu radio (FT-991A + FTX-1).** Backwards-compatible with v2.1.x — wire `VERSION` stays 3; the new packet types (`0x21`–`0x29`) are purely additive and per-client subscription-gated, so a v2.1.x peer never receives them. Server, desktop client and Android client carry `VERSION = "2.2.0"`; pair with **Thetis fork PA3GHM TL2-4** for the full feature-set, stock Thetis remains supported.
+
+- **Virtual receivers (VRX1/VRX2)** — two independent receivers carved from the wideband DDC I/Q stream by an FFT channelizer (`vrx-rs` crate), each with its own frequency, mode (USB/LSB/AM/SAM/FM), filter, high-res spectrum/waterfall and S-meter in a joint pop-out window; NB (8 kHz) / WB (16 kHz) Opus audio; per-DDC-bucket frequency memory and state persistence. See §28 and the illustrated explainer at <https://cjenschede.github.io/ThetisLink/VRX-explained.html>.
+- **Dual-radio (slot 1)** — a second Yaesu runs as an independent channel with auto-detected model (`ID;` → `0670` = FT-991A, `0840` = FTX-1), per-radio audio/CAT/memory, a `RadioInfo` broadcast for panel naming, FTX-1 WIRES-X EX-menu fields and a server-side software squelch (FM-family only). See §29.
+- **Switchable RX bandwidth + `#N` device index** — one switch sets narrow/wide RX audio for Thetis, the VRX channels and the Yaesu radios together (receive only); a `#N` suffix disambiguates two identically-named USB Audio CODEC devices. WAV recording rate auto-scales.
 
 ### v2.1.0 highlights
 
@@ -113,7 +121,7 @@ The v2.0.0 release is a major step compared to the v0.x line. Key changes:
 
 ## 2. Architecture
 
-ThetisLink v2.1.0 uses a single TCI WebSocket connection to Thetis for audio, IQ and all radio commands. With the PA3GHM fork the additional `_ex` commands extend the surface (CTUN auto-recenter, diversity, per-RX DDC sample rate, `rx_only_ex` preventive TX-inhibit). No parallel CAT connection is required against either stock v2.10.3.15 or the fork.
+ThetisLink v2.2.0 uses a single TCI WebSocket connection to Thetis for audio, IQ and all radio commands. With the PA3GHM fork the additional `_ex` commands extend the surface (CTUN auto-recenter, diversity, per-RX DDC sample rate, `rx_only_ex` preventive TX-inhibit). No parallel CAT connection is required against either stock v2.10.3.15 or the fork.
 
 ```mermaid
 flowchart LR
@@ -643,6 +651,58 @@ Multi-channel audio: bundles 1-4 mono Opus frames in a single UDP packet. Perfec
 | 0x33 | TotpChallenge | Server -> Client | (no payload, signals TOTP input) |
 | 0x34 | TotpResponse | Client -> Server | 2-byte length + UTF-8 TOTP code (6 digits) |
 
+### Protocol additions (v2.2.0)
+
+Wire protocol `VERSION` stays **3** in v2.2.0 — the VRX and second-radio features are **purely additive**. The new packet types reuse the previously-unused `0x21`–`0x29` range and — the actual backward-compatibility guarantee — are sent only to clients that explicitly subscribe (per-client gating, see below), so a v2.1.x peer never receives them in the first place. No existing packet layout changed, so a v2.1.x client and a v2.2.0 server interoperate fully.
+
+#### New packet types
+
+| ID | Name | Direction | Layout / notes |
+|----|------|-----------|----------------|
+| 0x21 | AudioVrx | Server -> Client | VRX audio. `header(4) + sequence(4) + timestamp(4) + vrx_id(1) + opus_len(2) + opus_data(N)` = 15 + N bytes. `vrx_id` multiplexes VRX1/VRX2 on the same socket. Narrowband (8 kHz) or wideband (16 kHz) via the header `AUDIO_WIDEBAND` flag. |
+| 0x22 | FrequencyVrx | Client -> Server | VRX absolute listen frequency. `header(4) + vrx_id(1) + frequency_hz(8)` = 13 bytes. The server computes the bin offset relative to the current DDC center. |
+| 0x23 | SpectrumVrx1 | Server -> Client | VRX1 high-resolution extracted spectrum view. Same layout as `Spectrum` (0x0A). |
+| 0x24 | SpectrumVrx2 | Server -> Client | VRX2 high-resolution extracted spectrum view. Same layout as `Spectrum`. |
+| 0x25 | AudioYaesu2 | Server -> Client | Slot-1 (second radio) audio. Byte-identical layout to `AudioYaesu` (0x16). |
+| 0x26 | YaesuState2 | Server -> Client | Slot-1 radio state. Byte-identical layout to `YaesuState` (0x17). |
+| 0x27 | FrequencyYaesu2 | Client -> Server | Slot-1 frequency set. Byte-identical layout to `FrequencyYaesu` (0x18). |
+| 0x28 | YaesuMemoryData2 | Server -> Client | Slot-1 memory data (tab-separated text). Same layout as `YaesuMemoryData` (0x19). |
+| 0x29 | RadioInfo | Server -> Client | Per-radio model info: `slot(1) + model(1)` (model 0 = FT-991A, 1 = FTX-1). Lets a dual-radio-aware client label the panels correctly. Kept as a separate packet so the byte-identical slot-0 `YaesuState` stays unchanged. |
+
+#### New ControlId values
+
+The second-radio controls mirror the slot-0 Yaesu controls (`0x20`–`0x2F`) on the free range `0x80`–`0x8F`; the VRX controls live on `0x67`–`0x74`. Three earlier-reserved IDs are also now in use.
+
+| ID | Name | Values | Description |
+|----|------|--------|-------------|
+| 0x66 | ThetisWidebandAudio | 0/1 | RX audio bandwidth: 0 = narrowband 8 kHz (default), 1 = wideband 16 kHz. Requires `WIDEBAND_AUDIO` capability on both sides. |
+| 0x67 | VrxEnable | 0/1 | VRX1 enable + **audio-subscription gate**. When 1, server runs the channelizer on RX1 IQ and streams VRX audio. |
+| 0x68 | VrxMode | 0=USB, 1=LSB, 2=AM, 3=SAM, 4=FM | VRX1 demod mode |
+| 0x69 | VrxVolume | volume x100 (0..200) | VRX1 mix volume (applied client-side at mix time) |
+| 0x6A | VrxEnable2 | 0/1 | VRX2 enable + audio-subscription gate (RX2 IQ + VFO-B) |
+| 0x6B | VrxMode2 | 0=USB, 1=LSB, 2=AM, 3=SAM, 4=FM | VRX2 demod mode |
+| 0x6C | VrxVolume2 | volume x100 | VRX2 mix gain (client-side) |
+| 0x6D | VrxFilterLow | signed Hz (i16 as u16) | VRX1 SSB filter low edge |
+| 0x6E | VrxFilterHigh | signed Hz | VRX1 SSB filter high edge |
+| 0x6F | VrxFilterLow2 | signed Hz | VRX2 SSB filter low edge |
+| 0x70 | VrxFilterHigh2 | signed Hz | VRX2 SSB filter high edge |
+| 0x71 | VrxSpectrumEnable | 0/1 | VRX1 high-res spectrum extraction + spectrum-subscription gate |
+| 0x72 | VrxSpectrumEnable2 | 0/1 | VRX2 high-res spectrum extraction gate |
+| 0x73 | VrxSpectrumSpanKhz | kHz (u16) | VRX1 high-res spectrum window width |
+| 0x74 | VrxSpectrumSpanKhz2 | kHz (u16) | VRX2 high-res spectrum window width |
+| 0x80 | Yaesu2Enable | 0/1 | Slot-1 stream enable + **slot-1 subscription gate**. Mirror of `YaesuEnable` (0x20). |
+| 0x81..0x8F | Yaesu2Ptt … Yaesu2SetMenu | (per slot-0 mirror) | 1:1 mirror of slot-0 Yaesu controls `0x21`–`0x2F` (PTT, freq, mic gain, mode, memory read/recall/write, VFO select, squelch, RF gain, radio mic gain, RF power, raw button, read/set EX menu). |
+
+#### Per-client subscription gating
+
+The new packet types are **never broadcast to every client** — each is sent only to clients that explicitly opted in, using the same mechanism that gates the second radio:
+
+- **VRX audio** (`AudioVrx`): a client only receives it after sending `VrxEnable` (VRX1) or `VrxEnable2` (VRX2) with value 1. Server-side `SessionManager::vrx_audio_addrs(ch)` filters the broadcast list to subscribed, authenticated clients only.
+- **VRX high-res spectrum** (`SpectrumVrx1/2`): gated by `VrxSpectrumEnable` / `VrxSpectrumEnable2` via `vrx_spectrum_addrs(ch)`.
+- **Second radio** (`AudioYaesu2` / `YaesuState2` / `YaesuMemoryData2`): gated by `Yaesu2Enable` (default off) via `yaesu2_addrs()`, exactly as slot-0 Yaesu uses `YaesuEnable` + `yaesu_addrs()`.
+
+Because the default for every gate is **off**, a v2.1.x client (which never sends `VrxEnable*` / `Yaesu2Enable`) receives none of the `0x21`–`0x29` packet types — no parse errors, no log spam, no wasted bandwidth.
+
 ---
 
 ## 6. Opus Codec Configuration
@@ -761,7 +821,7 @@ TCI (Transceiver Control Interface) is a WebSocket-based protocol built into The
 
 ### Stock vs fork TCI sub-protocol
 
-ThetisLink v2.1.0 talks TCI to both **stock Thetis v2.10.3.15** and the **PA3GHM fork (TL2-4)**. The base protocol is identical — but the fork adds an `_ex` extension layer that ThetisLink uses when available, including the `rx_only_ex` preventive TX-inhibit (TL2-3+) and the wideband-IQ extension (TL2-4).
+ThetisLink v2.2.0 talks TCI to both **stock Thetis v2.10.3.15** and the **PA3GHM fork (TL2-4)**. The base protocol is identical — but the fork adds an `_ex` extension layer that ThetisLink uses when available, including the `rx_only_ex` preventive TX-inhibit (TL2-3+) and the wideband-IQ extension (TL2-4).
 
 **Capability negotiation:** at connect time the client requests `tci_caps_ex;`. With the fork (and the "ThetisLink extensions" Setup checkbox enabled) Thetis responds with a list of supported `_ex` capabilities (`auto_recenter_ex`, `rx_filter_preset_ex`, `ddc_sample_rate_ex`, `diversity_ex`, ...). Stock Thetis does not implement `tci_caps_ex` and the request times out → ThetisLink falls back to stock-mode behaviour.
 
@@ -1983,7 +2043,83 @@ Passwords and TOTP secrets are automatically obfuscated on saving.
 
 ---
 
-## 28. Known Limitations
+## 28. Virtual Receivers (VRX) (v2.2.0)
+
+Two independent **virtual receivers** — VRX1 on RX1/VFO-A and VRX2 on RX2/VFO-B — are carved out of the wideband DDC I/Q stream by an FFT channelizer (the new `vrx-rs` crate). Each VRX has its own listen frequency, demod mode, filter, high-resolution spectrum/waterfall, S-meter and audio, mixed into the main RX audio alongside RX1/RX2 and the connected Yaesu radios. State (enable/frequency/mode/filter) persists across reconnects.
+
+For the full illustrated treatment of the signal chain — from radio wave to sound — and of the server -> client network path, see the public explainers:
+- [How a VRX works](https://cjenschede.github.io/ThetisLink/VRX-explained.html)
+- [The network path](https://cjenschede.github.io/ThetisLink/Network-explained.html)
+
+### FFT-channelizer principle
+
+The channelizer turns one wideband complex I/Q stream into a narrowband audio channel at a tunable carrier offset, without running a full-spectrum FFT per VRX:
+
+```
+Wideband DDC I/Q (96 / 192 / 384 / 768 / 1536 kHz)
+  -> accumulate into FFT frames -> forward FFT
+  -> select the bins around the VRX carrier offset (bin selection)
+  -> iFFT of the selected band -> per-mode demodulation
+  -> 8 kHz (NB) or 16 kHz (WB) audio -> Opus encode -> AudioVrx
+```
+
+The forward FFT cost is amortised across the input batch; adding a VRX channel only adds a per-channel iFFT + demod + Opus encode, not another whole-spectrum FFT. This is the same architectural pattern WebSDR / OpenWebRX use at larger scale.
+
+### Bin width and output rates
+
+- **62.5 Hz audio bins.** The iFFT size is chosen so the bin width is exactly 62.5 Hz at both output rates: 128-point iFFT at 8 kHz (NB) and 256-point iFFT at 16 kHz (WB). The forward FFT size scales with the input DDC rate so the FFT and iFFT bin widths match (`fft_n = ifft_n x input_rate / output_rate`). Filter edges are quantised to multiples of 62.5 Hz so they map straight onto bin indices.
+- **NB output (8 kHz, Opus narrowband)** is the default — SSB/CW, ~4 kHz audio bandwidth.
+- **WB output (16 kHz, Opus wideband)** is selected for AM/FM-quality audio. WB is also driven by the global RX-bandwidth switch (ControlId `ThetisWidebandAudio` 0x66, §5).
+
+### Demodulation modes
+
+`VrxMode` supports USB, LSB, AM, SAM and FM. SSB extracts a single sideband and emits the real part; AM demodulates by envelope; SAM coherently in-phase (assumes the user is tuned on carrier — no PLL tracking); FM emits the phase derivative between successive complex baseband samples (`atan2` quadrant-correct as of the v2.2.0 fix).
+
+### Protocol surface
+
+- **Audio:** `AudioVrx` (0x21), `vrx_id` selecting VRX1/VRX2, NB or WB.
+- **Tuning:** `FrequencyVrx` (0x22) sets the absolute listen frequency; the server converts to a bin offset against the live DDC center. Per-DDC-bucket frequency memory keeps each VRX where it was when you return to a band.
+- **High-res spectrum:** `SpectrumVrx1/2` (0x23/0x24), enabled and width-controlled by `VrxSpectrumEnable*` (0x71/0x72) + `VrxSpectrumSpanKhz*` (0x73/0x74).
+- **Controls:** `VrxEnable*`, `VrxMode*`, `VrxVolume*`, `VrxFilterLow/High*` (0x67–0x70).
+
+All VRX audio and spectrum is gated per client (see §5, *Per-client subscription gating*), so older clients never receive any VRX packet type.
+
+---
+
+## 29. Dual-radio: second Yaesu (slot 1) (v2.2.0)
+
+A second Yaesu radio runs alongside the first as an **independent channel** (slot 1), each with its own CAT serial port, USB audio device, frequency, mode, PTT and memory set. Slot 0 is the existing radio (packets `0x16`–`0x19`, unchanged); slot 1 uses the additive packet variants `0x25`–`0x29` and the mirrored controls `0x80`–`0x8F`.
+
+### Model autodetect via `ID;`
+
+The radio model is detected from the CAT `ID;` response on bring-up (`RadioModel::from_id_code`):
+
+| `ID;` code | Model |
+|------------|-------|
+| `0670` | FT-991A |
+| `0840` | FTX-1 |
+
+The Yaesu CAT dialect is largely shared, so `RadioModel` only carries the few per-model differences (autodetect code, audio device name, mode-code extras and a few command-format quirks — e.g. the FTX-1 uses 5-digit memory channels `MC0{ch:05};` and a power-head prefix `PC{head}{nnn};`, where the 991A uses 3-digit `MC{ch:03};` and `PC{nnn};`). Detection probes the serial port with a baud fallback. A bring-up probe logs a warning if the detected model does not match the configured slot (a likely USB-enumeration swap). An unknown but responsive Yaesu `ID` defaults the slot model to **FTX-1** (`detect_model` → `unwrap_or(Ftx1)`), parsed with the shared, 991A-compatible CAT dialect.
+
+Two identically-named `USB Audio CODEC` devices (one per radio) can be disambiguated with a `#N` index suffix in the audio-device selector.
+
+### Per-radio packet variants and RadioInfo
+
+Slot 1 carries its own audio (`AudioYaesu2` 0x25), state (`YaesuState2` 0x26), frequency set (`FrequencyYaesu2` 0x27) and memory data (`YaesuMemoryData2` 0x28) — each byte-identical in layout to its slot-0 counterpart. The server also broadcasts `RadioInfo` (0x29) — `slot + model` — so a dual-radio-aware client can label each panel correctly ("991A 1" / "FTX1" etc.). All slot-1 traffic is gated behind `Yaesu2Enable` (default off), so an unaware or older client never receives it.
+
+### FTX-1 software squelch
+
+The FTX-1's hardware squelch does not gate its USB audio, so an FM channel would stream noise continuously. A **server-side software squelch** addresses this:
+
+- The fast poll loop adds `RI0;` alongside `SM0;` for the FTX-1 (the 991A has no `RI` and is not polled for it). The `RI` P8 field reports the radio's busy state -> `squelch_open`.
+- When the squelch is closed the audio loop fades the FTX-1 (Yaesu) USB audio to silence (a short gate envelope, ~200 ms full fade) instead of cutting abruptly; only the fade edges are logged. This gates the radio's own USB audio path only — it does not touch the VRX or Thetis audio.
+- **FM-family modes only.** Gating applies to internal mode 5 (FM / FM-N / DATA-FM). On SSB/CW/AM/data the busy flag is meaningless, so audio always passes through. `squelch_open` defaults to **true** (open), so a radio without `RI` (the 991A) or any channel before the first poll is never gated.
+
+The FTX-1 **WIRES-X** EX-menu fields are added to the EX editor (§26).
+
+---
+
+## 30. Known Limitations
 
 1. **AM/FM audio:** Currently no audio in AM/FM mode on Thetis (SSB/CW works correctly).
 

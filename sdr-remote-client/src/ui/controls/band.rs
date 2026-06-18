@@ -71,7 +71,7 @@ pub(crate) fn render_band_selector(
             } else {
                 egui::Button::new(RichText::new(label).size(11.0))
             };
-            let resp = ui.add_enabled(ctx.connected, btn);
+            let resp = ui.add_enabled(ctx.connected, btn).on_hover_text("Select band.");
             if resp.clicked() {
                 ctx.events.emit(UiEvent::ClickReceived {
                     control_id: "band_selector",

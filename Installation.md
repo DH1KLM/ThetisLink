@@ -1,10 +1,10 @@
-# ThetisLink v2.1.0 - Installation Guide
+# ThetisLink v2.2.0 - Installation Guide
 
 ThetisLink is a remote control application for the ANAN 7000DLE SDR with Thetis. Audio, spectrum, PTT and full radio control over the network via TCI WebSocket.
 
 **Compatibility:** ThetisLink talks only to **Thetis** (via TCI WebSocket) and not directly to the SDR hardware. It therefore works with any SDR device supported by **Thetis v2.10.3.15** (official release by ramdor) — both HPSDR Protocol 1 (Hermes, Angelia, Orion) and HPSDR Protocol 2 (ANAN-7000DLE, ANAN-8000DLE, ANAN-G2, Hermes-Lite 2, etc.). Optional: Yaesu FT-991A as a second radio (via COM port).
 
-**PA3GHM Thetis fork (optional, recommended for TL2 extensions):** ThetisLink v2.1.0 works fine with stock Thetis v2.10.3.15 over TCI alone — no separate CAT TCP connection is required. The PA3GHM fork is an **optional** drop-in replacement that adds ThetisLink-specific TL2 `_ex` extensions on top of stock Thetis: extended IQ bandwidth up to 1536 kHz (vs the 384 kHz stock cap), `tci_caps_ex` capability broadcast, server-side CTUN auto-recenter (`auto_recenter_ex`), filter-preset and per-RX DDC-rate push notifications, and diversity auto-null with live circle broadcast. All extensions sit behind the **"ThetisLink extensions"** checkbox in Thetis and are disabled by default; with the checkbox unchecked the TCI extension behaviour is preserved (stock v2.10.3.15 — note the fork still carries its own build tag, release notes and About metadata). See the User Manual (`User-Manual-EN.md`) for details.
+**PA3GHM Thetis fork (optional, recommended for TL2 extensions):** ThetisLink v2.2.0 works fine with stock Thetis v2.10.3.15 over TCI alone — no separate CAT TCP connection is required. The PA3GHM fork is an **optional** drop-in replacement that adds ThetisLink-specific TL2 `_ex` extensions on top of stock Thetis: extended IQ bandwidth up to 1536 kHz (vs the 384 kHz stock cap), `tci_caps_ex` capability broadcast, server-side CTUN auto-recenter (`auto_recenter_ex`), filter-preset and per-RX DDC-rate push notifications, and diversity auto-null with live circle broadcast. All extensions sit behind the **"ThetisLink extensions"** checkbox in Thetis and are disabled by default; with the checkbox unchecked the TCI extension behaviour is preserved (stock v2.10.3.15 — note the fork still carries its own build tag, release notes and About metadata). See the User Manual (`User-Manual-EN.md`) for details.
 
 **Disclaimer:** This software controls radio transmitters. Use at your own risk. The author is not responsible for damage to equipment, interference or violations of regulations resulting from the use of this software. Verify all safety features (PTT timeout, power limits) before transmitting.
 
@@ -16,7 +16,7 @@ ThetisLink is a remote control application for the ANAN 7000DLE SDR with Thetis.
 |------|-------------|
 | ThetisLink-Server.exe | ThetisLink Server - runs on the PC alongside Thetis |
 | ThetisLink-Client.exe | ThetisLink Desktop Client - Windows |
-| ThetisLink-2.1.0.apk | ThetisLink Android Client - phone/tablet |
+| ThetisLink-2.2.0.apk | ThetisLink Android Client - phone/tablet |
 | Installation.pdf | Installation guide (English, this document) |
 | User-Manual-EN.pdf | User manual (English) |
 | Technical-Reference.pdf | Technical reference (English) |
@@ -66,7 +66,7 @@ No administrator rights required for the ThetisLink Server or ThetisLink Clients
 
 ### 1.0 Installing the PA3GHM Thetis fork (recommended)
 
-The PA3GHM fork is a modified version of Thetis with ThetisLink-specific extensions. **ThetisLink v2.1.0 works best with Thetis-fork build PA3GHM TL2-4** — that build ships the wideband-IQ extension + modulation-filter fan-out that this release relies on. Earlier fork builds also work, with progressively fewer fork-only features available (TL2-3 without wideband, TL2-2 without rx_only_ex push-notify, etc.); stock Thetis v2.10.3.15 remains the fallback. Installation:
+The PA3GHM fork is a modified version of Thetis with ThetisLink-specific extensions. **ThetisLink v2.2.0 works best with Thetis-fork build PA3GHM TL2-4** — that build ships the wideband-IQ extension + modulation-filter fan-out that this release relies on. Earlier fork builds also work, with progressively fewer fork-only features available (TL2-3 without wideband, TL2-2 without rx_only_ex push-notify, etc.); stock Thetis v2.10.3.15 remains the fallback. Installation:
 
 1. First install the official **Thetis v2.10.3.15** using the standard installer (if you have not already done so)
 2. Download `Thetis.exe` from the PA3GHM fork — **release tag `TL2-4`** at [cjenschede/Thetis](https://github.com/cjenschede/Thetis/releases) (branch `thetislink-tl2`)
@@ -99,7 +99,7 @@ Setup -> Serial/Network/Midi CAT -> Network -> **TCI Server** group:
 With the PA3GHM Thetis fork, on the same tab:
 1. Check **ThetisLink extensions**
 
-> ThetisLink v2.1.0 uses TCI exclusively for radio control. The TCP/IP CAT server in Thetis does not need to be enabled for ThetisLink — it is only required if you want to connect a separate logging program or third-party CAT client to Thetis directly.
+> ThetisLink v2.2.0 uses TCI exclusively for radio control. The TCP/IP CAT server in Thetis does not need to be enabled for ThetisLink — it is only required if you want to connect a separate logging program or third-party CAT client to Thetis directly.
 
 ---
 
@@ -151,7 +151,18 @@ https://www.silabs.com/developer-tools/usb-to-uart-bridge-vcp-drivers
 
 After installing the driver and connecting the Yaesu via USB, **two COM ports** will appear in Device Manager (e.g. COM5 and COM6). Select the **lowest** of the two - this is the CAT/serial port. The other port is for USB audio.
 
-For Yaesu audio: in the ThetisLink Server GUI, select **USB Audio CODEC** as the audio device for the Yaesu device. The ThetisLink Server forwards this audio channel to all connected ThetisLink Clients.
+For Yaesu audio: in the ThetisLink Server GUI, select **USB Audio CODEC** as the audio device for the Yaesu device. The ThetisLink Server forwards this audio channel to all connected ThetisLink Clients. A second radio (e.g. FTX-1) may appear as **USB Audio Device** — pick the correct device per radio.
+
+> **Important — disable Windows audio enhancements.** By default Windows applies "audio enhancements" (noise suppression / AGC) to recording devices. On the radio's USB audio device this makes constant band noise fade away after a few seconds with compression artifacts — as if an adaptive filter were applied. Disable it on the server PC:
+>
+> 1. Windows key → type `mmsys.cpl` → Enter.
+> 2. **Recording** tab → select the radio's USB audio device (e.g. *Microphone (USB Audio CODEC)* for the FT-991A) → **Properties**.
+> 3. **Enhancements** tab → tick **"Disable all enhancements"** → OK. (Windows 11: Settings → System → Sound → click the recording device → **Audio enhancements → Off**.)
+> 4. Repeat for each connected radio audio device.
+>
+> Without this step the audio still sounds clear, but the noise disappears unnaturally. This is caused by Windows, not by ThetisLink.
+
+> **Two identically-named audio devices.** Two identical radios (e.g. 2× FT-991A) present their USB audio with the **same** name ("USB Audio CODEC"). Add a **`#N` suffix** to the audio name to select the N-th (1-based) device: `yaesu_audio=USB Audio CODEC#1` for radio 1, `yaesu2_audio=USB Audio CODEC#2` for radio 2. Without `#N` = the first device (unchanged behavior). If Windows already gives them distinct names (often a prefix like "2- USB Audio CODEC"), just use that name without `#`. The server startup log lists the device names under `Beschikbare audio-input devices [...]`.
 
 ### 2.4 Firewall
 
@@ -237,14 +248,14 @@ When the server itself runs on the Thetis PC, its window has two tabs: **Status*
 ### 4.1 Installing the APK
 
 **Via file manager:**
-1. Copy `ThetisLink-2.1.0.apk` to your phone (USB, email, or cloud)
+1. Copy `ThetisLink-2.2.0.apk` to your phone (USB, email, or cloud)
 2. Open the APK file on the phone
 3. Allow "Install from unknown sources" if prompted
 4. Install
 
 **Via ADB** (with USB debugging enabled):
 ```
-adb install ThetisLink-2.1.0.apk
+adb install ThetisLink-2.2.0.apk
 ```
 
 ### 4.2 Connecting — guided setup wizard
@@ -351,6 +362,7 @@ In the ThetisLink Client, use your **public IP address** as the ThetisLink Serve
 | External devices not responding | Check COM port setting in the ThetisLink Server GUI and whether the device is powered on |
 | Rotor offline | Check IP:port in the ThetisLink Server GUI. Visual Rotor software must not be running at the same time |
 | Yaesu not responding | Check COM port in the ThetisLink Server GUI. Make sure no other program is using the COM port |
+| Yaesu noise fades / compression artifacts | Disable Windows "audio enhancements" on the radio's USB recording device (`mmsys.cpl` → Recording → Properties → Enhancements → disable all). See §2.3 |
 | APK will not install | Allow "unknown sources" in Android settings |
 
 For problems during use, see the User Manual (`User-Manual-EN.md`).

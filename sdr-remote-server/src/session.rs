@@ -162,6 +162,18 @@ pub struct ClientSession {
     pub rx2_spectrum_max_bins: u16,
     pub vfo_sync: bool,
     pub yaesu_enabled: bool,
+    /// Dual-radio slot 1 subscription-gate (PATCH-dual-radio-991a-ftx1, Optie
+    /// B-prime). Default false → oude clients (die `Yaesu2Enable` nooit sturen)
+    /// krijgen nooit slot-1 state/audio/memory. Dit is de echte back-compat-guard.
+    pub yaesu2_enabled: bool,
+    /// VRX per-client subscription-gates (release-gate fix v2.2.0). Default
+    /// false → clients die `VrxEnable*`/`VrxSpectrumEnable*` nooit sturen
+    /// (o.a. oude v2.1.x clients) krijgen nooit `AudioVrx`/`SpectrumVrx`
+    /// packet-types. Zelfde back-compat-patroon als `yaesu2_enabled`.
+    pub vrx1_audio_enabled: bool,
+    pub vrx2_audio_enabled: bool,
+    pub vrx1_spectrum_enabled: bool,
+    pub vrx2_spectrum_enabled: bool,
     pub audio_mode: u8, // 255=default(CH0 only), 0=Mono, 1=BIN, 2=Split
     /// DX-cluster spot stream opt-out — default true (= stream actief).
     /// Wanneer false stuurt de server geen Spot-frames meer naar deze
@@ -313,11 +325,13 @@ impl SessionManager {
             rx2_spectrum_fps: sdr_remote_core::DEFAULT_SPECTRUM_FPS,
             rx2_spectrum_zoom: 1.0, rx2_spectrum_pan: 0.0,
             rx2_spectrum_max_bins: sdr_remote_core::DEFAULT_SPECTRUM_BINS as u16,
-            vfo_sync: false, yaesu_enabled: false, audio_mode: 255,
+            vfo_sync: false, yaesu_enabled: false, yaesu2_enabled: false, audio_mode: 255,
             dx_spots_enabled: true,
             allow_zoom_below_2x: false,
             smeter_sources: 0x22,
             thetis_wideband_audio: false,
+            vrx1_audio_enabled: false, vrx2_audio_enabled: false,
+            vrx1_spectrum_enabled: false, vrx2_spectrum_enabled: false,
         });
         info!("Auth challenge sent to {}", addr);
         nonce
@@ -411,12 +425,14 @@ impl SessionManager {
                 rx2_spectrum_pan: 0.0,
                 rx2_spectrum_max_bins: sdr_remote_core::DEFAULT_SPECTRUM_BINS as u16,
                 vfo_sync: false,
-                yaesu_enabled: false,
+                yaesu_enabled: false, yaesu2_enabled: false,
                 audio_mode: 255, // default: CH0 only until client sends AudioMode
                 dx_spots_enabled: true,
                 allow_zoom_below_2x: false,
                 smeter_sources: 0x22,
                 thetis_wideband_audio: false,
+                vrx1_audio_enabled: false, vrx2_audio_enabled: false,
+                vrx1_spectrum_enabled: false, vrx2_spectrum_enabled: false,
             });
             TouchResult::NewClient
         }
@@ -563,6 +579,48 @@ impl SessionManager {
         }
     }
 
+    /// Dual-radio slot 1 subscription-gate (Optie B-prime). Spiegel van
+    /// `set_yaesu_enabled`; gezet door de `Yaesu2Enable`-control.
+    pub fn set_yaesu2_enabled(&mut self, addr: SocketAddr, enabled: bool) {
+        if let Some(session) = self.clients.get_mut(&addr) {
+            session.yaesu2_enabled = enabled;
+        }
+    }
+
+    /// VRX per-client audio-subscription (release-gate fix). ch 0 = VRX1, anders VRX2.
+    pub fn set_vrx_audio(&mut self, addr: SocketAddr, ch: u8, on: bool) {
+        if let Some(s) = self.clients.get_mut(&addr) {
+            if ch == 0 { s.vrx1_audio_enabled = on; } else { s.vrx2_audio_enabled = on; }
+        }
+    }
+
+    /// VRX per-client high-res-spectrum-subscription. ch 0 = VRX1, anders VRX2.
+    pub fn set_vrx_spectrum(&mut self, addr: SocketAddr, ch: u8, on: bool) {
+        if let Some(s) = self.clients.get_mut(&addr) {
+            if ch == 0 { s.vrx1_spectrum_enabled = on; } else { s.vrx2_spectrum_enabled = on; }
+        }
+    }
+
+    /// Subscribers voor `AudioVrx` op kanaal `ch` (0=VRX1, 1=VRX2). Spiegel van
+    /// `yaesu2_addrs`: alleen clients die `VrxEnable*` aan hebben gezet — oude
+    /// clients krijgen nooit een `AudioVrx` packet-type.
+    pub fn vrx_audio_addrs(&self, ch: u8) -> Vec<SocketAddr> {
+        self.clients.values()
+            .filter(|s| Self::is_active_authed(s)
+                && if ch == 0 { s.vrx1_audio_enabled } else { s.vrx2_audio_enabled })
+            .map(|s| s.addr)
+            .collect()
+    }
+
+    /// Subscribers voor `SpectrumVrx1/2` (high-res). ch 0=VRX1, 1=VRX2.
+    pub fn vrx_spectrum_addrs(&self, ch: u8) -> Vec<SocketAddr> {
+        self.clients.values()
+            .filter(|s| Self::is_active_authed(s)
+                && if ch == 0 { s.vrx1_spectrum_enabled } else { s.vrx2_spectrum_enabled })
+            .map(|s| s.addr)
+            .collect()
+    }
+
     /// Set the S-meter source-subscription bitmap for a client.
     /// See `ControlId::SmeterSources` for bit layout.
     pub fn set_smeter_sources(&mut self, addr: SocketAddr, mask: u16) {
@@ -646,6 +704,15 @@ impl SessionManager {
     pub fn yaesu_addrs(&self) -> Vec<SocketAddr> {
         self.clients.iter()
             .filter(|(_, s)| s.yaesu_enabled && Self::is_active_authed(s))
+            .map(|(addr, _)| *addr)
+            .collect()
+    }
+
+    /// Slot-1 subscribers (Optie B-prime). Spiegel van `yaesu_addrs`; alleen
+    /// clients die `Yaesu2Enable` aan hebben gezet → oude clients nooit.
+    pub fn yaesu2_addrs(&self) -> Vec<SocketAddr> {
+        self.clients.iter()
+            .filter(|(_, s)| s.yaesu2_enabled && Self::is_active_authed(s))
             .map(|(addr, _)| *addr)
             .collect()
     }
@@ -831,11 +898,13 @@ mod tests {
             rx2_spectrum_zoom: rx2_zoom,
             rx2_spectrum_pan: 0.0,
             rx2_spectrum_max_bins: 256,
-            vfo_sync: false, yaesu_enabled: false, audio_mode: 255,
+            vfo_sync: false, yaesu_enabled: false, yaesu2_enabled: false, audio_mode: 255,
             dx_spots_enabled: true,
             allow_zoom_below_2x: allow,
             smeter_sources: 0x22,
             thetis_wideband_audio: false,
+            vrx1_audio_enabled: false, vrx2_audio_enabled: false,
+            vrx1_spectrum_enabled: false, vrx2_spectrum_enabled: false,
         }
     }
 

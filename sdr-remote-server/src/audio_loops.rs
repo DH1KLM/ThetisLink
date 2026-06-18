@@ -22,6 +22,95 @@ use sdr_remote_core::{
 use crate::ptt::PttController;
 use crate::session::SessionManager;
 
+// ── VRX experiment: one-shot IQ dump ────────────────────────────────
+// Activated by VRX_DUMP=<path> env. Duration via VRX_DUMP_SECONDS
+// (default 5 s). File format: u32 LE sample_rate_hz, then interleaved
+// f32 LE I, f32 LE Q pairs. Read by `vrx-spike --input <path>`.
+
+struct VrxDumpState {
+    writer: std::io::BufWriter<std::fs::File>,
+    samples_written: u64,
+    samples_target: u64,
+    sample_rate: u32,
+    header_written: bool,
+    finished: bool,
+    path: String,
+}
+
+impl VrxDumpState {
+    fn open(path: &str) -> std::io::Result<Self> {
+        let f = std::fs::File::create(path)?;
+        let seconds: f32 = std::env::var("VRX_DUMP_SECONDS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5.0);
+        // samples_target is computed once the first frame arrives so we
+        // know the actual rate Thetis is providing.
+        info!(
+            "VRX dump: capturing ~{} s of RX1 I/Q to {} (will close on completion)",
+            seconds, path
+        );
+        Ok(Self {
+            writer: std::io::BufWriter::new(f),
+            samples_written: 0,
+            samples_target: 0,
+            sample_rate: 0,
+            header_written: false,
+            finished: false,
+            path: path.to_string(),
+        })
+    }
+
+    fn write_batch(&mut self, sample_rate: u32, pairs: &[(f32, f32)]) {
+        if self.finished {
+            return;
+        }
+        use std::io::Write;
+        if !self.header_written {
+            let seconds: f32 = std::env::var("VRX_DUMP_SECONDS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(5.0);
+            self.sample_rate = sample_rate;
+            self.samples_target = (sample_rate as f32 * seconds) as u64;
+            if self.writer.write_all(&sample_rate.to_le_bytes()).is_err() {
+                self.finished = true;
+                return;
+            }
+            self.header_written = true;
+            info!(
+                "VRX dump: header written, sample_rate={} Hz, target={} samples",
+                sample_rate, self.samples_target
+            );
+        }
+        // Write up to samples_target.
+        let remaining = self.samples_target.saturating_sub(self.samples_written);
+        let take = (pairs.len() as u64).min(remaining) as usize;
+        for &(i, q) in &pairs[..take] {
+            if self.writer.write_all(&i.to_le_bytes()).is_err()
+                || self.writer.write_all(&q.to_le_bytes()).is_err()
+            {
+                self.finished = true;
+                return;
+            }
+        }
+        self.samples_written += take as u64;
+        if self.samples_written >= self.samples_target {
+            let _ = self.writer.flush();
+            self.finished = true;
+            info!(
+                "VRX dump: capture complete, {} samples written to {}",
+                self.samples_written, self.path
+            );
+        }
+    }
+}
+
+// VRX live channelizer + Opus encode + UDP send is volledig
+// gedelegeerd aan de `vrx-rs` crate + `vrx_bridge::ThetisVrxSink`.
+// `tci_iq_consumer` instantieert per VRX-channel een `VrxRuntime`
+// en geeft elke IQ-batch door via `feed()`.
+
 // â”€â”€ Resampling helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Resample i16 8kHz â†’ f32 device rate
@@ -365,24 +454,47 @@ pub async fn yaesu_audio_loop(
     start: Instant,
     audio_stats: Arc<crate::audio_stats::AudioActivityStats>,
     server_start: Instant,
+    // Dual-radio (Optie B-prime): slot 0 → yaesu_addrs + AudioYaesu (byte-identiek
+    // aan het bestaande pad); slot 1 → yaesu2_addrs + AudioYaesu2.
+    slot: u8,
+    // Live radio-status (voor de software-squelch). FTX-1: squelch_open uit de
+    // RI-poll gate't de USB-audio. 991A: squelch_open blijft true → geen effect.
+    // std::sync::Mutex (matcht YaesuRadio.status; audio_loops' `Mutex` = tokio).
+    status: Arc<std::sync::Mutex<crate::yaesu::YaesuState>>,
 ) -> Result<()> {
+    let audio_ptype = if slot == 0 { PacketType::AudioYaesu } else { PacketType::AudioYaesu2 };
     let frame_samples = (sample_rate * 20 / 1000) as usize;
 
-    let mut encoder = OpusEncoder::new()?;
-    let mut resampler_in = rubato::SincFixedIn::<f32>::new(
+    // Radio-RX bandbreedte volgt de Thetis-wideband-toggle (build 122):
+    // de client kiest in de Server-tab NB (laag dataverbruik) of WB (helder,
+    // CELT i.p.v. SILK → getrouwe ruis). Eén globale knop voor Thetis + beide
+    // radio's. We houden daarom beide encoders/resamplers aan en sturen per
+    // abonnee het formaat dat die client wil (`client_thetis_wideband`), met
+    // de `AUDIO_WIDEBAND`-flag op WB-packets. Mirror van het Thetis-multi-ch-pad.
+    let mut enc_nb = OpusEncoder::new_radio_rx()?;      // 8 kHz, DTX-uit
+    let mut enc_wb = OpusEncoderWideband::new()?;       // 16 kHz
+    let mut res_nb = rubato::SincFixedIn::<f32>::new(
         NETWORK_SAMPLE_RATE as f64 / sample_rate as f64,
-        1.0,
-        hq_sinc_params(),
-        frame_samples,
-        1,
-    ).context("create Yaesu audio resampler")?;
+        1.0, hq_sinc_params(), frame_samples, 1,
+    ).context("create Yaesu NB resampler")?;
+    let mut res_wb = rubato::SincFixedIn::<f32>::new(
+        NETWORK_SAMPLE_RATE_WIDEBAND as f64 / sample_rate as f64,
+        1.0, hq_sinc_params(), frame_samples, 1,
+    ).context("create Yaesu WB resampler")?;
 
     let mut sequence: u32 = 0;
     let mut accumulator: Vec<f32> = Vec::with_capacity(frame_samples * 4);
     let mut tick = interval(Duration::from_millis(20));
     let mut had_clients = false;
 
-    info!("Yaesu audio TX loop started ({}Hz â†’ {}Hz Opus)", sample_rate, NETWORK_SAMPLE_RATE);
+    // Software-squelch gate-envelope (FTX-1: dichte squelch → fade naar stilte;
+    // de squelch-knop op de radio is de drempel). 991A: squelch_open=true → no-op.
+    let mut gate_gain: f32 = 1.0;
+    let mut sql_closed_frames: u32 = 0;
+    const SQL_HANG_FRAMES: u32 = 8;   // ~160 ms hang vóór de gate sluit (anti-flutter)
+    const SQL_FADE_STEP: f32 = 0.10;  // ~10 frames ≈ 200 ms volledige fade
+
+    info!("Yaesu audio RX loop started ({}Hz capture, NB+WB op aanvraag)", sample_rate);
 
     loop {
         tokio::select! {
@@ -402,24 +514,31 @@ pub async fn yaesu_audio_loop(
                 }
             }
             _ = tick.tick() => {
-                let addrs = session.lock().await.yaesu_addrs();
-                if addrs.is_empty() {
+                // Abonnees + hun WB-voorkeur. RX-bandbreedte volgt de Thetis-toggle
+                // per client; TX blijft altijd wideband (zie network.rs).
+                let subs: Vec<(std::net::SocketAddr, bool)> = {
+                    let s = session.lock().await;
+                    let addrs = if slot == 0 { s.yaesu_addrs() } else { s.yaesu2_addrs() };
+                    addrs.into_iter().map(|a| (a, s.client_thetis_wideband(a))).collect()
+                };
+                if subs.is_empty() {
                     accumulator.clear();
                     had_clients = false;
                     continue;
                 }
 
                 if !had_clients {
-                    match OpusEncoder::new() {
-                        Ok(new_enc) => {
-                            encoder = new_enc;
+                    match (OpusEncoder::new_radio_rx(), OpusEncoderWideband::new()) {
+                        (Ok(n), Ok(w)) => {
+                            enc_nb = n;
+                            enc_wb = w;
                             sequence = 0;
                             accumulator.clear();
                             had_clients = true;
-                            info!("Yaesu audio: client(s) enabled, encoder reset");
+                            info!("Yaesu audio: client(s) enabled, encoders reset");
                         }
-                        Err(e) => {
-                            log::error!("Yaesu encoder reset failed: {} — Yaesu audio TX skipped this tick (server blijft draaien)", e);
+                        _ => {
+                            log::error!("Yaesu encoder reset failed — Yaesu audio RX skipped this tick (server blijft draaien)");
                             // had_clients stays false → retry next tick if clients still present.
                         }
                     }
@@ -429,30 +548,95 @@ pub async fn yaesu_audio_loop(
                 if accumulator.len() < frame_samples {
                     continue;
                 }
-                let frame: Vec<f32> = accumulator.drain(..frame_samples).collect();
+                let mut frame: Vec<f32> = accumulator.drain(..frame_samples).collect();
 
-                let pcm_8k = resample_to_network(&mut resampler_in, &frame);
-                let pcm_i16: Vec<i16> = pcm_8k.iter()
-                    .map(|&s| (s * 32767.0).clamp(-32768.0, 32767.0) as i16)
-                    .collect();
-
-                if pcm_i16.len() >= FRAME_SAMPLES {
-                    let opus_data = encoder.encode(&pcm_i16[..FRAME_SAMPLES])?;
-                    let timestamp = start.elapsed().as_millis() as u32;
-                    let packet = AudioPacket {
-                        flags: Flags::NONE,
-                        sequence,
-                        timestamp,
-                        opus_data,
-                    };
-                    sequence = sequence.wrapping_add(1);
-
-                    let mut send_buf = Vec::with_capacity(MAX_PACKET_SIZE);
-                    packet.serialize_as_type(&mut send_buf, PacketType::AudioYaesu);
-
-                    for &addr in &addrs {
-                        let _ = socket.send_to(&send_buf, addr).await;
+                // Software-squelch: fade naar stilte bij dichte squelch (alleen FTX-1
+                // zet squelch_open=false; 991A blijft open → start_g/end_g==1.0 → no-op).
+                // ALLEEN in FM-familie (internal mode 5: FM/FM-N/DATA-FM): op SSB/CW/AM/
+                // RTTY/data heeft de radio-BUSY (RI P8) geen zinvolle betekenis en meldt
+                // hij 'dicht' terwijl er wél audio is → daar audio altijd doorlaten
+                // (owner-test build 123: LSB werd onterecht volledig gedempt).
+                let (sql_open, mode) = {
+                    let s = status.lock().unwrap();
+                    (s.squelch_open, s.mode)
+                };
+                let effective_open = mode != 5 || sql_open;
+                let target: f32 = if effective_open {
+                    sql_closed_frames = 0;
+                    1.0
+                } else {
+                    sql_closed_frames = sql_closed_frames.saturating_add(1);
+                    if sql_closed_frames > SQL_HANG_FRAMES { 0.0 } else { 1.0 }
+                };
+                let start_g = gate_gain;
+                let end_g = if target > gate_gain {
+                    (gate_gain + SQL_FADE_STEP).min(target)
+                } else {
+                    (gate_gain - SQL_FADE_STEP).max(target)
+                };
+                if !(start_g == 1.0 && end_g == 1.0) {
+                    let n = frame.len().max(1) as f32;
+                    for (i, s) in frame.iter_mut().enumerate() {
+                        let g = start_g + (end_g - start_g) * (i as f32 / n);
+                        *s *= g;
                     }
+                }
+                gate_gain = end_g;
+                // Observability: log alleen de fade-randen (geen per-frame spam).
+                if start_g > 0.0 && end_g == 0.0 {
+                    log::info!("Yaesu squelch: gate dicht — audio gedempt");
+                } else if start_g == 0.0 && end_g > 0.0 {
+                    log::info!("Yaesu squelch: gate open — audio hervat");
+                }
+
+                let need_wb = subs.iter().any(|(_, wb)| *wb);
+                let need_nb = subs.iter().any(|(_, wb)| !*wb);
+                let timestamp = start.elapsed().as_millis() as u32;
+
+                // Encodeer alléén de gevraagde formaten (meestal maar één).
+                let nb_buf: Option<Vec<u8>> = if need_nb {
+                    let pcm = resample_to_network(&mut res_nb, &frame);
+                    let i16s: Vec<i16> = pcm.iter()
+                        .map(|&s| (s * 32767.0).clamp(-32768.0, 32767.0) as i16).collect();
+                    if i16s.len() >= FRAME_SAMPLES {
+                        match enc_nb.encode(&i16s[..FRAME_SAMPLES]) {
+                            Ok(op) => {
+                                let p = AudioPacket { flags: Flags::NONE, sequence, timestamp, opus_data: op };
+                                let mut b = Vec::with_capacity(MAX_PACKET_SIZE);
+                                p.serialize_as_type(&mut b, audio_ptype);
+                                Some(b)
+                            }
+                            Err(e) => { log::warn!("Yaesu NB encode: {}", e); None }
+                        }
+                    } else { None }
+                } else { None };
+
+                let wb_buf: Option<Vec<u8>> = if need_wb {
+                    let pcm = resample_to_network(&mut res_wb, &frame);
+                    let i16s: Vec<i16> = pcm.iter()
+                        .map(|&s| (s * 32767.0).clamp(-32768.0, 32767.0) as i16).collect();
+                    if i16s.len() >= FRAME_SAMPLES_WIDEBAND {
+                        match enc_wb.encode(&i16s[..FRAME_SAMPLES_WIDEBAND]) {
+                            Ok(op) => {
+                                let p = AudioPacket { flags: Flags::AUDIO_WIDEBAND, sequence, timestamp, opus_data: op };
+                                let mut b = Vec::with_capacity(MAX_PACKET_SIZE);
+                                p.serialize_as_type(&mut b, audio_ptype);
+                                Some(b)
+                            }
+                            Err(e) => { log::warn!("Yaesu WB encode: {}", e); None }
+                        }
+                    } else { None }
+                } else { None };
+
+                sequence = sequence.wrapping_add(1);
+
+                for (addr, wb) in &subs {
+                    let buf = if *wb { wb_buf.as_ref() } else { nb_buf.as_ref() };
+                    if let Some(b) = buf {
+                        let _ = socket.send_to(b, addr).await;
+                    }
+                }
+                if nb_buf.is_some() || wb_buf.is_some() {
                     audio_stats.yaesu_rx.tick(server_start);
                 }
             }
@@ -466,14 +650,64 @@ pub async fn yaesu_audio_loop(
 // â”€â”€ TCI IQ consumer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 /// Drains IQ channels from TCI and feeds spectrum processors (RX1 + RX2).
+/// Also runs the VRX channelizer on the RX1 IQ stream and emits VrxAudioPacket
+/// UDP frames to subscribed clients (separate-channel VRX audio).
 pub async fn tci_iq_consumer(
     ptt: Arc<Mutex<PttController>>,
     spectrum: Arc<Mutex<crate::spectrum::SpectrumProcessor>>,
     rx2_spectrum: Arc<Mutex<crate::spectrum::Rx2SpectrumProcessor>>,
     shutdown: &mut watch::Receiver<bool>,
+    socket: Arc<UdpSocket>,
+    session: Arc<Mutex<SessionManager>>,
 ) {
     let mut iq_rx1: Option<tokio::sync::mpsc::Receiver<(u32, Vec<(f32, f32)>)>> = None;
     let mut iq_rx2: Option<tokio::sync::mpsc::Receiver<(u32, Vec<(f32, f32)>)>> = None;
+
+    // Local epoch for VRX packet timestamp stamping. Doesn't have to
+    // match `audio_stats.tick` callsites since VRX is a separate
+    // monotonic counter on the wire.
+    let server_start = Instant::now();
+
+    // VRX channelizer experiment — one-shot RX1 I/Q dump to file when
+    // VRX_DUMP=<path> env is set. Captures ~5 s of complex I/Q (or
+    // VRX_DUMP_SECONDS if set), then closes the file. File format:
+    //   u32 LE  sample_rate_hz
+    //   then interleaved f32 I, f32 Q pairs (little-endian)
+    // Loaded by `vrx-spike --input <path>` for offline processing.
+    let mut vrx_dump: Option<VrxDumpState> = std::env::var("VRX_DUMP")
+        .ok()
+        .map(|path| VrxDumpState::open(&path).expect("VRX_DUMP: failed to open"));
+
+    // VRX live channelizers. Two instances: VRX1 on the RX1 IQ stream
+    // + VFO-A (vrx_id=0), VRX2 on the RX2 IQ stream + VFO-B (vrx_id=1).
+    // Both gated at runtime by their own `VrxControlState` slot. The
+    // optional `VRX_LIVE_DIR=<dir>` env still produces WAV captures —
+    // VRX1 writes to the configured dir as before; VRX2 is wav-less to
+    // avoid filename collisions (acceptable for dev tooling, can grow
+    // a per-channel sub-dir later if needed).
+    let vrx_dir = std::env::var("VRX_LIVE_DIR").ok();
+    let initial_wb = session.lock().await.any_client_wants_thetis_wideband();
+    let mut vrx1_runtime = vrx_rs::VrxRuntime::new(
+        vrx_rs::VrxRuntimeOptions {
+            vrx_id: 0,
+            wav_dir: vrx_dir.clone(),
+            wav_segment_sec: 10,
+            wideband: initial_wb,
+        },
+        crate::vrx_bridge::vrx_control_thetislink(0),
+    );
+    let mut vrx2_runtime = vrx_rs::VrxRuntime::new(
+        vrx_rs::VrxRuntimeOptions {
+            vrx_id: 1,
+            wav_dir: None,
+            wav_segment_sec: 10,
+            wideband: initial_wb,
+        },
+        crate::vrx_bridge::vrx_control_thetislink(1),
+    );
+    let mut vrx1_sink = crate::vrx_bridge::ThetisVrxSink::new(socket.clone());
+    let mut vrx2_sink = crate::vrx_bridge::ThetisVrxSink::new(socket.clone());
+    let mut vrx_current_wb = initial_wb;
 
     let mut fft_size = spectrum.lock().await.ddc_fft_size();
     let mut rx2_fft_size = rx2_spectrum.lock().await.ddc_fft_size();
@@ -523,6 +757,47 @@ pub async fn tci_iq_consumer(
                     rx1_accum.clear();
                 }
                 rx1_accum.extend_from_slice(&iq_pairs);
+                if let Some(dump) = vrx_dump.as_mut() {
+                    if !dump.finished {
+                        dump.write_batch(frame_rate, &iq_pairs);
+                    }
+                }
+                {
+                    // VRX1 op RX1 IQ + VFO-A. ThetisVrxSink stuurt
+                    // VrxAudioPacket frames naar elke client per Opus
+                    // frame. Snapshot active_addrs vóór feed() — sink
+                    // gebruikt try_send_to (sync) zonder eigen lock.
+                    let (vfo_hz, ddc_center_hz) = {
+                        let spec = spectrum.lock().await;
+                        (spec.vfo_freq_hz(), spec.ddc_center_hz())
+                    };
+                    vrx1_sink.addrs = session.lock().await.vrx_audio_addrs(0);
+                    vrx1_sink.timestamp_ms = server_start.elapsed().as_millis() as u32;
+                    // Wideband toggle change → recreate runtimes (output
+                    // rate is fixed at construction). Brief audio gap is
+                    // acceptable, toggle is a rare user action.
+                    let want_wb = session.lock().await.any_client_wants_thetis_wideband();
+                    if want_wb != vrx_current_wb {
+                        info!("VRX wideband toggle: {} → {} — recreating runtimes", vrx_current_wb, want_wb);
+                        vrx_current_wb = want_wb;
+                        vrx1_runtime = vrx_rs::VrxRuntime::new(
+                            vrx_rs::VrxRuntimeOptions { vrx_id: 0, wav_dir: vrx_dir.clone(), wav_segment_sec: 10, wideband: want_wb },
+                            crate::vrx_bridge::vrx_control_thetislink(0),
+                        );
+                        vrx2_runtime = vrx_rs::VrxRuntime::new(
+                            vrx_rs::VrxRuntimeOptions { vrx_id: 1, wav_dir: None, wav_segment_sec: 10, wideband: want_wb },
+                            crate::vrx_bridge::vrx_control_thetislink(1),
+                        );
+                    }
+                    vrx1_sink.wideband = want_wb;
+                    // Mute VRX during TX: skip the channelizer + Opus encode
+                    // + UDP send. Avoids the “insensitive RX” sound during
+                    // own transmissions; saves bandwidth + CPU too.
+                    let tx_active = ptt.lock().await.is_tx_or_prefill();
+                    if !tx_active {
+                        vrx1_runtime.feed(frame_rate, &iq_pairs, vfo_hz, ddc_center_hz, &mut vrx1_sink);
+                    }
+                }
                 let cur_fft = spectrum.lock().await.ddc_fft_size();
                 if cur_fft != fft_size {
                     fft_size = cur_fft;
@@ -558,6 +833,21 @@ pub async fn tci_iq_consumer(
                     rx2_accum.clear();
                 }
                 rx2_accum.extend_from_slice(&iq_pairs);
+                {
+                    // VRX2 op RX2 IQ + VFO-B. Zie VRX1 voor de
+                    // snapshot-volgorde (addrs vóór feed).
+                    let (vfo_hz, ddc_center_hz) = {
+                        let spec = rx2_spectrum.lock().await;
+                        (spec.vfo_freq_hz(), spec.ddc_center_hz())
+                    };
+                    vrx2_sink.addrs = session.lock().await.vrx_audio_addrs(1);
+                    vrx2_sink.timestamp_ms = server_start.elapsed().as_millis() as u32;
+                    vrx2_sink.wideband = vrx_current_wb;
+                    let tx_active = ptt.lock().await.is_tx_or_prefill();
+                    if !tx_active {
+                        vrx2_runtime.feed(frame_rate, &iq_pairs, vfo_hz, ddc_center_hz, &mut vrx2_sink);
+                    }
+                }
                 let cur_fft = rx2_spectrum.lock().await.ddc_fft_size();
                 if cur_fft != rx2_fft_size {
                     rx2_fft_size = cur_fft;

@@ -1,4 +1,4 @@
-﻿# ThetisLink v2.1.0 — Gebruikershandleiding
+﻿# ThetisLink v2.2.0 — Gebruikershandleiding
 
 ## Inhoudsopgave
 
@@ -47,7 +47,7 @@ ThetisLink wordt gedistribueerd als een zip bestand met de volgende inhoud:
 |---------|-------------|
 | `ThetisLink-Server.exe` | Server executable (Windows) |
 | `ThetisLink-Client.exe` | Desktop client executable |
-| `ThetisLink-2.1.0.apk` | Android client app |
+| `ThetisLink-2.2.0.apk` | Android client app |
 | `Installatie.pdf` | Installatiehandleiding (Nederlands) |
 | `User-Manual.pdf` | Gebruikershandleiding (Nederlands, dit document) |
 | `Technische-Referentie.pdf` | Technische referentie (Nederlands) |
@@ -92,7 +92,7 @@ flowchart TB
     Server <--> Yaesu[Yaesu FT-991A<br>COM + USB Audio]
 ```
 
-Alle audio (RX/TX), IQ spectrum data en besturing gaan via één enkele TCI WebSocket verbinding. ThetisLink v2.1.0 gebruikt geen aparte CAT TCP verbinding — TCI dekt alle benodigde commando's, zowel met stock Thetis v2.10.3.15 als met de PA3GHM fork. Geen VB-Cable of andere drivers nodig.
+Alle audio (RX/TX), IQ spectrum data en besturing gaan via één enkele TCI WebSocket verbinding. ThetisLink v2.2.0 gebruikt geen aparte CAT TCP verbinding — TCI dekt alle benodigde commando's, zowel met stock Thetis v2.10.3.15 als met de PA3GHM fork. Geen VB-Cable of andere drivers nodig.
 
 ---
 
@@ -282,6 +282,31 @@ Volledige tweede ontvanger ondersteuning:
 - Eigen spectrum en waterval
 - VFO Sync: VFO B volgt automatisch VFO A
 - A<>B: wissel VFO A en B
+
+### Virtuele ontvangers (VRX, v2.2.0)
+
+Naast de twee fysieke ontvangers (RX1/RX2) biedt ThetisLink vanaf v2.2.0 twee **virtuele ontvangers**: **VRX1** (gekoppeld aan RX1/VFO-A) en **VRX2** (gekoppeld aan RX2/VFO-B). Een VRX is een onafhankelijke ontvanger die uit de brede IQ-stroom van de DDC wordt "uitgesneden" — je kunt er dus binnen de huidige DDC-bandbreedte vrij mee rondluisteren zonder de hoofd-VFO te verzetten. Handig om bijvoorbeeld een tweede station op dezelfde band te volgen terwijl je hoofdontvangst op zijn plek blijft.
+
+**Joint VRX pop-out openen:** beide virtuele ontvangers worden samen in één los pop-out venster getoond, met VRX1 en VRX2 naast elkaar. Open het venster vanuit de client; positie en grootte worden onthouden.
+
+**Per-VRX instellingen:**
+- **Aan/uit** per VRX — een VRX verbruikt pas netwerk en CPU als je hem inschakelt.
+- **Frequentie:** eigen luisterfrequentie, vrij instelbaar binnen de DDC-bandbreedte. Per DDC-positie wordt de laatst gekozen VRX-frequentie onthouden, zodat je bij terugkeren op dezelfde plek verder luistert.
+- **Mode:** USB, LSB, AM, SAM of FM.
+- **Filter:** eigen filterbreedte per VRX.
+- **Volume:** eigen mix-niveau; de VRX-audio wordt samen met RX1/RX2 (en een eventuele Yaesu) in de hoofdaudio gemengd.
+
+**Spectrum, waterval en S-meter:** elke VRX heeft een eigen **hoge-resolutie spectrum + waterval** rond zijn luisterfrequentie en een eigen S-meter. De hoge-resolutie weergave vraag je per VRX aan; de client toont dan een ingezoomd spectrum (met instelbare zoom, referentieniveau, bereik en waterval-contrast).
+
+**Smalle of brede audio:** de VRX-audio gebruikt dezelfde RX-bandbreedte-keuze als de rest van de ontvangst — smalband (8 kHz) of breedband (16 kHz) Opus (zie [RX-bandbreedte](#rx-bandbreedte-smalbreed-v220)).
+
+**Persistentie:** de VRX-instellingen (aan/uit, frequentie, mode en filter) worden bewaard en hersteld bij een nieuwe verbinding.
+
+> **Hoe werkt een VRX precies?** Een geïllustreerde uitleg van de hele VRX-signaalketen — van radiogolf tot geluid — staat online: **[Hoe een VRX werkt](https://cjenschede.github.io/ThetisLink/VRX-uitleg.html)**.
+
+### RX-bandbreedte (smal/breed, v2.2.0)
+
+Eén schakelaar in de client zet de **RX-audiobandbreedte** voor de Thetis-ontvanger, de VRX-kanalen én de aangesloten Yaesu-radio's tegelijk: smalband (8 kHz) of breedband (16 kHz). Dit geldt alleen voor ontvangst — de zend-audio blijft altijd breedband. De sample-rate van een WAV-opname schaalt automatisch mee met deze instelling.
 
 ### WebSDR/KiwiSDR (Desktop)
 
@@ -560,6 +585,43 @@ yaesu_enabled=true
 
 De Yaesu audio wordt automatisch afgespeeld op de client als het apparaat is ingeschakeld.
 
+### Tweede radio (FT-991A + FTX-1, dual-radio, v2.2.0)
+
+Vanaf v2.2.0 kan een **tweede Yaesu-radio** naast de eerste draaien als een **onafhankelijk kanaal** (slot 1). Beide radio's hebben hun eigen CAT-COM-poort, eigen USB-audio en hun eigen frequentie, mode, PTT en geheugenkanalen. Je kunt twee FT-991A's, twee FTX-1's of een mix gebruiken.
+
+**Automatische modeldetectie:** bij het opstarten leest de server het radio-model uit via het CAT-commando `ID;`. De respons bepaalt het model:
+
+| ID-respons | Model |
+|---|---|
+| `0670` | FT-991A |
+| `0840` | FTX-1 |
+
+Als het gedetecteerde model niet overeenkomt met het ingestelde slot, logt de server een waarschuwing (mogelijk zijn de twee USB-radio's verwisseld bij het enumereren). De server stuurt daarnaast een `RadioInfo`-bericht naar de clients, zodat dual-radio-bewuste clients de panelen met het juiste model labelen.
+
+### FTX-1 software-squelch (v2.2.0)
+
+De **hardware-squelch van de FTX-1 dempt zijn USB-audio niet** — op een FM-kanaal stroomt er dus continu ruis mee. ThetisLink heeft daarom een **server-side software-squelch** die de busy-status van de radio uitleest (CAT `RI`-respons) en de audio naar stilte laat uitfaden zodra de squelch dicht is.
+
+- Werkt **alleen in de FM-familie** (FM, FM-N, DATA-FM). In SSB, CW, AM en data-modes heeft de busy-vlag geen zinvolle betekenis, dus daar wordt de audio altijd doorgelaten.
+- De squelch-knop op de radio zelf is de drempel; de server volgt simpelweg of de radio "busy" meldt.
+- De gate faadt zacht (met een korte hang-tijd) zodat snelle openen/sluiten geen geflutter geeft.
+
+### FTX-1 WIRES-X (EX-menu)
+
+De **WIRES-X EX-menu-velden** van de FTX-1 zijn toegevoegd aan de menu-editor, zodat je de WIRES-X-instellingen van de radio via de server-UI kunt uitlezen en wijzigen.
+
+### Twee identieke "USB Audio CODEC"-apparaten onderscheiden (`#N`)
+
+Twee Yaesu-radio's presenteren zich in Windows allebei als een apparaat met dezelfde naam ("USB Audio CODEC"). Om ze in de audio-apparaatkeuze uit elkaar te houden gebruik je een **`#N`-indexsuffix** achter de naam:
+
+```
+USB Audio CODEC      → het eerste apparaat met die naam
+USB Audio CODEC#1    → idem (eerste match)
+USB Audio CODEC#2    → het tweede apparaat met die naam
+```
+
+De server kiest het **N-de apparaat** dat op de naam matcht (`#2` = de tweede). Zonder suffix wordt het eerste matchende apparaat gebruikt. Het server-log toont per radio de gekozen apparaatnaam, zodat je kunt controleren welk CODEC aan welke radio hangt.
+
 ---
 
 ## Diversity ontvangst
@@ -764,6 +826,7 @@ Als het spectrum (lijn) en de waterval niet synchroon lopen bij het pannen, hers
 
 | Versie | Hoogtepunten |
 |---|---|
+| **2.2.0** | **Virtuele ontvangers (VRX) + tweede Yaesu-radio (FT-991A + FTX-1).** Backward-compatible met v2.1.x — wire-protocol VERSION 3 ongewijzigd; de nieuwe packet-types (0x21–0x29) zijn additief en per-client gegate, dus v2.1.x-clients ontvangen ze nooit. **VRX1/VRX2** virtuele ontvangers uit de brede DDC-stroom via een FFT-channelizer, elk met eigen frequentie, mode (USB/LSB/AM/SAM/FM), filter, high-res spectrum/waterval en S-meter in één gezamenlijk popout-venster; NB/WB Opus-audio; per-bucket frequentiegeheugen + persistentie. **Dual-radio** tweede Yaesu-kanaal met model-autodetect (`ID;` 0670/0840), per-radio audio/CAT/geheugen, `RadioInfo`-paneelnaamgeving, **FTX-1 WIRES-X** EX-menu en een **software-squelch** (alleen FM-familie). **Schakelbare RX-bandbreedte** (Thetis + VRX + Yaesu, alleen ontvangst) en een **`#N` audio-device-index** voor identieke USB-codecs; dynamische WAV-opnamerate. Geïllustreerde VRX-leerboeken online (zie Documentatie). Pair met **Thetis fork PA3GHM TL2-4**; stock Thetis blijft ondersteund. |
 | **2.1.0** | **Yaesu G-1000DXC rotor via MCP2221A, opt-in wideband Thetis RX, Amplitec reconnect, RX2 filter-fixes.** Backwards-compatible met v2.0.4 — wire-protocol ongewijzigd; 2.0.4-clients praten gewoon met 2.1.0-server (en omgekeerd). **Yaesu G-1000DXC rotor-backend** als 3e optie naast EA7HG en PstRotator: directe aansturing via Adafruit MCP2221A breakout (5 V mod), met soft-start/soft-stop ramp (1-200 %/s, default 50%), adaptive ADC poll-rate (30 Hz tijdens beweging / 1 Hz bij stilstand, mediaan-filter tegen 50/100 Hz netvoeding-ripple), kortste-route optie voor rotors met overlap-zone (max_deg > 360°), en kalibratie-wizard (Park CCW / Park CW). **Opt-in wideband Thetis RX** via fork-extensie — breekt geen stock-Thetis pad. **Amplitec 6/2 reconnect** na power-cycle + venster verschijnt ook bij offline-start (was: venster bleef onzichtbaar tot server-restart). **RX2 mode-switch filter-restore** (modulation-handler honoreert server filter-update bij modus-wissel) + per-channel filter-edge drag (RX1/RX2 drag-state gescheiden). **Yaesu EQ profile mic-gain persistence** (mic-slider wordt mee opgeslagen met band/treble); **scherpere TX resampler anti-alias filter**. **Modulaire multi-tuner wizard** met per-slot Add/Rename/Delete, classificatie-scan, inklapbaar MCP2221A-blok. **Status-paneel scroll-stabiliteit** (snapshot-cache bij lock-contentie; MCP2221A uitgeklapte sectie springt niet meer terug omhoog). UI-polish: chevron-labels op alle collapsible toggles, Settings-tab ScrollArea, Amplitec antenne-rename via right-click. Pair met **Thetis fork PA3GHM TL2-4** voor de volledige feature-set; stock Thetis blijft ondersteund. |
 | **2.0.4** | **Bandbreedte-toolkit, preventieve TX-inhibit, power-cap, PstRotator.** Backwards-compatible met v2.0.3 — wire-protocol uitsluitend additief. **Preventieve RX-only TX-inhibit** via nieuw `rx_only_ex` TCI-commando (vereist Thetis-fork PA3GHM TL2-3): MOX/spatiebalk/hardware-PTT/VOX worden aan de bron geweigerd op een RX-only Amplitec-positie, niet reactief teruggeflipt; stock Thetis valt terug op de reactieve `ZZTX0` catch-all. **Reactieve RF-power cap per positie** met PA-eigen DriveDown (SPE + RF2K-S), mode-multipliers (SSB/CW × 1.0, AM × 0.5, FM/DIG × 0.4); rate-limit 1 s/stap — korte CW-bursts (<1 s) kunnen de reactieve cap passeren, preventieve dekking bestaat alleen op RX-only posities. **PstRotator UDP/XML rotor-backend** (host = numeriek IP-adres, geen DNS). **Server-tab bandbreedte-monitor** (Down/Up Kbit/s, klikbaar voor per-stream breakdown) — telt UDP application-payload bytes (de Windows-netwerkmeter leest ~1,5-2× hoger door IP/UDP/Ethernet-headers). **Per-client DX-spots opt-out** (Desktop + Android Settings), met server-side dedup (~90 Kbit/s broadcast storm → ~6 Kbit/s). **WebSDR favorites edit-toggle**. Server-log cleanup (PowerCap state-change-only + DXC reconnect 1-regel-per-cycle). |
 | **2.0.3** | **Multi-tuner release + wire-protocol breaking change.** Twee fysieke StockCorner JC-4s/JC-3s tuners parallel via Adafruit MCP2221A USB-HID breakouts (vervangt de v2.0.2 serial-port RTS/CTS aansturing); per-tuner threshold + hysterese schuiven op de gele tune-status draad (1 MΩ + 1 MΩ deler, default 2.25 V / 0.50 V); board scan + serial programming UI; automatische USB-reconnect; inklapbaar MCP2221A-blok in het status-paneel. Daarnaast: S-meter herschreven met drie bronnen (Sig peak-hold, Avg true-mean, MaxBin), `rx_channel_sensors_ex` subscription, S9-frequency band shift; CTUN coupled-recenter + RX1/RX2 spectrum-mirror; MIDI client-side VFO-coalesce + auto-recenter handshake met de Thetis-fork; per-PA drive-snapshot persistence over proces-restart heen; collapsible window-states onthouden. **Wire-protocol u8 bumped van 2 → 3** (S-meter payload herschikt); v2.0.2-clients tegen v2.0.3-server (en omgekeerd) krijgen `ProtocolVersionMismatch` met gelocaliseerde melding ("Server is te oud" / "Client is te oud"). |

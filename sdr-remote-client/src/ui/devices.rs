@@ -1689,94 +1689,8 @@ impl SdrRemoteApp {
 
         ui.separator();
 
-        // 5-band Equalizer
-        if super::helpers::chevron_label(
-            ui,
-            self.collapse_yaesu_eq,
-            RichText::new("Equalizer").strong().size(14.0),
-        )
-        .clicked()
-        {
-            self.collapse_yaesu_eq = !self.collapse_yaesu_eq;
-            self.save_full_config();
-        }
-        if self.collapse_yaesu_eq {
-            ui.indent("yaesu_eq_body", |ui| {
-                ui.horizontal(|ui| {
-                    let mut eq_on = self.yaesu_eq_enabled;
-                    if ui.checkbox(&mut eq_on, "EQ").changed() {
-                        self.yaesu_eq_enabled = eq_on;
-                        let _ = self.cmd_tx.send(Command::SetYaesuEqEnabled(eq_on));
-                    }
-                    // Profile selector
-                    let profile_names: Vec<String> = self.yaesu_eq_profiles.iter().map(|(n, _, _, _)| n.clone()).collect();
-                    egui::ComboBox::from_id_salt("eq_profile")
-                        .selected_text(if self.yaesu_eq_active_profile.is_empty() { "---" } else { &self.yaesu_eq_active_profile })
-                        .width(100.0)
-                        .show_ui(ui, |ui| {
-                            for name in &profile_names {
-                                if ui.selectable_label(&self.yaesu_eq_active_profile == name, name).clicked() {
-                                    self.yaesu_eq_active_profile = name.clone();
-                                    if let Some((_, en, g, mg)) = self.yaesu_eq_profiles.iter().find(|(n, _, _, _)| n == name) {
-                                        self.yaesu_eq_enabled = *en;
-                                        self.yaesu_eq_gains = *g;
-                                        self.yaesu_mic_gain = *mg;
-                                        let _ = self.cmd_tx.send(Command::SetYaesuEqEnabled(*en));
-                                        for i in 0..5 {
-                                            let _ = self.cmd_tx.send(Command::SetYaesuEqBand(i as u8, g[i]));
-                                        }
-                                        let _ = self.cmd_tx.send(Command::SetYaesuTxGain(*mg));
-                                    }
-                                    self.save_full_config();
-                                }
-                            }
-                        });
-                    if ui.small_button("Save").clicked() && !self.yaesu_eq_active_profile.is_empty() {
-                        let name = self.yaesu_eq_active_profile.clone();
-                        if let Some(p) = self.yaesu_eq_profiles.iter_mut().find(|(n, _, _, _)| *n == name) {
-                            p.1 = self.yaesu_eq_enabled;
-                            p.2 = self.yaesu_eq_gains;
-                            p.3 = self.yaesu_mic_gain;
-                        } else {
-                            self.yaesu_eq_profiles.push((name, self.yaesu_eq_enabled, self.yaesu_eq_gains, self.yaesu_mic_gain));
-                        }
-                        self.save_full_config();
-                    }
-                    if ui.small_button("Del").clicked() && !self.yaesu_eq_active_profile.is_empty() {
-                        self.yaesu_eq_profiles.retain(|(n, _, _, _)| n != &self.yaesu_eq_active_profile);
-                        self.yaesu_eq_active_profile.clear();
-                        self.save_full_config();
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("New:");
-                    ui.add(egui::TextEdit::singleline(&mut self.yaesu_eq_new_name).desired_width(100.0));
-                    if ui.small_button("+").clicked() && !self.yaesu_eq_new_name.is_empty() {
-                        let name = self.yaesu_eq_new_name.clone();
-                        self.yaesu_eq_profiles.push((name.clone(), self.yaesu_eq_enabled, self.yaesu_eq_gains, self.yaesu_mic_gain));
-                        self.yaesu_eq_active_profile = name;
-                        self.yaesu_eq_new_name.clear();
-                        self.save_full_config();
-                    }
-                });
-                ui.horizontal(|ui| {
-                    for i in 0..5 {
-                        ui.vertical(|ui| {
-                            ui.set_width(50.0);
-                            ui.label(egui::RichText::new(sdr_remote_logic::eq::BAND_LABELS[i]).size(10.0));
-                            let mut g = self.yaesu_eq_gains[i];
-                            let slider = egui::Slider::new(&mut g, -12.0..=12.0)
-                                .vertical()
-                                .custom_formatter(|v, _| format!("{:+.0}", v));
-                            if ui.add_sized([20.0, 60.0], slider).changed() {
-                                self.yaesu_eq_gains[i] = g;
-                                let _ = self.cmd_tx.send(Command::SetYaesuEqBand(i as u8, g));
-                            }
-                        });
-                    }
-                });
-            });
-        }
+        // 5-band Equalizer — gedeelde generieke component (slot 0).
+        self.render_yaesu_eq(ui, 0);
 
         ui.separator();
 
@@ -1856,6 +1770,522 @@ impl SdrRemoteApp {
             ui.indent("yaesu_menu_body", |ui| {
                 self.render_yaesu_menu(ui);
             });
+        }
+    }
+
+    /// Paneel-/venster-naam voor een radio-slot (PATCH-dual-radio-991a-ftx1).
+    /// Model uit RadioInfo (0=991A, 1=FTX1). Bij twee dezelfde modellen krijgt
+    /// elk een index ("991A 1"/"991A 2"); verschillende modellen = kale naam.
+    /// Window-titel per radio-slot: "ThetisLink - Radio {N}: Yaesu {model}".
+    /// Generiek, gebruikt door beide popout-windows (model uit RadioInfo).
+    pub(super) fn yaesu_window_title(&self, slot: u8) -> String {
+        let code = if slot == 0 { self.yaesu_model } else { self.yaesu2_model };
+        let model = match code {
+            0 => "Yaesu FT-991A",
+            1 => "Yaesu FTX-1",
+            _ => "Yaesu",
+        };
+        format!("ThetisLink - Radio {}: {}", slot + 1, model)
+    }
+
+    pub(super) fn yaesu_panel_name(&self, slot: u8) -> String {
+        let code = if slot == 0 { self.yaesu_model } else { self.yaesu2_model };
+        let name = match code { 0 => "991A", 1 => "FTX1", _ => "Radio" };
+        if self.yaesu_model == self.yaesu2_model && self.yaesu2_connected {
+            format!("{} {}", name, slot + 1)
+        } else {
+            name.to_string()
+        }
+    }
+
+    /// Gefocust slot-1 radio-paneel (dual-radio fase 1): VFO-A freq + tune, mode,
+    /// PTT, S-meter, volume. Memory/EX-menu = fase 2. Leest self.yaesu2_* (gesynct
+    /// uit state) en stuurt SetYaesu2*-commando's.
+    /// Generieke 5-band EQ-sectie (chevron + profielen opslaan/verwijderen +
+    /// waarde per slider), GEDEELD door beide Yaesu-windows (slot 0 = 991A-window,
+    /// slot 1 = FTX-1-window) — parity by construction, niet per-window naschilderen.
+    /// Snapshot→writeback houdt de borrow-checker tevreden bij per-slot state +
+    /// per-slot commando's (SetYaesu*/SetYaesu2*).
+    pub(super) fn render_yaesu_eq(&mut self, ui: &mut egui::Ui, slot: u8) {
+        let mut collapse = if slot == 0 { self.collapse_yaesu_eq } else { self.collapse_yaesu2_eq };
+        if super::helpers::chevron_label(ui, collapse,
+            RichText::new("Equalizer").strong().size(14.0)).clicked()
+        {
+            collapse = !collapse;
+            if slot == 0 { self.collapse_yaesu_eq = collapse; } else { self.collapse_yaesu2_eq = collapse; }
+            self.save_full_config();
+        }
+        if !collapse { return; }
+
+        // Snapshot per-slot state in locals (writeback onderaan).
+        let mut enabled = if slot == 0 { self.yaesu_eq_enabled } else { self.yaesu2_eq_enabled };
+        let mut gains = if slot == 0 { self.yaesu_eq_gains } else { self.yaesu2_eq_gains };
+        let mut mic_gain = if slot == 0 { self.yaesu_mic_gain } else { self.yaesu2_mic_gain };
+        let mut profiles = if slot == 0 { self.yaesu_eq_profiles.clone() } else { self.yaesu2_eq_profiles.clone() };
+        let mut active = if slot == 0 { self.yaesu_eq_active_profile.clone() } else { self.yaesu2_eq_active_profile.clone() };
+        let mut new_name = if slot == 0 { self.yaesu_eq_new_name.clone() } else { self.yaesu2_eq_new_name.clone() };
+        let tx = self.cmd_tx.clone();
+        let mut dirty = false;
+        let mk_en = |on: bool| if slot == 0 { Command::SetYaesuEqEnabled(on) } else { Command::SetYaesu2EqEnabled(on) };
+        let mk_band = |b: u8, g: f32| if slot == 0 { Command::SetYaesuEqBand(b, g) } else { Command::SetYaesu2EqBand(b, g) };
+        let mk_gain = |g: f32| if slot == 0 { Command::SetYaesuTxGain(g) } else { Command::SetYaesu2TxGain(g) };
+
+        ui.indent(("yaesu_eq_body", slot), |ui| {
+            ui.horizontal(|ui| {
+                if ui.checkbox(&mut enabled, "EQ").changed() {
+                    let _ = tx.send(mk_en(enabled));
+                }
+                let names: Vec<String> = profiles.iter().map(|(n, _, _, _)| n.clone()).collect();
+                egui::ComboBox::from_id_salt(("eq_profile", slot))
+                    .selected_text(if active.is_empty() { "---" } else { active.as_str() })
+                    .width(100.0)
+                    .show_ui(ui, |ui| {
+                        for name in &names {
+                            if ui.selectable_label(&active == name, name).clicked() {
+                                active = name.clone();
+                                if let Some((_, en, g, mg)) = profiles.iter().find(|(n, _, _, _)| n == name) {
+                                    enabled = *en; gains = *g; mic_gain = *mg;
+                                    let _ = tx.send(mk_en(*en));
+                                    for i in 0..5 { let _ = tx.send(mk_band(i as u8, g[i])); }
+                                    let _ = tx.send(mk_gain(*mg));
+                                }
+                                dirty = true;
+                            }
+                        }
+                    });
+                if ui.small_button("Save").clicked() && !active.is_empty() {
+                    let name = active.clone();
+                    if let Some(p) = profiles.iter_mut().find(|(n, _, _, _)| *n == name) {
+                        p.1 = enabled; p.2 = gains; p.3 = mic_gain;
+                    } else {
+                        profiles.push((name, enabled, gains, mic_gain));
+                    }
+                    dirty = true;
+                }
+                if ui.small_button("Del").clicked() && !active.is_empty() {
+                    profiles.retain(|(n, _, _, _)| n != &active);
+                    active.clear();
+                    dirty = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("New:");
+                ui.add(egui::TextEdit::singleline(&mut new_name).desired_width(100.0));
+                if ui.small_button("+").clicked() && !new_name.is_empty() {
+                    let name = new_name.clone();
+                    profiles.push((name.clone(), enabled, gains, mic_gain));
+                    active = name;
+                    new_name.clear();
+                    dirty = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                for i in 0..5 {
+                    ui.vertical(|ui| {
+                        ui.set_width(50.0);
+                        ui.label(RichText::new(sdr_remote_logic::eq::BAND_LABELS[i]).size(10.0));
+                        let mut g = gains[i];
+                        let slider = egui::Slider::new(&mut g, -12.0..=12.0)
+                            .vertical()
+                            .custom_formatter(|v, _| format!("{:+.0}", v));
+                        if ui.add_sized([20.0, 60.0], slider).changed() {
+                            gains[i] = g;
+                            let _ = tx.send(mk_band(i as u8, g));
+                        }
+                    });
+                }
+            });
+        });
+
+        // Writeback naar de slot-state.
+        if slot == 0 {
+            self.yaesu_eq_enabled = enabled; self.yaesu_eq_gains = gains; self.yaesu_mic_gain = mic_gain;
+            self.yaesu_eq_profiles = profiles; self.yaesu_eq_active_profile = active; self.yaesu_eq_new_name = new_name;
+        } else {
+            self.yaesu2_eq_enabled = enabled; self.yaesu2_eq_gains = gains; self.yaesu2_mic_gain = mic_gain;
+            self.yaesu2_eq_profiles = profiles; self.yaesu2_eq_active_profile = active; self.yaesu2_eq_new_name = new_name;
+        }
+        if dirty { self.save_full_config(); }
+    }
+
+    /// Geheugen-tabel per radio-slot. Slot 0 = direct. Slot 1: wissel de slot-1
+    /// state via mem::swap in de (gedeelde) slot-0 velden, render dezelfde tabel,
+    /// en wissel terug — zo blijft de werkende 991A-tabel ongewijzigd en is de UI
+    /// gedeeld. De read/write-commando's volgen `yaesu_mem_active_slot`.
+    pub(super) fn render_yaesu_memories_slot(&mut self, ui: &mut egui::Ui, slot: u8) {
+        if slot == 0 {
+            self.render_yaesu_memories(ui);
+            return;
+        }
+        let swap_in_out = |s: &mut Self| {
+            std::mem::swap(&mut s.yaesu_mem_channels, &mut s.yaesu2_mem_channels);
+            std::mem::swap(&mut s.yaesu_mem_file, &mut s.yaesu2_mem_file);
+            std::mem::swap(&mut s.yaesu_mem_selected, &mut s.yaesu2_mem_selected);
+            std::mem::swap(&mut s.yaesu_mem_filter, &mut s.yaesu2_mem_filter);
+            std::mem::swap(&mut s.yaesu_mem_dirty, &mut s.yaesu2_mem_dirty);
+            std::mem::swap(&mut s.yaesu_mem_radio_received, &mut s.yaesu2_mem_radio_received);
+        };
+        swap_in_out(self);
+        self.yaesu_mem_active_slot = 1;
+        self.render_yaesu_memories(ui);
+        self.yaesu_mem_active_slot = 0;
+        swap_in_out(self);
+    }
+
+    pub(super) fn render_yaesu2_panel(&mut self, ui: &mut egui::Ui) {
+        let mode_label = match self.yaesu2_mode {
+            0 => "LSB", 1 => "USB", 3 => "CW-L", 4 => "CW-U",
+            5 => "FM", 6 => "AM", 7 => "DIGU", 9 => "DIGL", _ => "?",
+        };
+        // A/B + V/M bovenaan (zelfde volgorde als 991A-paneel) + mode-label rechts.
+        ui.horizontal(|ui| {
+            if ui.add(egui::Button::new(RichText::new("A/B").strong().size(12.0))
+                .min_size(egui::vec2(50.0, 22.0))).clicked()
+            {
+                let _ = self.cmd_tx.send(Command::SetControl(
+                    sdr_remote_core::protocol::ControlId::Yaesu2SelectVfo, 2));
+            }
+            if ui.add(egui::Button::new(RichText::new("V/M").strong().size(12.0))
+                .min_size(egui::vec2(50.0, 22.0))).clicked()
+            {
+                let _ = self.cmd_tx.send(Command::SetControl(
+                    sdr_remote_core::protocol::ControlId::Yaesu2SelectVfo, 3));
+            }
+            ui.separator();
+            ui.label(RichText::new(mode_label).size(14.0).color(Color32::from_rgb(255, 170, 40)));
+        });
+        // VFO / Memory-indicator (blauw bij Memory) — zelfde plek + naam/freq als 991A.
+        if self.yaesu2_vfo_select == 1 {
+            let c = Color32::from_rgb(100, 200, 255);
+            let found = self.yaesu2_mem_channels.iter()
+                .find(|ch| ch.channel_number == self.yaesu2_memory_channel);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("MEM {:02}", self.yaesu2_memory_channel))
+                    .size(14.0).strong().color(c));
+                if let Some(ch) = found {
+                    ui.label(RichText::new(&ch.name).size(14.0).strong().color(c));
+                    ui.label(RichText::new(super::yaesu_memory::format_freq_display(ch.rx_freq_hz))
+                        .size(14.0).family(egui::FontFamily::Monospace).color(c));
+                }
+            });
+        } else {
+            let (label, c) = if self.yaesu2_split {
+                ("VFO  Split", Color32::from_rgb(255, 180, 50))
+            } else {
+                ("VFO", Color32::from_rgb(100, 255, 100))
+            };
+            ui.label(RichText::new(label).size(14.0).strong().color(c));
+        }
+        // A: frequentie (scroll-to-tune), daaronder B:.
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("A:  ").size(16.0).strong());
+            if let Some(delta) = render_freq_scroll(ui, self.yaesu2_freq_a) {
+                let new_freq = (self.yaesu2_freq_a as i64 + delta).max(0) as u64;
+                let _ = self.cmd_tx.send(Command::SetYaesu2Freq(new_freq));
+                self.yaesu2_freq_a = new_freq;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("B:  ").size(12.0));
+            ui.label(RichText::new(format!("{} Hz", format_frequency(self.yaesu2_freq_b)))
+                .size(14.0).family(egui::FontFamily::Monospace));
+        });
+        ui.separator();
+        {
+            let btn = |text: &str| egui::Button::new(RichText::new(text).size(11.0))
+                .min_size(egui::vec2(38.0, 20.0));
+            let mode_names = ["LSB", "USB", "CW", "CW-R", "FM", "AM", "DIG-U", "DIG-L"];
+            let mode_codes: &[u8] = &[0, 1, 3, 4, 5, 6, 7, 9];
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Mode:");
+                for (i, &name) in mode_names.iter().enumerate() {
+                    if ui.add(btn(name)).clicked() {
+                        let _ = self.cmd_tx.send(Command::SetYaesu2Mode(mode_codes[i]));
+                    }
+                }
+            });
+        }
+        // Band / A=B / Split / Scan / Tune — spiegel van het 991A-paneel, geroute
+        // naar slot 1 (Yaesu2Button). Mem± en V/M = fase 2 (geheugen).
+        {
+            use sdr_remote_core::protocol::ControlId;
+            let btn = |text: &str| egui::Button::new(RichText::new(text).size(11.0))
+                .min_size(egui::vec2(38.0, 20.0));
+            ui.horizontal(|ui| {
+                if ui.add(btn("Band-")).clicked() {
+                    let _ = self.cmd_tx.send(Command::SetControl(ControlId::Yaesu2Button, 6));
+                }
+                if ui.add(btn("Band+")).clicked() {
+                    let _ = self.cmd_tx.send(Command::SetControl(ControlId::Yaesu2Button, 5));
+                }
+                ui.separator();
+                if ui.add(btn("Mem-")).clicked() {
+                    let _ = self.cmd_tx.send(Command::SetControl(ControlId::Yaesu2Button, 10));
+                }
+                if ui.add(btn("Mem+")).clicked() {
+                    let _ = self.cmd_tx.send(Command::SetControl(ControlId::Yaesu2Button, 9));
+                }
+                ui.separator();
+                if ui.add(btn("A=B")).clicked() {
+                    let _ = self.cmd_tx.send(Command::SetControl(ControlId::Yaesu2Button, 0));
+                }
+                let split_btn = if self.yaesu2_split {
+                    egui::Button::new(RichText::new("Split").size(11.0).color(Color32::WHITE))
+                        .fill(Color32::from_rgb(180, 100, 0)).min_size(egui::vec2(38.0, 20.0))
+                } else { btn("Split") };
+                if ui.add(split_btn).clicked() {
+                    self.yaesu2_split = !self.yaesu2_split;
+                    let _ = self.cmd_tx.send(Command::SetControl(ControlId::Yaesu2Button,
+                        if self.yaesu2_split { 7 } else { 8 }));
+                }
+                let scan_btn = if self.yaesu2_scan {
+                    egui::Button::new(RichText::new("Scan").size(11.0).color(Color32::WHITE))
+                        .fill(Color32::from_rgb(0, 120, 0)).min_size(egui::vec2(38.0, 20.0))
+                } else { btn("Scan") };
+                if ui.add(scan_btn).clicked() {
+                    self.yaesu2_scan = !self.yaesu2_scan;
+                    let _ = self.cmd_tx.send(Command::SetControl(ControlId::Yaesu2Button,
+                        if self.yaesu2_scan { 1 } else { 2 }));
+                }
+                let tune_btn = if self.yaesu2_tuner_active {
+                    egui::Button::new(RichText::new("Tune").size(11.0).color(Color32::WHITE))
+                        .fill(Color32::from_rgb(180, 0, 0)).min_size(egui::vec2(38.0, 20.0))
+                } else { btn("Tune") };
+                if ui.add(tune_btn).clicked() {
+                    self.yaesu2_tuner_active = !self.yaesu2_tuner_active;
+                    let _ = self.cmd_tx.send(Command::SetControl(ControlId::Yaesu2Button,
+                        if self.yaesu2_tuner_active { 3 } else { 4 }));
+                }
+            });
+            // Quick Memory Bank (FTX-1-specifiek): momentane actie-knoppen.
+            // Store = huidige VFO in QMB (QI;), Recall = QMB doorlopen (QR;).
+            ui.horizontal(|ui| {
+                ui.label("QMB:");
+                if ui.add(btn("Store"))
+                    .on_hover_text("Quick Memory: huidige VFO opslaan (QI)").clicked()
+                {
+                    let _ = self.cmd_tx.send(Command::SetControl(ControlId::Yaesu2Button, 13));
+                }
+                if ui.add(btn("Recall"))
+                    .on_hover_text("Quick Memory: opgeslagen QMB terughalen/doorlopen (QR)").clicked()
+                {
+                    let _ = self.cmd_tx.send(Command::SetControl(ControlId::Yaesu2Button, 14));
+                }
+            });
+        }
+        // Squelch / RF-power / RF-gain sliders — spiegel van het 991A-paneel.
+        {
+            use sdr_remote_core::protocol::ControlId;
+            let slider_w = 120.0;
+            egui::Grid::new("yaesu2_sliders").num_columns(4).spacing([4.0, 2.0]).show(ui, |ui| {
+                ui.allocate_space(egui::vec2(55.0, 0.0));
+                ui.label("SQL");
+                let sql = egui::Slider::new(&mut self.yaesu2_squelch, 0..=100)
+                    .custom_formatter(|v, _| format!("{:.0}", v));
+                if ui.add_sized([slider_w, 16.0], sql).changed() {
+                    let _ = self.cmd_tx.send(Command::SetControl(ControlId::Yaesu2Squelch, self.yaesu2_squelch));
+                    self.yaesu2_control_changed_at = Some(std::time::Instant::now());
+                }
+                ui.label("PWR");
+                let pwr = egui::Slider::new(&mut self.yaesu2_rf_power, 0..=100)
+                    .custom_formatter(|v, _| format!("{:.0}W", v));
+                if ui.add_sized([slider_w, 16.0], pwr).changed() {
+                    let _ = self.cmd_tx.send(Command::SetControl(ControlId::Yaesu2RfPower, self.yaesu2_rf_power));
+                    self.yaesu2_control_changed_at = Some(std::time::Instant::now());
+                }
+                ui.end_row();
+                ui.allocate_space(egui::vec2(55.0, 0.0));
+                ui.label("RF Gain");
+                let rf = egui::Slider::new(&mut self.yaesu2_rf_gain, 0..=255)
+                    .custom_formatter(|v, _| format!("{:.0}", v));
+                if ui.add_sized([slider_w, 16.0], rf).changed() {
+                    let _ = self.cmd_tx.send(Command::SetControl(ControlId::Yaesu2RfGain, self.yaesu2_rf_gain));
+                    self.yaesu2_control_changed_at = Some(std::time::Instant::now());
+                }
+                ui.end_row();
+            });
+        }
+        ui.separator();
+        // S-meter — identiek aan het 991A-paneel (geverfde bar i.p.v. ProgressBar).
+        {
+            let frac = (self.yaesu2_smeter as f32 / 255.0).clamp(0.0, 1.0);
+            let desired = egui::vec2(ui.available_width().min(350.0), 18.0);
+            let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
+            if ui.is_rect_visible(rect) {
+                let painter = ui.painter();
+                painter.rect_filled(rect, 3.0, Color32::from_rgb(30, 30, 30));
+                let fill_w = rect.width() * frac;
+                let fill_rect = egui::Rect::from_min_size(rect.min, egui::vec2(fill_w, rect.height()));
+                let color = if frac < 0.7 { Color32::from_rgb(0, 180, 0) } else { Color32::from_rgb(220, 40, 40) };
+                painter.rect_filled(fill_rect, 3.0, color);
+                // S-eenheid-omrekening (zelfde als 991A; FTX-1 SM-cal evt. later fijnstellen).
+                let s_val = (self.yaesu2_smeter as f32 / 12.0).min(9.0);
+                let text = if s_val >= 9.0 {
+                    let db_over = ((self.yaesu2_smeter as f32 - 108.0) * 0.5).max(0.0);
+                    format!("S9+{:.0} dB", db_over)
+                } else {
+                    format!("S{:.0}", s_val)
+                };
+                painter.text(rect.center(), egui::Align2::CENTER_CENTER,
+                    text, egui::FontId::proportional(12.0), Color32::WHITE);
+            }
+        }
+        ui.separator();
+        // Status: RX/TX + power on/off (spiegel van het 991A-paneel).
+        ui.horizontal(|ui| {
+            let (tx_color, tx_text) = if self.yaesu2_tx_active {
+                (Color32::from_rgb(220, 40, 40), "TX")
+            } else {
+                (Color32::from_rgb(0, 150, 0), "RX")
+            };
+            ui.colored_label(tx_color, RichText::new(tx_text).size(16.0).strong());
+            ui.separator();
+            ui.label(if self.yaesu2_power_on { "Power ON" } else { "Power OFF" });
+        });
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("Volume:");
+            // Waarde-blok (%) + muis-aanpasbaar, identiek aan het 991A-volume.
+            let slider = egui::Slider::new(&mut self.yaesu2_volume, 0.001..=1.0)
+                .logarithmic(true)
+                .custom_formatter(|v, _| format!("{:.0}%", v * 100.0));
+            let resp = ui.add_sized([140.0, 16.0], slider);
+            if resp.changed() {
+                let _ = self.cmd_tx.send(Command::SetYaesu2Volume(self.yaesu2_volume));
+            }
+            if resp.drag_stopped() {
+                self.save_full_config(); // persist volume bij loslaten
+            }
+        });
+        ui.separator();
+        // Equalizer — zelfde gedeelde generieke component als het 991A-window (slot 1).
+        self.render_yaesu_eq(ui, 1);
+        ui.separator();
+        // Memory Channels — zelfde gedeelde tabel als het 991A-window (via slot 1).
+        if super::helpers::chevron_label(ui, self.collapse_yaesu2_memories,
+            RichText::new("Memory Channels").strong().size(14.0)).clicked()
+        {
+            self.collapse_yaesu2_memories = !self.collapse_yaesu2_memories;
+        }
+        if self.collapse_yaesu2_memories {
+            // Schaal de lijst mee tot de onderkant van het window i.p.v. een
+            // vaste hoogte: gebruik de resterende beschikbare hoogte (met een
+            // ondergrens zodat hij bruikbaar blijft in een klein window).
+            let avail = ui.available_height().max(120.0);
+            ui.indent("yaesu2_memories_body", |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("yaesu2_memories_scroll")
+                    .max_height(avail)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.render_yaesu_memories_slot(ui, 1);
+                    });
+            });
+        }
+        // (geen separator hier — pariteit met het 991A-window; de lijn hoorde er niet)
+        // Radio Settings (EX Menu) — FTX-1 hiërarchisch. C1: ruwe adres/waarde-lijst
+        // ter verificatie van de server-scan; C3 maakt er een P1>P2>P3 browser van.
+        if super::helpers::chevron_label(ui, self.collapse_yaesu2_menu,
+            RichText::new("Radio Settings (EX Menu)").strong().size(14.0)).clicked()
+        {
+            self.collapse_yaesu2_menu = !self.collapse_yaesu2_menu;
+        }
+        if self.collapse_yaesu2_menu {
+            ui.indent("yaesu2_menu_body", |ui| self.render_yaesu2_ex_menu(ui));
+        }
+    }
+
+    /// FTX-1 EX-menu browser (Fase C3). Groepeert de live-gescande EX-waarden per
+    /// groep > subgroep met labels uit de chart (Table 3); per item een waarde-veld
+    /// + Set. Adressen/waarden = ground truth radio; labels = chart (cosmetisch).
+    fn render_yaesu2_ex_menu(&mut self, ui: &mut egui::Ui) {
+        use super::ftx1_ex_chart;
+        ui.horizontal(|ui| {
+            if ui.button("Read radio").clicked() {
+                self.yaesu2_menu_received = false;
+                let _ = self.cmd_tx.send(Command::SetControl(
+                    sdr_remote_core::protocol::ControlId::Yaesu2ReadMenus, 0));
+            }
+            ui.label(format!("{} settings", self.yaesu2_menu_entries.len()));
+            ui.separator();
+            ui.label("Filter:");
+            ui.add(egui::TextEdit::singleline(&mut self.yaesu2_menu_filter).desired_width(120.0));
+            if !self.yaesu2_menu_filter.is_empty() && ui.button("x").clicked() {
+                self.yaesu2_menu_filter.clear();
+            }
+        });
+
+        // Bouw de gegroepeerde view lokaal (geen self-borrow tijdens render).
+        // Item = (addr, group, sub, naam+desc, huidige waarde).
+        let filt = self.yaesu2_menu_filter.to_lowercase();
+        let mut groups: Vec<(String, Vec<(String, String, String, String)>)> = Vec::new();
+        for (addr, val) in &self.yaesu2_menu_entries {
+            let (group, sub, desc) = match ftx1_ex_chart::lookup(addr) {
+                Some((g, s, d)) => (g.to_string(), s.to_string(), d.to_string()),
+                None => ("Other".to_string(), String::new(), addr.clone()),
+            };
+            if !filt.is_empty()
+                && !desc.to_lowercase().contains(&filt)
+                && !group.to_lowercase().contains(&filt)
+                && !sub.to_lowercase().contains(&filt)
+            {
+                continue;
+            }
+            match groups.iter_mut().find(|(g, _)| *g == group) {
+                Some((_, items)) => items.push((addr.clone(), sub, desc, val.clone())),
+                None => groups.push((group, vec![(addr.clone(), sub, desc, val.clone())])),
+            }
+        }
+
+        let avail = ui.available_height().max(150.0);
+        let mut to_set: Option<(String, String)> = None; // (addr, value)
+        egui::ScrollArea::vertical()
+            .id_salt("yaesu2_menu_scroll")
+            .max_height(avail)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (group, items) in &groups {
+                    egui::CollapsingHeader::new(RichText::new(group).strong())
+                        .default_open(!filt.is_empty())
+                        .show(ui, |ui| {
+                            let mut last_sub = String::new();
+                            for (addr, sub, desc, val) in items {
+                                if sub != &last_sub {
+                                    // Subgroep-header bold (was .weak() → vrijwel onleesbaar,
+                                    // owner-feedback build 120). Bold + volle contrast.
+                                    ui.label(RichText::new(sub).strong());
+                                    last_sub = sub.clone();
+                                }
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(desc).size(11.0));
+                                    let buf = self.yaesu2_menu_edits
+                                        .entry(addr.clone()).or_insert_with(|| val.clone());
+                                    ui.add(egui::TextEdit::singleline(buf)
+                                        .desired_width(70.0)
+                                        .font(egui::FontId::monospace(11.0)));
+                                    // Set alleen tonen als de buffer afwijkt van de radio-waarde.
+                                    if buf.as_str() != val.as_str() && ui.small_button("Set").clicked() {
+                                        to_set = Some((addr.clone(), buf.clone()));
+                                    }
+                                });
+                            }
+                        });
+                }
+            });
+
+        if let Some((addr, value)) = to_set {
+            // Optimistische baseline-update: de radio-waarde wordt anders pas
+            // bij een volgende "Read radio" ververst, waardoor de UI blijft
+            // denken dat de oude waarde nog in de radio staat. Daardoor
+            // verschijnt "Set" niet meer als je naar het origineel terugzet.
+            // Alleen bijwerken als het commando daadwerkelijk verstuurd is.
+            if self.cmd_tx.send(Command::SetYaesu2Menu(addr.clone(), value.clone())).is_ok() {
+                if let Some(entry) =
+                    self.yaesu2_menu_entries.iter_mut().find(|(a, _)| *a == addr)
+                {
+                    entry.1 = value;
+                }
+            }
         }
     }
 
@@ -1951,8 +2381,13 @@ impl SdrRemoteApp {
         ui.horizontal(|ui| {
             if ui.button("Read radio").clicked() {
                 self.yaesu_mem_radio_received = false; // allow processing new data
-                let _ = self.cmd_tx.send(Command::SetControl(
-                    sdr_remote_core::protocol::ControlId::YaesuReadMemories, 0));
+                // Read/write routeren naar de actieve radio (slot 0 = 991A, 1 = FTX-1).
+                let cmd = if self.yaesu_mem_active_slot == 0 {
+                    sdr_remote_core::protocol::ControlId::YaesuReadMemories
+                } else {
+                    sdr_remote_core::protocol::ControlId::Yaesu2ReadMemories
+                };
+                let _ = self.cmd_tx.send(Command::SetControl(cmd, 0));
             }
             if !self.yaesu_mem_channels.is_empty() {
                 if ui.button("Write radio").clicked() {
@@ -1960,7 +2395,12 @@ impl SdrRemoteApp {
                     // Save to file first, then send to server for writing
                     let _ = yaesu_memory::save_tab_file(path, &self.yaesu_mem_channels);
                     if let Ok(text) = std::fs::read_to_string(path) {
-                        let _ = self.cmd_tx.send(Command::WriteYaesuMemories(text));
+                        let cmd = if self.yaesu_mem_active_slot == 0 {
+                            Command::WriteYaesuMemories(text)
+                        } else {
+                            Command::WriteYaesu2Memories(text)
+                        };
+                        let _ = self.cmd_tx.send(cmd);
                     }
                 }
             }
@@ -1997,6 +2437,27 @@ impl SdrRemoteApp {
                 self.yaesu_mem_dirty = true;
                 // Auto-select new channel for editing
                 self.yaesu_mem_selected = Some(self.yaesu_mem_channels.len() - 1);
+            }
+            // Import: kopieer de volledige geheugenlijst van de ANDERE radio.
+            // Door het mem::swap-patroon in render_yaesu_memories_slot staan de
+            // kanalen van de andere radio altijd in `yaesu2_mem_channels`,
+            // ongeacht welk slot nu getoond wordt. 991A↔FTX-1 delen exact dezelfde
+            // YaesuMemoryChannel + tab-kolommen, dus een directe clone volstaat;
+            // de per-model write-functie op de server mapt de mode-codes.
+            // Niet-destructief: vult de lijst + markeert dirty — pas bij
+            // "Write radio" gaat het écht naar de radio.
+            if !self.yaesu2_mem_channels.is_empty() {
+                let from_radio = if self.yaesu_mem_active_slot == 0 { 2 } else { 1 };
+                if ui.button(format!("Import from Radio {}", from_radio))
+                    .on_hover_text("Neem alle geheugenkanalen van de andere radio over (nog niet geschreven)")
+                    .clicked()
+                {
+                    self.yaesu_mem_channels = self.yaesu2_mem_channels.clone();
+                    self.yaesu_mem_dirty = true;
+                    self.yaesu_mem_selected = None;
+                    log::info!("Imported {} channels from Radio {}",
+                        self.yaesu_mem_channels.len(), from_radio);
+                }
             }
         });
 
@@ -2295,7 +2756,7 @@ impl SdrRemoteApp {
 
     pub(super) fn render_device_yaesu(&mut self, ui: &mut egui::Ui, _amber: Color32) {
         ui.horizontal(|ui| {
-            ui.heading("Yaesu FT-991A");
+            ui.heading(format!("Radio 1: {}", self.yaesu_panel_name(0)));
             ui.separator();
             if ui.checkbox(&mut self.yaesu_enabled, "Enable").changed() {
                 let _ = self.cmd_tx.send(Command::SetControl(
@@ -2317,6 +2778,39 @@ impl SdrRemoteApp {
             }
             if ui.selectable_label(self.yaesu_ptt_toggle_mode, "Toggle").clicked() {
                 self.yaesu_ptt_toggle_mode = true;
+                self.save_ptt_config();
+            }
+        });
+        ui.separator();
+
+        // ── Radio 2 (2e Yaesu, bv. FTX-1) — eigen enable / PTT-mode / window ──
+        ui.horizontal(|ui| {
+            ui.heading(format!("Radio 2: {}", self.yaesu_panel_name(1)));
+            ui.separator();
+            if ui.checkbox(&mut self.yaesu2_enabled, "Enable").changed() {
+                let _ = self.cmd_tx.send(Command::SetYaesu2Enable(self.yaesu2_enabled));
+                if !self.yaesu2_enabled {
+                    self.yaesu2_popout = false;
+                }
+                self.save_ptt_config();
+            }
+            ui.separator();
+            if self.yaesu2_enabled {
+                let popout_label = if self.yaesu2_popout { "Close window" } else { "Open window" };
+                if ui.button(popout_label).clicked() {
+                    self.yaesu2_popout = !self.yaesu2_popout;
+                    self.save_ptt_config(); // persist window open/dicht-stand
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("PTT:");
+            if ui.selectable_label(!self.yaesu2_ptt_toggle_mode, "Push to talk").clicked() {
+                self.yaesu2_ptt_toggle_mode = false;
+                self.save_ptt_config();
+            }
+            if ui.selectable_label(self.yaesu2_ptt_toggle_mode, "Toggle").clicked() {
+                self.yaesu2_ptt_toggle_mode = true;
                 self.save_ptt_config();
             }
         });

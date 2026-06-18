@@ -176,6 +176,19 @@ impl SpectrumProcessor {
         self.ddc_pipeline.as_ref().map(|p| p.window.len()).unwrap_or(65536)
     }
 
+    /// Current VFO frequency (Hz). Used by VRX to know where the user
+    /// thinks they are tuned.
+    pub fn vfo_freq_hz(&self) -> u64 {
+        self.vfo_freq_hz
+    }
+
+    /// Current DDC center frequency (Hz). With CTUN+auto-recenter
+    /// extension this is updated independently of VFO; the VRX
+    /// channelizer needs the difference to know how to bin-select.
+    pub fn ddc_center_hz(&self) -> u64 {
+        self.ddc_center_hz
+    }
+
     /// Process DDC I/Q samples from HPSDR DDC capture
     pub fn process_ddc_frame(&mut self, samples: &[(f32, f32)]) {
         if let Some(ref mut pipeline) = self.ddc_pipeline {
@@ -375,6 +388,87 @@ impl SpectrumProcessor {
             num_bins: bins.len() as u16,
             center_freq_hz: self.ddc_center_hz as u32,
             span_hz: self.sample_rate_hz,
+            ref_level: 0,
+            db_per_unit: 1,
+            bins,
+        }
+    }
+
+    /// Extract a view centered on an arbitrary absolute frequency
+    /// (instead of zoom/pan-around-VFO). Used for per-VRX high-res
+    /// spectrum where the VRX freq is not the same as RX1's VFO.
+    /// Returns up to `max_bins` bins covering [center-span/2 ..
+    /// center+span/2]. Clamps to available DDC range.
+    pub fn extract_view_at(
+        &self,
+        center_hz: u64,
+        span_hz: u32,
+        max_bins: usize,
+    ) -> SpectrumPacket {
+        let total = self.smoothed.len();
+        if total == 0 || !self.ddc_mode || span_hz == 0 {
+            return SpectrumPacket {
+                sequence: self.sequence,
+                num_bins: 0,
+                center_freq_hz: 0,
+                span_hz: 0,
+                ref_level: 0,
+                db_per_unit: 1,
+                bins: Vec::new(),
+            };
+        }
+        let hz_per_bin = self.sample_rate_hz as f64 / total as f64;
+        let ddc_lo = self.ddc_center_hz as f64 - (self.sample_rate_hz as f64 / 2.0);
+        let view_lo = (center_hz as f64) - (span_hz as f64 / 2.0);
+        let view_hi = (center_hz as f64) + (span_hz as f64 / 2.0);
+        let bin_lo = ((view_lo - ddc_lo) / hz_per_bin).floor() as isize;
+        let bin_hi = ((view_hi - ddc_lo) / hz_per_bin).ceil() as isize;
+        // Clamp BEIDE grenzen naar [0, total]. Een view volledig ONDER de DDC
+        // geeft een negatieve bin_hi; `negatief as usize` wrapt dan naar een
+        // gigantische index -> out-of-bounds panic in de bin-loop hieronder.
+        // Met clamp wordt dat 0, en de `end <= start`-guard geeft netjes een
+        // leeg spectrum terug i.p.v. de server te laten crashen.
+        let start = bin_lo.clamp(0, total as isize) as usize;
+        let end = bin_hi.clamp(0, total as isize) as usize;
+        if end <= start {
+            return SpectrumPacket {
+                sequence: self.sequence,
+                num_bins: 0,
+                center_freq_hz: 0,
+                span_hz: 0,
+                ref_level: 0,
+                db_per_unit: 1,
+                bins: Vec::new(),
+            };
+        }
+        let visible = end - start;
+        let cal_shift = self.cal_offset_db * 65535.0 / 120.0;
+        let bins: Vec<u16> = if visible <= max_bins {
+            self.smoothed[start..end].iter()
+                .map(|v| (v + cal_shift).clamp(0.0, 65535.0) as u16)
+                .collect()
+        } else {
+            let stride = visible as f64 / max_bins as f64;
+            (0..max_bins).map(|i| {
+                let s = start + (i as f64 * stride) as usize;
+                let e = (start + ((i as f64 + 1.0) * stride) as usize).min(end);
+                let mut max_val = 0.0f32;
+                for j in s..e {
+                    if self.smoothed[j] > max_val {
+                        max_val = self.smoothed[j];
+                    }
+                }
+                (max_val + cal_shift).clamp(0.0, 65535.0) as u16
+            }).collect()
+        };
+        let bin_center_offset = (start + end) as f64 / 2.0 - total as f64 / 2.0;
+        let actual_center_hz = (self.ddc_center_hz as f64 + bin_center_offset * hz_per_bin) as u32;
+        let actual_span_hz = (visible as f64 * hz_per_bin) as u32;
+        SpectrumPacket {
+            sequence: self.sequence,
+            num_bins: bins.len() as u16,
+            center_freq_hz: actual_center_hz,
+            span_hz: actual_span_hz,
             ref_level: 0,
             db_per_unit: 1,
             bins,
@@ -666,6 +760,17 @@ impl Rx2SpectrumProcessor {
         self.cal_offset_db = offset;
     }
 
+    /// Current RX2 VFO (VFO-B) frequency in Hz. Used by VRX2 channelizer.
+    pub fn vfo_freq_hz(&self) -> u64 {
+        self.vfo_freq_hz
+    }
+
+    /// Current RX2 DDC center frequency in Hz. Used by VRX2 to compute
+    /// bin-offset against the IQ stream's centre.
+    pub fn ddc_center_hz(&self) -> u64 {
+        self.ddc_center_hz
+    }
+
     pub fn set_tci_mode(&mut self, enabled: bool) {
         self.tci_mode = enabled;
     }
@@ -863,6 +968,70 @@ impl Rx2SpectrumProcessor {
         self.last_frame = Instant::now();
         self.sequence = self.sequence.wrapping_add(1);
         true
+    }
+
+    /// Extract a view centered on absolute frequency (mirror of
+    /// SpectrumProcessor::extract_view_at for RX2). Used for VRX2
+    /// high-res spectrum.
+    pub fn extract_view_at(
+        &self,
+        center_hz: u64,
+        span_hz: u32,
+        max_bins: usize,
+    ) -> SpectrumPacket {
+        let total = self.smoothed.len();
+        if total == 0 || span_hz == 0 {
+            return SpectrumPacket {
+                sequence: self.sequence, num_bins: 0, center_freq_hz: 0,
+                span_hz: 0, ref_level: 0, db_per_unit: 1, bins: Vec::new(),
+            };
+        }
+        let hz_per_bin = self.sample_rate_hz as f64 / total as f64;
+        let ddc_lo = self.ddc_center_hz as f64 - (self.sample_rate_hz as f64 / 2.0);
+        let view_lo = (center_hz as f64) - (span_hz as f64 / 2.0);
+        let view_hi = (center_hz as f64) + (span_hz as f64 / 2.0);
+        let bin_lo = ((view_lo - ddc_lo) / hz_per_bin).floor() as isize;
+        let bin_hi = ((view_hi - ddc_lo) / hz_per_bin).ceil() as isize;
+        // Clamp BEIDE grenzen naar [0, total]. Een view volledig ONDER de DDC
+        // geeft een negatieve bin_hi; `negatief as usize` wrapt dan naar een
+        // gigantische index -> out-of-bounds panic in de bin-loop hieronder.
+        // Met clamp wordt dat 0, en de `end <= start`-guard geeft netjes een
+        // leeg spectrum terug i.p.v. de server te laten crashen.
+        let start = bin_lo.clamp(0, total as isize) as usize;
+        let end = bin_hi.clamp(0, total as isize) as usize;
+        if end <= start {
+            return SpectrumPacket {
+                sequence: self.sequence, num_bins: 0, center_freq_hz: 0,
+                span_hz: 0, ref_level: 0, db_per_unit: 1, bins: Vec::new(),
+            };
+        }
+        let visible = end - start;
+        let cal_shift = self.cal_offset_db * 65535.0 / 120.0;
+        let bins: Vec<u16> = if visible <= max_bins {
+            self.smoothed[start..end].iter()
+                .map(|v| (v + cal_shift).clamp(0.0, 65535.0) as u16).collect()
+        } else {
+            let stride = visible as f64 / max_bins as f64;
+            (0..max_bins).map(|i| {
+                let s = start + (i as f64 * stride) as usize;
+                let e = (start + ((i as f64 + 1.0) * stride) as usize).min(end);
+                let mut max_val = 0.0f32;
+                for j in s..e { if self.smoothed[j] > max_val { max_val = self.smoothed[j]; } }
+                (max_val + cal_shift).clamp(0.0, 65535.0) as u16
+            }).collect()
+        };
+        let bin_center_offset = (start + end) as f64 / 2.0 - total as f64 / 2.0;
+        let actual_center_hz = (self.ddc_center_hz as f64 + bin_center_offset * hz_per_bin) as u32;
+        let actual_span_hz = (visible as f64 * hz_per_bin) as u32;
+        SpectrumPacket {
+            sequence: self.sequence,
+            num_bins: bins.len() as u16,
+            center_freq_hz: actual_center_hz,
+            span_hz: actual_span_hz,
+            ref_level: 0,
+            db_per_unit: 1,
+            bins,
+        }
     }
 
     /// Extract view — same logic as SpectrumProcessor::extract_view

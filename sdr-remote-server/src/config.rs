@@ -164,6 +164,21 @@ pub struct ServerConfig {
     pub yaesu_baud: u32,
     /// Yaesu USB audio input device name pattern (e.g. "USB Audio")
     pub yaesu_audio_device: Option<String>,
+    // ── Dual-radio slot 1 (PATCH-dual-radio-991a-ftx1) ──
+    // Tweede onafhankelijke radio (bv. FTX-1). De bestaande `yaesu_*`-keys
+    // hierboven = slot 0 (back-compat); deze `yaesu2_*`-keys = slot 1. Beide
+    // delen het gedeelde Yaesu-CAT-dialect; `RadioModel` draagt de verschillen.
+    /// Slot-1 radio serial port (e.g. "COM25").
+    pub yaesu2_port: Option<String>,
+    pub yaesu2_enabled: bool,
+    pub yaesu2_baud: u32,
+    /// Slot-1 USB audio input device name pattern. Aparte keuze want twee
+    /// radio's melden zich mogelijk identiek als "USB Audio CODEC" (edge-case 6).
+    pub yaesu2_audio_device: Option<String>,
+    /// Slot-1 capture-kanaal-keuze voor dual-RX radio's (FTX-1 = 2 fysieke
+    /// ontvangers op L/R). 0 = L (hardware-RX 1), 1 = R (hardware-RX 2),
+    /// 2 = mix (beide gesommeerd). Default 2. Mono radio's (991A) negeren dit.
+    pub yaesu2_audio_channel: u8,
     /// Amplitec 6/2 serial port (e.g. "COM3")
     pub amplitec_port: Option<String>,
     pub amplitec_enabled: bool,
@@ -318,6 +333,11 @@ impl Default for ServerConfig {
             yaesu_enabled: false,
             yaesu_baud: 38400,
             yaesu_audio_device: None,
+            yaesu2_port: None,
+            yaesu2_enabled: false,
+            yaesu2_baud: 38400,
+            yaesu2_audio_device: None,
+            yaesu2_audio_channel: 2, // mix (beide ontvangers) als veilige default
             amplitec_port: None,
             amplitec_enabled: true,
             amplitec_labels: default_labels("Ant"),
@@ -566,6 +586,31 @@ fn load_unlocked() -> ServerConfig {
                     "yaesu_audio" => {
                         let v = value.trim().to_string();
                         config.yaesu_audio_device = if v.is_empty() { None } else { Some(v) };
+                    }
+                    "yaesu2_port" => {
+                        let v = value.trim().to_string();
+                        config.yaesu2_port = if v.is_empty() { None } else { Some(v) };
+                    }
+                    "yaesu2_enabled" => {
+                        config.yaesu2_enabled = value.trim() != "false";
+                    }
+                    "yaesu2_baud" => {
+                        if let Ok(v) = value.trim().parse::<u32>() {
+                            config.yaesu2_baud = v;
+                        }
+                    }
+                    "yaesu2_audio" => {
+                        let v = value.trim().to_string();
+                        config.yaesu2_audio_device = if v.is_empty() { None } else { Some(v) };
+                    }
+                    "yaesu2_audio_channel" => {
+                        // Tolerant: accepteer cijfer (0/1/2) of L/R/MIX (case-insensitive).
+                        let v = value.trim().to_lowercase();
+                        config.yaesu2_audio_channel = match v.as_str() {
+                            "0" | "l" | "left" => 0,
+                            "1" | "r" | "right" => 1,
+                            _ => 2, // "2"/"mix"/onbekend → mix
+                        };
                     }
                     "amplitec_port" => {
                         let v = value.trim().to_string();
@@ -1024,6 +1069,14 @@ fn save_unlocked(config: &ServerConfig) {
         config.rotor_enabled,
         config.show_rotor_window,
     );
+    // Dual-radio slot 1 (PATCH-dual-radio-991a-ftx1). Apart geblokt zodat het
+    // bestaande config-format ongewijzigd blijft bij upgrade (oude bestanden
+    // zonder deze keys laden gewoon de defaults: slot 1 disabled).
+    contents.push_str(&format!("yaesu2_port={}\n", config.yaesu2_port.as_deref().unwrap_or("")));
+    contents.push_str(&format!("yaesu2_enabled={}\n", config.yaesu2_enabled));
+    contents.push_str(&format!("yaesu2_baud={}\n", config.yaesu2_baud));
+    contents.push_str(&format!("yaesu2_audio={}\n", config.yaesu2_audio_device.as_deref().unwrap_or("")));
+    contents.push_str(&format!("yaesu2_audio_channel={}\n", config.yaesu2_audio_channel));
     // Rotor backend keuze + PstRotator-velden. Apart geblokt zodat de
     // bestaande EA7HG-config-format ongewijzigd blijft bij upgrade.
     contents.push_str(&format!("rotor_backend={}\n", config.rotor_backend));

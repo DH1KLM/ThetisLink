@@ -838,6 +838,578 @@ pub(crate) fn render_waterfall(
     }
 }
 
+/// VRX strip: zoom slider + spectrum line + waterfall, all
+/// centered on `vrx_freq_hz`. Slices `full_bins` (= main DDC
+/// spectrum) and per-row data from `wf` to extract the VRX view.
+/// Returns Some(new_freq_hz) when user click/scroll/drag tunes the
+/// VRX, else None.
+///
+/// Layout (per VRX, ~250 px tall):
+///   [Zoom slider, 22 px]
+///   [Spectrum line, 80 px]
+///   [Waterfall, 120 px]
+pub(crate) fn render_vrx_strip(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    salt: &str,
+    vrx_freq_hz: u64,
+    zoom: f32,
+    pan: f32,
+    ref_db: f32,
+    range_db: f32,
+    wf_contrast: f32,
+    spec_h: f32,
+    wf_h: f32,
+    mode_lsb: bool,
+    filter_low_hz: i32,
+    filter_high_hz: i32,
+    smeter_dbm: f32,
+    enabled: bool,
+    full_bins: &[u16],
+    full_center_hz: u32,
+    full_span_hz: u32,
+    // Waterfall covers the full DDC; its data is independent of any
+    // extracted-view trick. Passed separately so spectrum-line
+    // (extracted) and waterfall (full-DDC) coexist in high-res mode.
+    wf_full_span_hz: u32,
+    // True when `full_bins`/`full_span_hz` are the server-side extracted
+    // view (already at the user's current visible window). In that case
+    // bins map 1:1 to the view, no zoom-division.
+    extracted_mode: bool,
+    wf: &WaterfallRingBuffer,
+    texture: &mut Option<egui::TextureHandle>,
+    ddc_min_hz: u64,
+    ddc_max_hz: u64,
+) -> Option<u64> {
+    use egui::Pos2 as P2;
+    let mut new_freq: Option<u64> = None;
+
+    if full_span_hz == 0 || full_bins.is_empty() {
+        ui.label(RichText::new("(spectrum nog niet ontvangen)").size(10.0).color(Color32::GRAY));
+        return None;
+    }
+
+    // Server-side fixed dB scale used to pack bins into u16 (matches
+    // main spectrum). Client-side ref/range are a remap onto y-axis.
+    let server_floor_db = -150.0f32;
+    let server_range_db = 120.0f32;
+
+    // ── Compute view bounds (centered on VRX freq + pan offset) ──
+    // Extracted view: server already extracted the current visible window,
+    // so view_span = bins_span directly. Full view: divide by client zoom.
+    let view_span_hz = if extracted_mode {
+        full_span_hz as f64
+    } else {
+        (full_span_hz as f64 / (zoom as f64).max(1.0)).max(500.0)
+    };
+    let pan_hz = pan as f64 * full_span_hz as f64;
+    let view_min_hz = vrx_freq_hz as f64 + pan_hz - view_span_hz / 2.0;
+    let view_max_hz = vrx_freq_hz as f64 + pan_hz + view_span_hz / 2.0;
+    let full_min_hz = full_center_hz as f64 - full_span_hz as f64 / 2.0;
+    let bin_hz = full_span_hz as f64 / full_bins.len() as f64;
+
+    // ── Spectrum + label strip ──
+    let label_h = 16.0_f32;
+    let plot_h = spec_h.max(40.0);
+    let (rect, resp) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), plot_h + label_h),
+        egui::Sense::click_and_drag(),
+    );
+    // Besluit 9: custom Painter-helper bouwt hover zelf in.
+    let resp = resp.on_hover_text("Click: tune VRX. Scroll: tune. Drag/scroll filter edge: resize filter.");
+    let plot_rect = egui::Rect::from_min_max(rect.min, P2::new(rect.max.x, rect.max.y - label_h));
+    let label_strip = egui::Rect::from_min_max(P2::new(rect.min.x, plot_rect.max.y), rect.max);
+    let floor_db = ref_db - range_db;
+
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter_at(rect);
+        // Backgrounds (match main spectrum)
+        painter.rect_filled(plot_rect, 2.0, Color32::from_rgb(10, 15, 30));
+        painter.rect_filled(label_strip, 0.0, Color32::from_rgb(18, 22, 40));
+
+        // When VRX is disabled: dim everything + show overlay text, skip
+        // spectrum/waterfall drawing so the panel visually "freezes" off.
+        if !enabled {
+            painter.rect_filled(plot_rect, 2.0, Color32::from_rgba_premultiplied(0, 0, 0, 140));
+            let disabled_text = "DISABLED";
+            let disabled_font = egui::FontId::proportional(20.0);
+            let disabled_color = Color32::from_rgba_premultiplied(180, 80, 80, 220);
+            let galley = painter.layout_no_wrap(disabled_text.to_string(), disabled_font, disabled_color);
+            let text_pos = egui::Align2::CENTER_CENTER.anchor_size(plot_rect.center(), galley.size());
+            painter.galley(text_pos.min, galley, disabled_color);
+            return None;
+        }
+
+        // ── Nice tick spacing for freq and dB ──
+        let tick_spacing_hz = {
+            let raw = view_span_hz / 7.0;
+            let pow = 10.0f64.powf(raw.log10().floor());
+            let n = raw / pow;
+            let nice = if n < 1.5 { 1.0 } else if n < 3.5 { 2.0 } else if n < 7.5 { 5.0 } else { 10.0 };
+            nice * pow
+        };
+        let db_spacing = {
+            let raw = range_db / 6.0;
+            let pow = 10.0f32.powf(raw.log10().floor());
+            let n = raw / pow;
+            let nice = if n < 1.5 { 1.0 } else if n < 3.5 { 2.0 } else if n < 7.5 { 5.0 } else { 10.0 };
+            nice * pow
+        };
+        let grid_stroke = Stroke::new(1.0, Color32::from_rgb(60, 60, 85));
+
+        // ── Vertical freq grid + tick marks in label strip ──
+        let first_tick = (view_min_hz / tick_spacing_hz).ceil() as i64;
+        let last_tick = (view_max_hz / tick_spacing_hz).floor() as i64;
+        for tick_idx in first_tick..=last_tick {
+            let freq = tick_idx as f64 * tick_spacing_hz;
+            let frac = (freq - view_min_hz) / view_span_hz;
+            if frac < 0.01 || frac > 0.99 { continue; }
+            let x = rect.min.x + frac as f32 * rect.width();
+            painter.line_segment(
+                [P2::new(x, plot_rect.min.y), P2::new(x, plot_rect.max.y)],
+                grid_stroke,
+            );
+            painter.line_segment(
+                [P2::new(x, label_strip.min.y), P2::new(x, label_strip.min.y + 4.0)],
+                Stroke::new(1.0, Color32::from_rgb(80, 80, 110)),
+            );
+        }
+
+        // ── Horizontal dB grid ──
+        let first_db_tick = (floor_db / db_spacing).ceil() as i32;
+        let last_db_tick = (ref_db / db_spacing).floor() as i32;
+        for db_idx in first_db_tick..=last_db_tick {
+            let db = db_idx as f32 * db_spacing;
+            let frac = (ref_db - db) / range_db;
+            if frac < 0.02 || frac > 0.98 { continue; }
+            let y = plot_rect.min.y + frac * plot_rect.height();
+            painter.line_segment(
+                [P2::new(plot_rect.min.x, y), P2::new(plot_rect.max.x, y)],
+                grid_stroke,
+            );
+        }
+
+        // ── Filter passband overlay (yellow edges + dim fill) ──
+        let filt_lo_hz = vrx_freq_hz as f64 + filter_low_hz as f64;
+        let filt_hi_hz = vrx_freq_hz as f64 + filter_high_hz as f64;
+        let lo_frac = (filt_lo_hz - view_min_hz) / view_span_hz;
+        let hi_frac = (filt_hi_hz - view_min_hz) / view_span_hz;
+        let lo_x_raw = rect.min.x + lo_frac as f32 * rect.width();
+        let hi_x_raw = rect.min.x + hi_frac as f32 * rect.width();
+        let lo_x = lo_x_raw.max(plot_rect.min.x);
+        let hi_x = hi_x_raw.min(plot_rect.max.x);
+        if hi_x > lo_x {
+            painter.rect_filled(
+                egui::Rect::from_min_max(P2::new(lo_x, plot_rect.min.y), P2::new(hi_x, plot_rect.max.y)),
+                0.0,
+                Color32::from_rgb(25, 30, 45),
+            );
+            let edge_stroke = Stroke::new(0.5, Color32::from_rgba_premultiplied(200, 200, 0, 120));
+            if lo_x > plot_rect.min.x {
+                painter.line_segment([P2::new(lo_x, plot_rect.min.y), P2::new(lo_x, plot_rect.max.y)], edge_stroke);
+            }
+            if hi_x < plot_rect.max.x {
+                painter.line_segment([P2::new(hi_x, plot_rect.min.y), P2::new(hi_x, plot_rect.max.y)], edge_stroke);
+            }
+        }
+        // Stash edge positions for drag/scroll interaction outside the painter scope.
+        let _ = (lo_x_raw, hi_x_raw, mode_lsb);
+
+        // ── Compute per-pixel points + fracs (max-per-pixel aggregation) ──
+        let n_px = plot_rect.width().max(1.0) as usize;
+        let mut pwf: Vec<(P2, f32)> = Vec::with_capacity(n_px);
+        for px in 0..n_px {
+            let freq0 = view_min_hz + (px as f64 / n_px as f64) * view_span_hz;
+            let freq1 = view_min_hz + ((px + 1) as f64 / n_px as f64) * view_span_hz;
+            let b0 = ((freq0 - full_min_hz) / bin_hz).max(0.0);
+            let b1 = ((freq1 - full_min_hz) / bin_hz).max(0.0);
+            let bs = b0.floor() as usize;
+            let be = (b1.ceil() as usize).min(full_bins.len()).max(bs + 1);
+            let mut max_val = 0u16;
+            if bs < full_bins.len() {
+                for i in bs..be.min(full_bins.len()) {
+                    max_val = max_val.max(full_bins[i]);
+                }
+            }
+            let db = server_floor_db + (max_val as f32 / 65535.0) * server_range_db;
+            let frac = (ref_db - db) / range_db;
+            let y = plot_rect.min.y + frac * plot_rect.height();
+            pwf.push((
+                P2::new(plot_rect.min.x + px as f32, y.clamp(plot_rect.min.y, plot_rect.max.y)),
+                frac.clamp(0.0, 1.0),
+            ));
+        }
+
+        // ── VRX freq label (big red MHz, centered above spectrum) ──
+        let mut vfo_text_rect: Option<egui::Rect> = None;
+        let mut vfo_x: Option<f32> = None;
+        let vfo_frac = (vrx_freq_hz as f64 - view_min_hz) / view_span_hz;
+        if (0.0..=1.0).contains(&vfo_frac) {
+            let x = rect.min.x + vfo_frac as f32 * rect.width();
+            vfo_x = Some(x);
+            let vfo_mhz = vrx_freq_hz as f32 / 1_000_000.0;
+            let vfo_text = format!("{:.3}", vfo_mhz);
+            let vfo_font = egui::FontId::proportional(24.0);
+            let vfo_color = Color32::from_rgb(255, 120, 120);
+            let galley = painter.layout_no_wrap(vfo_text, vfo_font, vfo_color);
+            let text_pos = egui::Align2::CENTER_TOP.anchor_size(P2::new(x, plot_rect.min.y + 2.0), galley.size());
+            let bg_rect = text_pos.expand(2.0);
+            vfo_text_rect = Some(bg_rect);
+            painter.rect_filled(bg_rect, 2.0, Color32::from_rgba_premultiplied(10, 15, 30, 220));
+            painter.galley(text_pos.min, galley, vfo_color);
+        }
+
+        // ── Fill under curve with level-colored gradient mesh ──
+        if pwf.len() >= 2 {
+            let bottom_y = plot_rect.max.y;
+            let mut mesh = egui::Mesh::default();
+            for (i, (pt, frac)) in pwf.iter().enumerate() {
+                let uv = egui::epaint::WHITE_UV;
+                let (r, g, b) = spectrum_level_color_with_floor(1.0 - *frac, 0.25);
+                let fill_color = Color32::from_rgba_premultiplied(r, g, b, 50);
+                let bottom_color = Color32::from_rgba_premultiplied(r / 4, g / 4, b / 4, 20);
+                mesh.vertices.push(egui::epaint::Vertex { pos: *pt, uv, color: fill_color });
+                mesh.vertices.push(egui::epaint::Vertex { pos: P2::new(pt.x, bottom_y), uv, color: bottom_color });
+                if i > 0 {
+                    let base = (i as u32 - 1) * 2;
+                    mesh.indices.extend_from_slice(&[base, base + 1, base + 2]);
+                    mesh.indices.extend_from_slice(&[base + 1, base + 3, base + 2]);
+                }
+            }
+            painter.add(egui::Shape::Mesh(mesh));
+        }
+
+        // ── Spectrum line, per-segment level color ──
+        if pwf.len() >= 2 {
+            for i in 1..pwf.len() {
+                let (p0, f0) = &pwf[i - 1];
+                let (p1, f1) = &pwf[i];
+                let avg_frac = (f0 + f1) / 2.0;
+                let (r, g, b) = spectrum_level_color_with_floor(1.0 - avg_frac, 0.25);
+                painter.line_segment([*p0, *p1], Stroke::new(1.5, Color32::from_rgb(r, g, b)));
+            }
+        }
+
+        // ── VFO line (red, interrupted at the MHz text) ──
+        if let Some(x) = vfo_x {
+            let vfo_stroke = Stroke::new(2.0, Color32::from_rgba_premultiplied(255, 50, 50, 180));
+            if let Some(tr) = vfo_text_rect {
+                if plot_rect.min.y < tr.min.y {
+                    painter.line_segment([P2::new(x, plot_rect.min.y), P2::new(x, tr.min.y)], vfo_stroke);
+                }
+                painter.line_segment([P2::new(x, tr.max.y), P2::new(x, plot_rect.max.y)], vfo_stroke);
+            } else {
+                painter.line_segment([P2::new(x, plot_rect.min.y), P2::new(x, plot_rect.max.y)], vfo_stroke);
+            }
+        }
+
+        // ── S-meter overlay (top-right) ──
+        let bg_color_smeter = Color32::from_rgba_premultiplied(10, 15, 30, 220);
+        {
+            let meter_text = if smeter_dbm <= -73.0 {
+                let s_unit = ((smeter_dbm + 127.0) / 6.0).floor().clamp(0.0, 9.0) as u8;
+                format!("S{}", s_unit)
+            } else {
+                let db_over = (smeter_dbm + 73.0).round() as i32;
+                format!("S9+{}dB", db_over.max(0))
+            };
+            let meter_font = egui::FontId::proportional(42.0); // parity met RX-popout-spectrum
+            let meter_color = Color32::from_rgb(0, 220, 0);
+            let galley = painter.layout_no_wrap(meter_text, meter_font, meter_color);
+            let text_pos = egui::Align2::RIGHT_TOP.anchor_size(
+                P2::new(plot_rect.max.x - 4.0, plot_rect.min.y + 2.0),
+                galley.size(),
+            );
+            painter.rect_filled(text_pos.expand(2.0), 2.0, bg_color_smeter);
+            painter.galley(text_pos.min, galley, meter_color);
+        }
+
+        // ── Span label (top-left, yellow) ──
+        let bg_color = Color32::from_rgba_premultiplied(10, 15, 30, 220);
+        let span_khz = view_span_hz / 1000.0;
+        {
+            let label = if span_khz < 1.0 {
+                format!("{:.2} kHz", span_khz)
+            } else if span_khz < 100.0 {
+                format!("{:.1} kHz", span_khz)
+            } else {
+                format!("{:.0} kHz", span_khz)
+            };
+            let span_font = egui::FontId::proportional(11.0);
+            let span_color = Color32::from_rgb(220, 220, 80);
+            let galley = painter.layout_no_wrap(label, span_font, span_color);
+            let text_pos = egui::Align2::LEFT_TOP.anchor_size(P2::new(plot_rect.min.x + 2.0, plot_rect.min.y + 14.0), galley.size()); // +14 parity met RX (onder VFO-label)
+            painter.rect_filled(text_pos.expand(2.0), 2.0, bg_color);
+            painter.galley(text_pos.min, galley, span_color);
+        }
+
+        // ── dB labels at left edge ──
+        let grid_font = egui::FontId::proportional(11.0);
+        let grid_color = Color32::from_rgb(200, 200, 210);
+        for db_idx in first_db_tick..=last_db_tick {
+            let db = db_idx as f32 * db_spacing;
+            let frac = (ref_db - db) / range_db;
+            if frac < 0.02 || frac > 0.98 { continue; }
+            let y = plot_rect.min.y + frac * plot_rect.height();
+            let db_text = format!("{:.0}", db);
+            let galley = painter.layout_no_wrap(db_text, grid_font.clone(), grid_color);
+            let text_pos = egui::Align2::LEFT_TOP.anchor_size(P2::new(plot_rect.min.x + 2.0, y + 1.0), galley.size());
+            painter.rect_filled(text_pos.expand(1.0), 1.0, bg_color);
+            painter.galley(text_pos.min, galley, grid_color);
+        }
+
+        // ── Frequency labels in bottom label strip ──
+        let freq_label_color = Color32::from_rgb(220, 220, 230);
+        for tick_idx in first_tick..=last_tick {
+            let freq = tick_idx as f64 * tick_spacing_hz;
+            let frac = (freq - view_min_hz) / view_span_hz;
+            if frac < 0.02 || frac > 0.98 { continue; }
+            let x = rect.min.x + frac as f32 * rect.width();
+            let freq_mhz = freq / 1_000_000.0;
+            let label = if tick_spacing_hz >= 1_000_000.0 {
+                format!("{:.0}", freq_mhz)
+            } else if tick_spacing_hz >= 100_000.0 {
+                format!("{:.1}", freq_mhz)
+            } else if tick_spacing_hz >= 10_000.0 {
+                format!("{:.2}", freq_mhz)
+            } else if tick_spacing_hz >= 1_000.0 {
+                format!("{:.3}", freq_mhz)
+            } else {
+                format!("{:.4}", freq_mhz)
+            };
+            painter.text(
+                P2::new(x, label_strip.min.y + label_strip.height() / 2.0),
+                egui::Align2::CENTER_CENTER,
+                label,
+                grid_font.clone(),
+                freq_label_color,
+            );
+        }
+    }
+    // ── Filter edge interaction (drag-resize + scroll-resize) ──
+    // Mirror main spectrum pattern: detect near-edge, set cursor,
+    // memory-based drag-state persistence. Writes go to ctx-memory
+    // under "{salt}_filter_low/high_hz" — caller reads and dispatches.
+    let filt_lo_x_full = rect.min.x + (((vrx_freq_hz as f64 + filter_low_hz as f64) - view_min_hz) / view_span_hz) as f32 * rect.width();
+    let filt_hi_x_full = rect.min.x + (((vrx_freq_hz as f64 + filter_high_hz as f64) - view_min_hz) / view_span_hz) as f32 * rect.width();
+    let grab_dist = 8.0;
+    let hover_pos = resp.hover_pos().filter(|p| {
+        p.x >= rect.min.x && p.x <= rect.max.x && p.y >= rect.min.y && p.y <= rect.min.y + plot_h
+    });
+    let near_lo = hover_pos.map(|p| (p.x - filt_lo_x_full).abs() < grab_dist).unwrap_or(false);
+    let near_hi = hover_pos.map(|p| (p.x - filt_hi_x_full).abs() < grab_dist).unwrap_or(false);
+
+    let drag_id = egui::Id::new(salt).with("vrx_filter_drag");
+    let hover_ready_id = drag_id.with("hover_ready");
+    let is_low_id = drag_id.with("is_low");
+    let dragging_filter: Option<bool> = ui.memory(|mem| mem.data.get_temp(drag_id));
+
+    if !resp.dragged() {
+        ui.memory_mut(|mem| mem.data.insert_temp(hover_ready_id, near_lo || near_hi));
+        if near_lo || near_hi {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        }
+    }
+
+    // Snap helper: round to 62.5 Hz audio-bin grid
+    let snap_to_bin = |hz: f64| -> i32 { ((hz / 62.5).round() * 62.5) as i32 };
+
+    // Scroll over filter edge: resize by one audio bin (62.5 Hz)
+    let mut filter_scroll_consumed = false;
+    if (near_lo || near_hi) && resp.hovered() {
+        let scroll = ui.input(|i| i.raw_scroll_delta.y);
+        if scroll.abs() > 0.1 {
+            // Convention: scroll up = move edge outward (wider filter).
+            let outward = scroll > 0.0;
+            if near_lo {
+                // Low edge: outward = more negative (further below)
+                let delta = if outward { -62.5 } else { 62.5 };
+                let new_lo = snap_to_bin(filter_low_hz as f64 + delta);
+                let clamped = new_lo.max(-4000).min(filter_high_hz - 125);
+                ui.memory_mut(|mem| mem.data.insert_temp(
+                    egui::Id::new(format!("{}_filter_low_hz", salt)), clamped));
+            } else if near_hi {
+                // High edge: outward = more positive (further above)
+                let delta = if outward { 62.5 } else { -62.5 };
+                let new_hi = snap_to_bin(filter_high_hz as f64 + delta);
+                let clamped = new_hi.min(4000).max(filter_low_hz + 125);
+                ui.memory_mut(|mem| mem.data.insert_temp(
+                    egui::Id::new(format!("{}_filter_high_hz", salt)), clamped));
+            }
+            filter_scroll_consumed = true;
+        }
+    }
+
+    // Drag on filter edge: continuous resize, snapped to bin grid
+    if resp.dragged() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            let filter_edge = dragging_filter.unwrap_or_else(|| {
+                let was_near = ui.memory(|mem| mem.data.get_temp::<bool>(hover_ready_id)).unwrap_or(false);
+                ui.memory_mut(|mem| mem.data.insert_temp(drag_id, was_near));
+                if was_near {
+                    let dl = (pos.x - filt_lo_x_full).abs();
+                    let dh = (pos.x - filt_hi_x_full).abs();
+                    ui.memory_mut(|mem| mem.data.insert_temp(is_low_id, dl < dh));
+                }
+                was_near
+            });
+            if filter_edge {
+                let frac = ((pos.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
+                let abs_hz = view_min_hz + frac as f64 * view_span_hz;
+                let snapped = snap_to_bin(abs_hz - vrx_freq_hz as f64);
+                let is_low = ui.memory(|mem| mem.data.get_temp::<bool>(is_low_id)).unwrap_or(near_lo);
+                let key = if is_low {
+                    format!("{}_filter_low_hz", salt)
+                } else {
+                    format!("{}_filter_high_hz", salt)
+                };
+                // Constrain so edges can't cross within < 2 bins
+                let clamped = if is_low {
+                    snapped.min(filter_high_hz - 125).max(-4000)
+                } else {
+                    snapped.max(filter_low_hz + 125).min(4000)
+                };
+                ui.memory_mut(|mem| mem.data.insert_temp(egui::Id::new(key), clamped));
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            }
+        }
+    } else if dragging_filter.is_some() {
+        ui.memory_mut(|mem| {
+            mem.data.remove::<bool>(drag_id);
+            mem.data.remove::<bool>(is_low_id);
+        });
+    }
+    let was_filter_drag = dragging_filter.is_some() || near_lo || near_hi;
+
+    // Click → tune VRX (skip if interacting with filter edge)
+    if resp.clicked() && !was_filter_drag {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            let frac = ((pos.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
+            let freq = (view_min_hz + frac as f64 * view_span_hz) as u64;
+            let clamped = freq.clamp(ddc_min_hz, ddc_max_hz);
+            new_freq = Some((clamped / 1000) * 1000); // round to 1 kHz, parity met RX
+        }
+    }
+    // Scroll → step VRX freq (skip when filter-edge scroll consumed it)
+    if resp.hovered() && !filter_scroll_consumed && !(near_lo || near_hi) {
+        let scroll = ui.input(|i| i.raw_scroll_delta.y);
+        if scroll.abs() > 0.1 {
+            let step_hz: i64 = if zoom >= 256.0 { 10 }
+                else if zoom >= 64.0 { 50 }
+                else if zoom >= 16.0 { 100 }
+                else if zoom >= 4.0 { 500 }
+                else { 1000 };
+            let delta = if scroll > 0.0 { step_hz } else { -step_hz };
+            let cur = vrx_freq_hz as i64;
+            let next = (cur + delta).clamp(ddc_min_hz as i64, ddc_max_hz as i64) as u64;
+            new_freq = Some(next);
+        }
+    }
+
+    // ── Waterfall (texture-based) ──
+    let wf_h_px = (wf_h.max(40.0) as usize).max(1);
+    let wf_w_px = (ui.available_width().max(1.0) as usize).min(1024);
+    // Textuur-hoogte = ringbuffer-capaciteit (niet de paneel-pixelhoogte); painter.image
+    // rekt 'm uit naar de rect — parity met RX-waterval. Voorkomt een permanente zwarte
+    // rand onder als het paneel hoger is dan de ring.
+    let wf_tex_rows = wf.height.max(1);
+    let mut pixels = vec![Color32::from_rgb(8, 10, 20); wf_w_px * wf_tex_rows];
+    if wf.count > 0 {
+        for y in 0..wf_tex_rows {
+            if y >= wf.count { break; }
+            let src_idx = (wf.write_idx + wf.height - 1 - y) % wf.height;
+            let row = &wf.full_rows[src_idx];
+            let row_center = wf.full_centers[src_idx] as f64;
+            if row.is_empty() || row_center == 0.0 { continue; }
+            // Per-row span: preferred when stored (VRX hr waterfall has
+            // varying span across rows). Falls back to wf_full_span_hz
+            // for the RX1/RX2 main waterfall (constant DDC width).
+            let per_row_span = wf.full_spans.get(src_idx).copied().unwrap_or(0) as f64;
+            let wf_span_for_row = if per_row_span > 0.0 {
+                per_row_span
+            } else if wf_full_span_hz > 0 {
+                wf_full_span_hz as f64
+            } else {
+                full_span_hz as f64
+            };
+            let row_min_hz = row_center - wf_span_for_row / 2.0;
+            let row_bin_hz = wf_span_for_row / row.len() as f64;
+            for x in 0..wf_w_px {
+                let px_start_hz = view_min_hz + x as f64 * view_span_hz / wf_w_px as f64;
+                let px_end_hz = view_min_hz + (x as f64 + 1.0) * view_span_hz / wf_w_px as f64;
+                let b0 = ((px_start_hz - row_min_hz) / row_bin_hz) as isize;
+                let b1 = (((px_end_hz - row_min_hz) / row_bin_hz).ceil() as isize).max(b0 + 1);
+                if b1 <= 0 || b0 >= row.len() as isize { continue; }
+                let b0c = b0.max(0) as usize;
+                let b1c = (b1 as usize).min(row.len());
+                // Max over alle bins die op deze pixel vallen — parity met RX-waterval.
+                // Single-bin sampling miste de piek waardoor VRX donkerder oogde.
+                let mut val = 0u16;
+                for j in b0c..b1c { val = val.max(row[j]); }
+                let db = server_floor_db + (val as f32 / 65535.0) * server_range_db;
+                let frac = ((ref_db - db) / range_db).clamp(0.0, 1.0);
+                let level = (1.0 - frac).powf(1.0 / wf_contrast.max(0.1)).clamp(0.0, 1.0);
+                let (r, g, b) = spectrum_level_color_with_floor(level, 0.25);
+                pixels[y * wf_w_px + x] = Color32::from_rgb(r, g, b);
+            }
+        }
+    }
+    let img = egui::ColorImage { size: [wf_w_px, wf_tex_rows], pixels };
+    match texture {
+        Some(tex) => { tex.set(img, egui::TextureOptions::LINEAR); }
+        None => {
+            *texture = Some(ctx.load_texture(
+                format!("vrx_wf_{}", salt),
+                img,
+                egui::TextureOptions::LINEAR,
+            ));
+        }
+    }
+    let tex = texture.as_ref().expect("texture just set above");
+    let (wf_rect, wf_resp) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), wf_h_px as f32),
+        egui::Sense::click(),
+    );
+    // Besluit 9: custom Painter-helper bouwt hover zelf in.
+    let wf_resp = wf_resp.on_hover_text("Click waterfall to tune VRX.");
+    if ui.is_rect_visible(wf_rect) {
+        let painter = ui.painter_at(wf_rect);
+        let uv = egui::Rect::from_min_max(P2::new(0.0, 0.0), P2::new(1.0, 1.0));
+        painter.image(tex.id(), wf_rect, uv, Color32::WHITE);
+        // Vertical cursor at VRX freq
+        painter.line_segment(
+            [P2::new(wf_rect.center().x, wf_rect.min.y),
+             P2::new(wf_rect.center().x, wf_rect.max.y)],
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 100, 100, 180)),
+        );
+    }
+    if wf_resp.clicked() {
+        if let Some(pos) = wf_resp.interact_pointer_pos() {
+            let frac = ((pos.x - wf_rect.min.x) / wf_rect.width()).clamp(0.0, 1.0);
+            let freq = (view_min_hz + frac as f64 * view_span_hz) as u64;
+            let clamped = freq.clamp(ddc_min_hz, ddc_max_hz);
+            new_freq = Some((clamped / 1000) * 1000); // round to 1 kHz, parity met RX
+        }
+    }
+    // Scroll over de waterval -> stem VRX (parity met RX-waterval; zelfde
+    // zoom-adaptieve stap als de spectrum-scroll hierboven).
+    if new_freq.is_none() && wf_resp.hovered() {
+        let scroll = ui.input(|i| i.raw_scroll_delta.y);
+        if scroll.abs() > 0.1 {
+            let step_hz: i64 = if zoom >= 256.0 { 10 }
+                else if zoom >= 64.0 { 50 }
+                else if zoom >= 16.0 { 100 }
+                else if zoom >= 4.0 { 500 }
+                else { 1000 };
+            let delta = if scroll > 0.0 { step_hz } else { -step_hz };
+            let cur = vrx_freq_hz as i64;
+            let next = (cur + delta).clamp(ddc_min_hz as i64, ddc_max_hz as i64) as u64;
+            new_freq = Some(next);
+        }
+    }
+    new_freq
+}
+
 /// Map 8-bit power value to RGB color (waterfall colormap)
 /// Black → Blue → Cyan → Yellow → Red → White
 pub(crate) fn waterfall_colormap(value: u8) -> (u8, u8, u8) {

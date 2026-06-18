@@ -28,6 +28,7 @@ mod rotor;
 mod pstrotator;
 mod pstrotator_listen;
 mod ui;
+mod vrx_bridge;
 
 use std::collections::VecDeque;
 
@@ -339,6 +340,11 @@ fn main() -> Result<()> {
             yaesu_enabled: defaults.yaesu_enabled,
             yaesu_baud: defaults.yaesu_baud,
             yaesu_audio_device: defaults.yaesu_audio_device,
+            yaesu2_port: defaults.yaesu2_port,
+            yaesu2_enabled: defaults.yaesu2_enabled,
+            yaesu2_baud: defaults.yaesu2_baud,
+            yaesu2_audio_device: defaults.yaesu2_audio_device,
+            yaesu2_audio_channel: defaults.yaesu2_audio_channel,
             amplitec_port: amplitec_port.or(defaults.amplitec_port),
             amplitec_labels: defaults.amplitec_labels,
             amplitec_max_w: defaults.amplitec_max_w,
@@ -838,6 +844,32 @@ pub async fn run_server_async(
     // NetworkService now takes the full Tuners collection so it can route
     // Tune commands per Amplitec-A position.
     let _ = tuner;
+
+    // Dual-radio slot 1 (PATCH-dual-radio-991a-ftx1, Optie B-prime). De 2e radio
+    // wordt hier uit config aangemaakt (werkt in GUI- én headless-mode). Model is
+    // per-poort autodetect via `ID;` (detect_model) → élke combinatie 2×991A /
+    // 2×FTX1 / mix werkt; faalt detect (radio uit) → FTX1-aanname-label, bring-up
+    // logt straks het echte ID. Slot 0 blijft volledig ongemoeid.
+    yaesu::log_input_devices();
+    let yaesu2_prebuilt: Option<Arc<yaesu::YaesuRadio>> = if config.yaesu2_enabled {
+        if let Some(ref port) = config.yaesu2_port {
+            let baud = config.yaesu2_baud;
+            let (model, det_baud) = yaesu::detect_model(port, baud)
+                .unwrap_or((yaesu::RadioModel::Ftx1, baud));
+            info!("[radio1] slot 1 enabled: {} @ {} baud, model={:?}", port, det_baud, model);
+            let audio = config.yaesu2_audio_device.clone();
+            match yaesu::YaesuRadio::new_with_model(port, det_baud, audio.as_deref(), model, 1, config.yaesu2_audio_channel) {
+                Ok(r) => Some(Arc::new(r)),
+                Err(e) => { warn!("[radio1] init failed: {} — slot 1 uit, server draait door", e); None }
+            }
+        } else {
+            warn!("[radio1] enabled maar geen yaesu2_port geconfigureerd — slot 1 uit");
+            None
+        }
+    } else {
+        None
+    };
+
     let network = NetworkService::new(
         bind_addr,
         session.clone(),
@@ -859,6 +891,7 @@ pub async fn run_server_async(
         vfo_freq_shared,
         vfo_b_freq_shared,
         yaesu_prebuilt,
+        yaesu2_prebuilt,
         audio_stats.clone(),
         tci_probe.clone(),
         server_start,

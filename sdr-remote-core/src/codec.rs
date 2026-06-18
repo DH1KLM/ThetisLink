@@ -20,10 +20,74 @@ pub struct OpusEncoder {
 
 impl OpusEncoder {
     pub fn new() -> Result<Self> {
-        let mut encoder = Encoder::new(SampleRate::Hz8000, Channels::Mono, Application::Voip)
+        Self::new_with_dtx(true)
+    }
+
+    /// Constructor with DTX (discontinuous transmission) optionally
+    /// disabled. DTX shrinks silence frames to 1-2 bytes — saves
+    /// bandwidth for voice traffic, but the encoder's voice-activity
+    /// detector can mis-fire on narrow-bandwidth SSB/CW content where
+    /// the spectrum looks "speech-like" only sometimes. For VRX
+    /// (server-side FFT-channelizer output) we want continuous audio
+    /// regardless of voice-activity → DTX off.
+    pub fn new_with_dtx(dtx: bool) -> Result<Self> {
+        // dtx=false signals VRX-mode (continuous audio, no DTX silence
+        // frames). Build 44 experiment: keep the rest of the Opus config
+        // identical to RX1 (Application::Voip + Signal::Voice + 12.8 kbps
+        // + Narrowband + FEC off). The earlier Audio+Auto+32kbps choice
+        // produced an inexplicable 6 kHz mirror image in client playback;
+        // matching RX1 settings rules out Opus as the cause.
+        let app = Application::Voip;
+        let signal = Signal::Voice;
+        let bitrate: i32 = 12_800;
+        let fec = dtx; // FEC is RX1-only; VRX is listen-only, no FEC.
+
+        let mut encoder = Encoder::new(SampleRate::Hz8000, Channels::Mono, app)
             .context("failed to create Opus encoder")?;
 
-        // 12.8 kbps — just above the 12.4k FEC threshold
+        encoder
+            .set_bitrate(Bitrate::BitsPerSecond(bitrate))
+            .context("set bitrate")?;
+        encoder
+            .set_bandwidth(Bandwidth::Narrowband)
+            .context("set bandwidth")?;
+        encoder
+            .set_signal(signal)
+            .context("set signal type")?;
+        encoder
+            .set_inband_fec(fec)
+            .context("set FEC")?;
+        encoder
+            .set_dtx(dtx)
+            .context("set DTX")?;
+        encoder
+            .set_packet_loss_perc(if fec { 10 } else { 0 })
+            .context("set packet loss")?;
+
+        Ok(Self {
+            encoder,
+            encode_buf: vec![0u8; MAX_ENCODED_SIZE],
+        })
+    }
+
+    /// Encoder voor live radio-RX audio (Yaesu USB CODEC → client).
+    ///
+    /// In tegenstelling tot de default voice-encoder staat hier **DTX uit**
+    /// en gebruiken we **Application::Audio + Signal::Auto**. Een aangesloten
+    /// radio levert *continue* audio (bandruis, FM-hiss, CW/SSB) die GEEN
+    /// spraak is. De default Voip+Voice+DTX-config laat de SILK voice-activity-
+    /// detector constante ruis als "stilte" classificeren → DTX stuurt dan
+    /// comfort-noise frames i.p.v. echte audio → precies het "ruis verdwijnt
+    /// langzaam, dan artifacts"-effect (owner-rapport build 119). Auto-signal +
+    /// DTX-uit = getrouwe, continue weergave. Zelfde aanpak als VRX
+    /// (`new_with_dtx(false)`), maar met FEC aan voor packet-loss-resilience.
+    ///
+    /// Bandbreedte/latency identiek aan het voice-pad (NB 8kHz, 12.8 kbps,
+    /// 20ms frames) — alleen de signaal-model-keuze verandert.
+    pub fn new_radio_rx() -> Result<Self> {
+        let mut encoder = Encoder::new(SampleRate::Hz8000, Channels::Mono, Application::Audio)
+            .context("failed to create radio-RX Opus encoder")?;
+
         encoder
             .set_bitrate(Bitrate::BitsPerSecond(12_800))
             .context("set bitrate")?;
@@ -31,15 +95,14 @@ impl OpusEncoder {
             .set_bandwidth(Bandwidth::Narrowband)
             .context("set bandwidth")?;
         encoder
-            .set_signal(Signal::Voice)
+            .set_signal(Signal::Auto)
             .context("set signal type")?;
         encoder
             .set_inband_fec(true)
-            .context("enable FEC")?;
+            .context("set FEC")?;
         encoder
-            .set_dtx(true)
-            .context("enable DTX")?;
-        // Expect 10% loss to make FEC useful
+            .set_dtx(false)
+            .context("set DTX")?;
         encoder
             .set_packet_loss_perc(10)
             .context("set packet loss")?;

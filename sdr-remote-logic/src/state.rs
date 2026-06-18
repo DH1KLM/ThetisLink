@@ -150,6 +150,9 @@ pub struct RadioState {
     pub playback_level_bin_r: f32,
     pub playback_level_rx2: f32,
     pub playback_level_yaesu: f32,
+    pub playback_level_yaesu2: f32,
+    pub playback_level_vrx1: f32,
+    pub playback_level_vrx2: f32,
     pub yaesu_mic_level: f32,
 
     // Radio
@@ -238,6 +241,18 @@ pub struct RadioState {
     pub full_spectrum_center_hz: u32,
     pub full_spectrum_span_hz: u32,
     pub full_spectrum_sequence: u16,
+
+    // High-res VRX extracted spectrum (server-side per-VRX window).
+    // Populated only when client enables it via SetVrxHighResSpectrum.
+    // Empty bins → fall back to full_spectrum on the client side.
+    pub vrx1_extracted_bins: Vec<u16>,
+    pub vrx1_extracted_center_hz: u32,
+    pub vrx1_extracted_span_hz: u32,
+    pub vrx1_extracted_sequence: u16,
+    pub vrx2_extracted_bins: Vec<u16>,
+    pub vrx2_extracted_center_hz: u32,
+    pub vrx2_extracted_span_hz: u32,
+    pub vrx2_extracted_sequence: u16,
 
     // External equipment: Amplitec 6/2 antenna switch
     pub amplitec_connected: bool,
@@ -372,6 +387,29 @@ pub struct RadioState {
     pub yaesu_vfo_select: u8,  // 0=VFO, 1=Memory, 2=MemTune
     pub yaesu_memory_channel: u16,
     pub yaesu_memory_data: Option<String>,
+    // Dual-radio slot 1 (PATCH-dual-radio-991a-ftx1) — mirror van de slot-0
+    // Yaesu-velden hierboven. `*_model` = wire-code uit RadioInfo (0=991A,
+    // 1=FTX1) voor paneel-naamgeving. yaesu2_connected wordt true zodra een
+    // YaesuState2-packet binnenkomt → de UI toont dan het 2e paneel.
+    pub yaesu_model: u8,
+    pub yaesu2_model: u8,
+    pub yaesu2_connected: bool,
+    pub yaesu2_freq_a: u64,
+    pub yaesu2_freq_b: u64,
+    pub yaesu2_mode: u8,
+    pub yaesu2_smeter: u16,
+    pub yaesu2_tx_active: bool,
+    pub yaesu2_power_on: bool,
+    pub yaesu2_af_gain: u8,
+    pub yaesu2_tx_power: u8,
+    pub yaesu2_squelch: u8,
+    pub yaesu2_rf_gain: u8,
+    pub yaesu2_mic_gain: u8,
+    pub yaesu2_split: bool,
+    pub yaesu2_scan: bool,
+    pub yaesu2_vfo_select: u8,
+    pub yaesu2_memory_channel: u16,
+    pub yaesu2_memory_data: Option<String>, // tab-separated geheugen-dump radio 2 (Fase B)
     // New TCI controls (v2.10.3.13)
     pub agc_mode: u8,       // 0=off, 1=long, 2=slow, 3=med, 4=fast, 5=custom
     pub agc_gain: u8,       // 0-120
@@ -432,6 +470,9 @@ impl Default for RadioState {
             playback_level_bin_r: 0.0,
             playback_level_rx2: 0.0,
             playback_level_yaesu: 0.0,
+            playback_level_yaesu2: 0.0,
+            playback_level_vrx1: 0.0,
+            playback_level_vrx2: 0.0,
             yaesu_mic_level: 0.0,
             frequency_hz: 0,
             mode: 0,
@@ -496,6 +537,14 @@ impl Default for RadioState {
             full_spectrum_center_hz: 0,
             full_spectrum_span_hz: 0,
             full_spectrum_sequence: 0,
+            vrx1_extracted_bins: Vec::new(),
+            vrx1_extracted_center_hz: 0,
+            vrx1_extracted_span_hz: 0,
+            vrx1_extracted_sequence: 0,
+            vrx2_extracted_bins: Vec::new(),
+            vrx2_extracted_center_hz: 0,
+            vrx2_extracted_span_hz: 0,
+            vrx2_extracted_sequence: 0,
             amplitec_connected: false,
             amplitec_switch_a: 0,
             amplitec_switch_b: 0,
@@ -608,6 +657,25 @@ impl Default for RadioState {
             yaesu_vfo_select: 0,
             yaesu_memory_channel: 0,
             yaesu_memory_data: None,
+            yaesu_model: 0,
+            yaesu2_model: 1,
+            yaesu2_connected: false,
+            yaesu2_freq_a: 0,
+            yaesu2_freq_b: 0,
+            yaesu2_mode: 1,
+            yaesu2_smeter: 0,
+            yaesu2_tx_active: false,
+            yaesu2_power_on: false,
+            yaesu2_af_gain: 0,
+            yaesu2_tx_power: 0,
+            yaesu2_squelch: 0,
+            yaesu2_rf_gain: 0,
+            yaesu2_mic_gain: 0,
+            yaesu2_split: false,
+            yaesu2_scan: false,
+            yaesu2_vfo_select: 0,
+            yaesu2_memory_channel: 0,
+            yaesu2_memory_data: None,
             agc_mode: 3, // med
             agc_gain: 80,
             rit_enable: false,

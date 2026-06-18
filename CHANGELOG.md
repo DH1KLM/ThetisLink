@@ -16,6 +16,72 @@ hardware notes, see `docs-book/src/technical-reference.md` and
 
 ---
 
+## [2.2.0] — 2026-06-18 (Virtual receivers + dual-radio FT-991A/FTX-1)
+
+> **Backwards-compatible with 2.1.x.** Wire-protocol `VERSION` stays 3 — the new
+> VRX and second-radio packet types are purely additive (`0x21`–`0x29`) and are
+> sent only to clients that explicitly subscribe, so a v2.1.x client keeps working
+> and never receives the new types. Pair with **Thetis fork PA3GHM TL2-4** for the
+> full feature-set; stock Thetis remains supported. Download
+> `ThetisLink-2.2.0.zip` from the
+> [Releases page](https://github.com/cjenschede/ThetisLink/releases) — the ZIP
+> contains both Windows binaries, the Android APK, all PDF manuals, `LICENSE` and
+> `SHA256SUMS.txt`. SBOM and third-party license artefacts are attached to the
+> same release as separate download assets.
+
+### Added — Virtual receivers (VRX)
+
+Two independent **virtual receivers** — VRX1 on RX1/VFO-A and VRX2 on RX2/VFO-B —
+are carved out of the wideband DDC I/Q stream by an FFT channelizer (new
+`vrx-rs` crate). Each VRX has its own listen frequency, mode (USB/LSB/AM/SAM/FM),
+filter, high-resolution spectrum + waterfall and S-meter, shown together in a
+joint pop-out window and mixed into the main audio alongside RX1/RX2/Yaesu.
+Audio is Opus narrowband (8 kHz) or wideband (16 kHz). Per-DDC-bucket frequency
+memory and full state persistence (enable/frequency/mode/filter) across
+reconnects.
+
+A browser-readable, illustrated explanation of the whole VRX signal chain — from
+radio wave to sound — is published on GitHub Pages:
+**[How a VRX works](https://cjenschede.github.io/ThetisLink/VRX-explained.html)**
+(English) · **[Hoe een VRX werkt](https://cjenschede.github.io/ThetisLink/VRX-uitleg.html)**
+(Nederlands), with a companion document on the server → client network path.
+
+### Added — Second radio (FT-991A + FTX-1, dual-radio)
+
+A second Yaesu radio can run alongside the first as an **independent channel**
+(slot 1), each with its own CAT serial port, USB audio, frequency, mode, PTT and
+memory. The radio model is **auto-detected** from the CAT `ID;` response
+(`0670` = FT-991A, `0840` = FTX-1); a bring-up probe logs a warning if the
+detected model does not match the configured slot (possible USB-enumeration
+swap). New additive packet types carry the slot-1 audio/state/frequency/memory,
+plus a `RadioInfo` broadcast so dual-radio-aware clients label the panels
+correctly. The Yaesu **FTX-1 WIRES-X** EX-menu fields are added to the EX editor.
+Two identically-named `USB Audio CODEC` devices can be disambiguated with a
+**`#N` index suffix** in the audio-device selector.
+
+### Added — FTX-1 software squelch
+
+The FTX-1's hardware squelch does not gate its USB audio, so an FM channel
+streams noise continuously. A **server-side software squelch** now polls the
+radio's busy state (`RI`) and fades the audio to silence when the squelch is
+closed — **FM-family modes only**; SSB/CW/AM/data always pass through (where the
+busy flag is meaningless).
+
+### Added — Switchable radio RX bandwidth + dynamic recording rate
+
+One client switch now sets the **RX audio bandwidth** (narrow 8 kHz / wide
+16 kHz) for the Thetis receiver, the VRX channels and the connected Yaesu radios
+together (receive only; transmit stays wideband). WAV recording sample-rate
+auto-scales with that setting.
+
+### Fixed — VRX traffic isolation for older clients
+
+VRX audio (`AudioVrx`) and high-resolution VRX spectrum (`SpectrumVrx1/2`) are
+now gated by **per-client subscription** (mirroring the second-radio gate), so a
+v2.1.x client that never enables VRX receives none of the new packet types — no
+parse errors, no log-spam, no wasted bandwidth. The FM demodulator's phase
+discriminator was corrected to use a full-quadrant `atan2`.
+
 ## [2.1.1] — 2026-06-07 (PstRotator + Log4OM direct rotor control)
 
 > **Backwards-compatible with 2.1.0.** Wire-protocol unchanged. Adds a

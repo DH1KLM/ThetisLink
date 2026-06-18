@@ -1,0 +1,20 @@
+[package]
+name = "vrx-rs"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+description = "Virtual RX (VRX) FFT-channelizer + Opus-encode pipeline. Standalone DSP crate for software-defined radio with remote clients."
+repository = "https://github.com/cjenschede/ThetisLink"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1"
+audiopus = "0.3.0-rc.0"
+rustfft = "6"
+log = "0.4"
+# No tokio dep: control-state is std::sync::Mutex (short locks, no
+# await held), feed() is sync. Caller picks their own runtime.
+
+[[bin]]
+name = "vrx-spike"
+path = "src/bin/vrx-spike.rs"

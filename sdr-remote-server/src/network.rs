@@ -2,7 +2,12 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
+
+/// Per-VRX high-res spectrum span in kHz. 0 = disabled. Set via
+/// ControlId::VrxSpectrumEnable/SpanKhz; read by the spectrum tick.
+static VRX1_HR_SPAN_KHZ: AtomicU16 = AtomicU16::new(0);
+static VRX2_HR_SPAN_KHZ: AtomicU16 = AtomicU16::new(0);
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -78,6 +83,9 @@ pub struct NetworkService {
     vfo_b_freq_shared: Option<Arc<AtomicU64>>,
     yaesu_ptt_flag: Arc<std::sync::atomic::AtomicBool>,
     yaesu: Option<Arc<crate::yaesu::YaesuRadio>>,
+    /// Dual-radio slot 1 (PATCH-dual-radio-991a-ftx1, Optie B-prime). Eigen
+    /// onafhankelijke broadcast/audio/control-keten; None = slot 1 uit.
+    yaesu2: Option<Arc<crate::yaesu::YaesuRadio>>,
     /// PATCH-2: lock-free audio-activity counters shared with the
     /// audio loops AND the UI Status panel.
     audio_stats: Arc<crate::audio_stats::AudioActivityStats>,
@@ -111,6 +119,7 @@ impl NetworkService {
         vfo_freq_shared: Option<Arc<AtomicU64>>,
         vfo_b_freq_shared: Option<Arc<AtomicU64>>,
         yaesu: Option<Arc<crate::yaesu::YaesuRadio>>,
+        yaesu2: Option<Arc<crate::yaesu::YaesuRadio>>,
         audio_stats: Arc<crate::audio_stats::AudioActivityStats>,
         tci_probe: Arc<crate::audio_stats::TciStatusProbe>,
         server_start: Instant,
@@ -255,6 +264,7 @@ impl NetworkService {
             vfo_b_freq_shared,
             yaesu_ptt_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             yaesu,
+            yaesu2,
             audio_stats,
             tci_probe,
             server_start,
@@ -264,6 +274,7 @@ impl NetworkService {
     pub async fn run(mut self) -> Result<()> {
         let start = Instant::now();
         let yaesu = self.yaesu.clone();
+        let yaesu2 = self.yaesu2.clone();
 
         // TCI is the only audio/IQ/control path
         let playback_rate = 48000u32;
@@ -276,8 +287,10 @@ impl NetworkService {
             let rx2_spectrum = self.rx2_spectrum.clone();
             let ptt = self.ptt.clone();
             let mut shutdown = self.shutdown.clone();
+            let socket = self.socket.clone();
+            let session = self.session.clone();
             tokio::spawn(async move {
-                crate::audio_loops::tci_iq_consumer(ptt, spectrum, rx2_spectrum, &mut shutdown).await;
+                crate::audio_loops::tci_iq_consumer(ptt, spectrum, rx2_spectrum, &mut shutdown, socket, session).await;
             })
         };
 
@@ -315,17 +328,40 @@ impl NetworkService {
         let _yaesu_audio_handle = {
             let yaesu_audio = yaesu.as_ref().and_then(|y| {
                 let rx = y.audio_rx.lock().ok().and_then(|mut a| a.take())?;
-                Some((rx, y.audio_sample_rate))
+                Some((rx, y.audio_sample_rate, y.status_arc()))
             });
-            if let Some((audio_rx, sample_rate)) = yaesu_audio {
+            if let Some((audio_rx, sample_rate, yaesu_status)) = yaesu_audio {
                 let socket = self.socket.clone();
                 let session = self.session.clone();
                 let mut shutdown = self.shutdown.clone();
                 let audio_stats = self.audio_stats.clone();
                 let server_start = self.server_start;
                 Some(tokio::spawn(async move {
-                    if let Err(e) = crate::audio_loops::yaesu_audio_loop(socket, session, audio_rx, sample_rate, &mut shutdown, start, audio_stats, server_start).await {
+                    if let Err(e) = crate::audio_loops::yaesu_audio_loop(socket, session, audio_rx, sample_rate, &mut shutdown, start, audio_stats, server_start, 0, yaesu_status).await {
                         log::error!("Yaesu audio loop error: {}", e);
+                    }
+                }))
+            } else {
+                None
+            }
+        };
+
+        // Slot-1 RX audio loop (Optie B-prime) — exacte spiegel van slot 0,
+        // maar broadcast naar yaesu2_addrs als AudioYaesu2 (slot=1).
+        let _yaesu2_audio_handle = {
+            let yaesu2_audio = yaesu2.as_ref().and_then(|y| {
+                let rx = y.audio_rx.lock().ok().and_then(|mut a| a.take())?;
+                Some((rx, y.audio_sample_rate, y.status_arc()))
+            });
+            if let Some((audio_rx, sample_rate, yaesu2_status)) = yaesu2_audio {
+                let socket = self.socket.clone();
+                let session = self.session.clone();
+                let mut shutdown = self.shutdown.clone();
+                let audio_stats = self.audio_stats.clone();
+                let server_start = self.server_start;
+                Some(tokio::spawn(async move {
+                    if let Err(e) = crate::audio_loops::yaesu_audio_loop(socket, session, audio_rx, sample_rate, &mut shutdown, start, audio_stats, server_start, 1, yaesu2_status).await {
+                        log::error!("[radio1] audio loop error: {}", e);
                     }
                 }))
             } else {
@@ -418,6 +454,118 @@ impl NetworkService {
                                             }
                                         }
                                         info!("Sent Yaesu memory data to {} clients ({}B)", addrs.len(), text_bytes.len());
+                                    }
+                                }
+                            }
+                            _ = shutdown.changed() => break,
+                        }
+                    }
+                }))
+            } else {
+                None
+            }
+        };
+
+        // Slot-1 state broadcast (Optie B-prime) — spiegel van slot 0, maar als
+        // YaesuState2 / YaesuMemoryData2 naar yaesu2_addrs (subscription-gated).
+        let _yaesu2_state_handle = {
+            let yaesu2 = yaesu2.clone();
+            let socket = self.socket.clone();
+            let session = self.session.clone();
+            let mut shutdown = self.shutdown.clone();
+            if yaesu2.is_some() {
+                Some(tokio::spawn(async move {
+                    let mut tick = interval(Duration::from_millis(200));
+                    loop {
+                        tokio::select! {
+                            _ = tick.tick() => {
+                                let addrs = session.lock().await.yaesu2_addrs();
+                                if addrs.is_empty() { continue; }
+                                if let Some(ref y) = yaesu2 {
+                                    let ys = y.status();
+                                    let pkt = YaesuStatePacket {
+                                        freq_a: ys.vfo_a_freq,
+                                        freq_b: ys.vfo_b_freq,
+                                        mode: ys.mode,
+                                        smeter: if ys.connected { ys.smeter } else { 0 },
+                                        tx_active: if ys.connected { ys.tx_active } else { false },
+                                        power_on: if ys.connected { ys.power_on } else { false },
+                                        af_gain: ys.af_gain,
+                                        tx_power: ys.tx_power,
+                                        vfo_select: ys.vfo_select,
+                                        memory_channel: ys.memory_channel,
+                                        squelch: ys.squelch,
+                                        rf_gain: ys.rf_gain,
+                                        mic_gain: ys.mic_gain,
+                                        split: ys.split_active,
+                                        scan: ys.scan_active,
+                                    };
+                                    let mut buf = [0u8; YaesuStatePacket::SIZE];
+                                    pkt.serialize_as_type(&mut buf, PacketType::YaesuState2);
+                                    for addr in &addrs {
+                                        let _ = socket.try_send_to(&buf, *addr);
+                                    }
+
+                                    let mem_data = y.memory_data.lock().unwrap().take();
+                                    if let Some(text) = mem_data {
+                                        let text_bytes = text.as_bytes();
+                                        let chunk_size = 60000;
+                                        for chunk in text_bytes.chunks(chunk_size) {
+                                            let mut send_buf = Vec::with_capacity(6 + chunk.len());
+                                            let header = Header::new(PacketType::YaesuMemoryData2, Flags::NONE);
+                                            let mut hdr_buf = [0u8; 4];
+                                            header.serialize(&mut hdr_buf);
+                                            send_buf.extend_from_slice(&hdr_buf);
+                                            send_buf.extend_from_slice(&(chunk.len() as u16).to_be_bytes());
+                                            send_buf.extend_from_slice(chunk);
+                                            for addr in &addrs {
+                                                let _ = socket.try_send_to(&send_buf, *addr);
+                                            }
+                                        }
+                                        info!("[radio1] Sent memory data to {} clients ({}B)", addrs.len(), text_bytes.len());
+                                    }
+                                }
+                            }
+                            _ = shutdown.changed() => break,
+                        }
+                    }
+                }))
+            } else {
+                None
+            }
+        };
+
+        // RadioInfo broadcast (Optie B-prime): laat dual-radio-bewuste clients
+        // (die Yaesu2Enable hebben gestuurd → yaesu2_addrs) het gedetecteerde
+        // model per slot weten, voor de paneel-naamgeving ("991A 1"/"FTX1" etc.).
+        // Oude clients zitten nooit op yaesu2_addrs → krijgen dit nieuwe packet-
+        // type nooit (back-compat by construction). 1 Hz volstaat ruim.
+        let _radio_info_handle = {
+            let yaesu = yaesu.clone();
+            let yaesu2 = yaesu2.clone();
+            let socket = self.socket.clone();
+            let session = self.session.clone();
+            let mut shutdown = self.shutdown.clone();
+            if yaesu.is_some() || yaesu2.is_some() {
+                Some(tokio::spawn(async move {
+                    let mut tick = interval(Duration::from_millis(1000));
+                    loop {
+                        tokio::select! {
+                            _ = tick.tick() => {
+                                let addrs = session.lock().await.yaesu2_addrs();
+                                if addrs.is_empty() { continue; }
+                                let mut infos: Vec<(u8, u8)> = Vec::new();
+                                if let Some(ref y) = yaesu { infos.push((0, y.model.as_code())); }
+                                if let Some(ref y) = yaesu2 { infos.push((1, y.model.as_code())); }
+                                for (slot, model) in infos {
+                                    let mut buf = [0u8; Header::SIZE + 2];
+                                    let mut hdr = [0u8; Header::SIZE];
+                                    Header::new(PacketType::RadioInfo, Flags::NONE).serialize(&mut hdr);
+                                    buf[..Header::SIZE].copy_from_slice(&hdr);
+                                    buf[Header::SIZE] = slot;
+                                    buf[Header::SIZE + 1] = model;
+                                    for addr in &addrs {
+                                        let _ = socket.try_send_to(&buf, *addr);
                                     }
                                 }
                             }
@@ -604,6 +752,53 @@ impl NetworkService {
                                     }
                                 }
                             } // rx2 spectrum lock released
+
+                            // VRX1/VRX2 high-res spectrum: extract a window
+                            // centered on the VRX listen freq with the client-
+                            // requested span. Per-client gated (release-gate
+                            // fix): alleen clients die VrxSpectrum* aan hebben
+                            // gezet krijgen het SpectrumVrx packet-type — oude
+                            // v2.1.x clients nooit.
+                            let vrx1_span_khz = VRX1_HR_SPAN_KHZ.load(Ordering::Relaxed);
+                            let vrx2_span_khz = VRX2_HR_SPAN_KHZ.load(Ordering::Relaxed);
+                            if vrx1_span_khz > 0 || vrx2_span_khz > 0 {
+                                let (vrx1_spec_addrs, vrx2_spec_addrs) = {
+                                    let s = session.lock().await;
+                                    (s.vrx_spectrum_addrs(0), s.vrx_spectrum_addrs(1))
+                                };
+                                if !vrx1_spec_addrs.is_empty() || !vrx2_spec_addrs.is_empty() {
+                                    if vrx1_span_khz > 0 && !vrx1_spec_addrs.is_empty() {
+                                        let span_hz = (vrx1_span_khz as u32) * 1000;
+                                        let vrx1_freq = crate::vrx_bridge::vrx_control_thetislink(0)
+                                            .lock().unwrap().target_freq_hz;
+                                        if vrx1_freq > 0 {
+                                            let sp = spectrum.lock().await;
+                                            let pkt = sp.extract_view_at(vrx1_freq, span_hz, 4096);
+                                            drop(sp);
+                                            if pkt.num_bins > 0 {
+                                                let mut buf = Vec::with_capacity(pkt.num_bins as usize * 2 + 32);
+                                                pkt.serialize_as_type(&mut buf, PacketType::SpectrumVrx1);
+                                                for addr in &vrx1_spec_addrs { packets_to_send.push((*addr, buf.clone())); }
+                                            }
+                                        }
+                                    }
+                                    if vrx2_span_khz > 0 && !vrx2_spec_addrs.is_empty() {
+                                        let span_hz = (vrx2_span_khz as u32) * 1000;
+                                        let vrx2_freq = crate::vrx_bridge::vrx_control_thetislink(1)
+                                            .lock().unwrap().target_freq_hz;
+                                        if vrx2_freq > 0 {
+                                            let rx2_sp = rx2_spectrum.lock().await;
+                                            let pkt = rx2_sp.extract_view_at(vrx2_freq, span_hz, 4096);
+                                            drop(rx2_sp);
+                                            if pkt.num_bins > 0 {
+                                                let mut buf = Vec::with_capacity(pkt.num_bins as usize * 2 + 32);
+                                                pkt.serialize_as_type(&mut buf, PacketType::SpectrumVrx2);
+                                                for addr in &vrx2_spec_addrs { packets_to_send.push((*addr, buf.clone())); }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
 
                             // Send all packets without holding any locks (non-blocking to avoid stalling select! loop)
                             for (addr, buf) in &packets_to_send {
@@ -1653,6 +1848,11 @@ impl NetworkService {
         // finally lands. Otherwise the trigger was silently dropped.
         let mut yaesu_write_armed = false;
         let yaesu_mic_gain = Arc::new(AtomicU32::new(20.0_f32.to_bits())); // default 20.0x
+        // Slot-1 TX audio (Optie B-prime) + geheugen-write-latch (Fase B).
+        let mut yaesu2_ptt_active = false;
+        let yaesu2_mic_gain = Arc::new(AtomicU32::new(20.0_f32.to_bits()));
+        let mut yaesu2_write_pending: Option<String> = None;
+        let mut yaesu2_write_armed = false;
         let yaesu_tx_packet_tx = {
             let tx_audio_tx = yaesu.as_ref().and_then(|y| y.tx_audio_tx.clone());
             let tx_rate = yaesu.as_ref().map(|y| y.tx_sample_rate).unwrap_or(0);
@@ -1694,6 +1894,58 @@ impl NetworkService {
                         let resampled = match resampler.process(&[pcm_f32], None) {
                             Ok(r) => r.into_iter().next().unwrap_or_default(),
                             Err(e) => { log::warn!("Yaesu TX resample: {}", e); continue; }
+                        };
+                        if !resampled.is_empty() {
+                            let _ = tx_audio.try_send(resampled);
+                        }
+                    }
+                });
+                Some(pkt_tx)
+            } else {
+                None
+            }
+        };
+
+        // Slot-1 TX decode task (Optie B-prime) — exacte spiegel van slot 0,
+        // gevoed door AudioYaesu2 → yaesu2's tx_audio_tx.
+        let yaesu2_tx_packet_tx = {
+            let tx_audio_tx = yaesu2.as_ref().and_then(|y| y.tx_audio_tx.clone());
+            let tx_rate = yaesu2.as_ref().map(|y| y.tx_sample_rate).unwrap_or(0);
+            if tx_audio_tx.is_some() && tx_rate > 0 {
+                let (pkt_tx, mut pkt_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                let tx_audio = tx_audio_tx.unwrap();
+                let gain_shared = yaesu2_mic_gain.clone();
+                tokio::spawn(async move {
+                    let mut decoder = match sdr_remote_core::codec::OpusDecoderWideband::new() {
+                        Ok(d) => d,
+                        Err(e) => { log::error!("[radio1] TX wideband decoder init: {}", e); return; }
+                    };
+                    let sinc_params = rubato::SincInterpolationParameters {
+                        sinc_len: 128, f_cutoff: 0.95, oversampling_factor: 128,
+                        interpolation: rubato::SincInterpolationType::Cubic,
+                        window: rubato::WindowFunction::Blackman,
+                    };
+                    let mut resampler = match rubato::SincFixedIn::<f32>::new(
+                        tx_rate as f64 / NETWORK_SAMPLE_RATE_WIDEBAND as f64, 1.0,
+                        sinc_params, FRAME_SAMPLES_WIDEBAND, 1,
+                    ) {
+                        Ok(r) => r,
+                        Err(e) => { log::error!("[radio1] TX resampler init: {}", e); return; }
+                    };
+                    info!("[radio1] TX task started (wideband Opus 16kHz → {}Hz)", tx_rate);
+                    while let Some(opus_data) = pkt_rx.recv().await {
+                        let gain = f32::from_bits(gain_shared.load(Ordering::Relaxed));
+                        let pcm_i16 = match decoder.decode(&opus_data) {
+                            Ok(p) => p,
+                            Err(e) => { log::warn!("[radio1] TX decode: {}", e); continue; }
+                        };
+                        let pcm_f32: Vec<f32> = pcm_i16.iter()
+                            .map(|&s| (s as f32 / 32768.0 * gain).clamp(-1.0, 1.0))
+                            .collect();
+                        use rubato::Resampler;
+                        let resampled = match resampler.process(&[pcm_f32], None) {
+                            Ok(r) => r.into_iter().next().unwrap_or_default(),
+                            Err(e) => { log::warn!("[radio1] TX resample: {}", e); continue; }
                         };
                         if !resampled.is_empty() {
                             let _ = tx_audio.try_send(resampled);
@@ -2312,7 +2564,9 @@ impl NetworkService {
                         Packet::AudioRx2(_) | Packet::AudioBinR(_) | Packet::SmeterRx2(_)
                         | Packet::SpectrumRx2(_) | Packet::FullSpectrumRx2(_)
                         | Packet::SmeterSig(_) | Packet::SmeterMaxBin(_)
-                        | Packet::SmeterRx2Sig(_) | Packet::SmeterRx2MaxBin(_) => {}
+                        | Packet::SmeterRx2Sig(_) | Packet::SmeterRx2MaxBin(_)
+                        | Packet::AudioVrx(_)
+                        | Packet::SpectrumVrx1(_) | Packet::SpectrumVrx2(_) => {}
                         // Server→client only, ignore if received
                         Packet::Spot(_) | Packet::TxProfiles(_) | Packet::YaesuState(_)
                         | Packet::AmplitecPowerTable(_)
@@ -2364,7 +2618,64 @@ impl NetworkService {
                                 }
                             }
                         }
+                        Packet::FrequencyVrx(pkt) => {
+                            // pkt.vrx_id: 0=VRX1, 1=VRX2, anything else ignored.
+                            let id = match pkt.vrx_id {
+                                0 | 1 => pkt.vrx_id,
+                                _ => { continue; }
+                            };
+                            let ctl = crate::vrx_bridge::vrx_control_thetislink(id);
+                            let mut s = ctl.lock().unwrap();
+                            s.target_freq_hz = pkt.frequency_hz;
+                            info!("Client {} VRX{} freq: {} Hz", addr, id + 1, pkt.frequency_hz);
+                        }
                         Packet::AudioMultiCh(_) => {} // server→client only, ignore
+                        // Dual-radio slot 1 (Optie B-prime) — spiegel van AudioYaesu/FrequencyYaesu.
+                        Packet::AudioYaesu2(pkt) => {
+                            if yaesu2_ptt_active && !pkt.opus_data.is_empty() {
+                                if let Some(ref tx) = yaesu2_tx_packet_tx {
+                                    if tx.try_send(pkt.opus_data).is_ok() {
+                                        self.audio_stats.yaesu_tx.tick(self.server_start);
+                                    }
+                                }
+                            }
+                        }
+                        Packet::FrequencyYaesu2(freq_pkt) => {
+                            if let Some(ref yaesu) = yaesu2 {
+                                let status = yaesu.status();
+                                if status.vfo_select != 1 { // 1=Memory
+                                    yaesu.send_command(crate::yaesu::YaesuCmd::SetFreqA(freq_pkt.frequency_hz));
+                                }
+                            }
+                        }
+                        // Server→client only, ignore if received.
+                        Packet::YaesuState2(_) | Packet::RadioInfo { .. } => {}
+                        // Slot-1 geheugen-write (Fase B): client stuurt de tab-text.
+                        // Fire direct als de write-control al kwam (armed), anders
+                        // latchen tot Yaesu2WriteMemories (UDP-reorder-safe, zoals slot 0).
+                        Packet::YaesuMemoryData2(text) => {
+                            if let Some(rest) = text.strip_prefix("SETMENU:") {
+                                // FTX-1 EX-write: "SETMENU:p1p2p3:value" → EX{p1p2p3}{value};
+                                if let Some(ref yaesu) = yaesu2 {
+                                    let parts: Vec<&str> = rest.splitn(2, ':').collect();
+                                    if parts.len() == 2 && parts[0].len() == 6
+                                        && parts[0].chars().all(|c| c.is_ascii_digit())
+                                    {
+                                        info!("Client {} [radio1] set EX {} = {}", addr, parts[0], parts[1]);
+                                        yaesu.send_command(crate::yaesu::YaesuCmd::RawCat(
+                                            format!("EX{}{};", parts[0], parts[1])));
+                                    }
+                                }
+                            } else if yaesu2_write_armed {
+                                yaesu2_write_armed = false;
+                                if let Some(ref yaesu) = yaesu2 {
+                                    info!("Client {} [radio1] writing memories (deferred)", addr);
+                                    yaesu.send_command(crate::yaesu::YaesuCmd::WriteAllMemories(text));
+                                }
+                            } else {
+                                yaesu2_write_pending = Some(text);
+                            }
+                        }
                         Packet::Disconnect => {
                             info!("Client {} disconnected", addr);
                             self.session.lock().await.remove(addr);
@@ -2991,6 +3302,254 @@ impl NetworkService {
                                         guard.set_ddc_sample_rate(rx, rate_hz).await;
                                     });
                                 }
+                                // --- VRX (Virtual RX) controls ---
+                                ControlId::VrxEnable => {
+                                    let on = ctrl.value != 0;
+                                    {
+                                        let ctl = crate::vrx_bridge::vrx_control_thetislink(0);
+                                        ctl.lock().unwrap().enabled = on;
+                                    }
+                                    // Per-client gating (release-gate fix): alleen subscribers
+                                    // krijgen AudioVrx — oude clients nooit dit packet-type.
+                                    self.session.lock().await.set_vrx_audio(addr, 0, on);
+                                    info!("Client {} VRX1 enable: {}", addr, if on { "ON" } else { "OFF" });
+                                }
+                                ControlId::VrxMode => {
+                                    let mode = match ctrl.value {
+                                        0 => vrx_rs::VrxMode::Usb,
+                                        1 => vrx_rs::VrxMode::Lsb,
+                                        2 => vrx_rs::VrxMode::Am,
+                                        3 => vrx_rs::VrxMode::Sam,
+                                        4 => vrx_rs::VrxMode::Fm,
+                                        _ => vrx_rs::VrxMode::Usb,
+                                    };
+                                    let ctl = crate::vrx_bridge::vrx_control_thetislink(0);
+                                    let mut s = ctl.lock().unwrap();
+                                    s.mode = mode;
+                                    info!("Client {} VRX1 mode: {:?}", addr, mode);
+                                }
+                                ControlId::VrxVolume => {
+                                    // Encoded as volume × 100 (0..=200 = 0..200%).
+                                    let v = (ctrl.value as f32 / 100.0).clamp(0.0, 4.0);
+                                    let ctl = crate::vrx_bridge::vrx_control_thetislink(0);
+                                    let mut s = ctl.lock().unwrap();
+                                    s.volume = v;
+                                    info!("Client {} VRX1 volume: {:.2}", addr, v);
+                                }
+                                ControlId::VrxEnable2 => {
+                                    let on = ctrl.value != 0;
+                                    {
+                                        let ctl = crate::vrx_bridge::vrx_control_thetislink(1);
+                                        ctl.lock().unwrap().enabled = on;
+                                    }
+                                    self.session.lock().await.set_vrx_audio(addr, 1, on);
+                                    info!("Client {} VRX2 enable: {}", addr, if on { "ON" } else { "OFF" });
+                                }
+                                ControlId::VrxMode2 => {
+                                    let mode = match ctrl.value {
+                                        0 => vrx_rs::VrxMode::Usb,
+                                        1 => vrx_rs::VrxMode::Lsb,
+                                        2 => vrx_rs::VrxMode::Am,
+                                        3 => vrx_rs::VrxMode::Sam,
+                                        4 => vrx_rs::VrxMode::Fm,
+                                        _ => vrx_rs::VrxMode::Usb,
+                                    };
+                                    let ctl = crate::vrx_bridge::vrx_control_thetislink(1);
+                                    let mut s = ctl.lock().unwrap();
+                                    s.mode = mode;
+                                    info!("Client {} VRX2 mode: {:?}", addr, mode);
+                                }
+                                ControlId::VrxVolume2 => {
+                                    let v = (ctrl.value as f32 / 100.0).clamp(0.0, 4.0);
+                                    let ctl = crate::vrx_bridge::vrx_control_thetislink(1);
+                                    let mut s = ctl.lock().unwrap();
+                                    s.volume = v;
+                                    info!("Client {} VRX2 volume: {:.2}", addr, v);
+                                }
+                                ControlId::VrxFilterLow => {
+                                    let hz = ctrl.value as i16 as i32;
+                                    let ctl = crate::vrx_bridge::vrx_control_thetislink(0);
+                                    let mut s = ctl.lock().unwrap();
+                                    s.filter_low_hz = hz;
+                                }
+                                ControlId::VrxFilterHigh => {
+                                    let hz = ctrl.value as i16 as i32;
+                                    let ctl = crate::vrx_bridge::vrx_control_thetislink(0);
+                                    let (lo, hi) = {
+                                        let mut s = ctl.lock().unwrap();
+                                        s.filter_high_hz = hz;
+                                        (s.filter_low_hz, s.filter_high_hz)
+                                    };
+                                    info!("Client {} VRX1 filter: {} .. {} Hz", addr, lo, hi);
+                                }
+                                ControlId::VrxFilterLow2 => {
+                                    let hz = ctrl.value as i16 as i32;
+                                    let ctl = crate::vrx_bridge::vrx_control_thetislink(1);
+                                    let mut s = ctl.lock().unwrap();
+                                    s.filter_low_hz = hz;
+                                }
+                                ControlId::VrxFilterHigh2 => {
+                                    let hz = ctrl.value as i16 as i32;
+                                    let ctl = crate::vrx_bridge::vrx_control_thetislink(1);
+                                    let (lo, hi) = {
+                                        let mut s = ctl.lock().unwrap();
+                                        s.filter_high_hz = hz;
+                                        (s.filter_low_hz, s.filter_high_hz)
+                                    };
+                                    info!("Client {} VRX2 filter: {} .. {} Hz", addr, lo, hi);
+                                }
+                                ControlId::VrxSpectrumEnable => {
+                                    if ctrl.value != 0 {
+                                        // Default 24 kHz span on first enable; keep existing span otherwise.
+                                        if VRX1_HR_SPAN_KHZ.load(Ordering::Relaxed) == 0 {
+                                            VRX1_HR_SPAN_KHZ.store(24, Ordering::Relaxed);
+                                        }
+                                    } else {
+                                        VRX1_HR_SPAN_KHZ.store(0, Ordering::Relaxed);
+                                    }
+                                    // Per-client gating: alleen subscribers krijgen SpectrumVrx1.
+                                    self.session.lock().await.set_vrx_spectrum(addr, 0, ctrl.value != 0);
+                                    info!("Client {} VRX1 high-res spectrum span_khz: {}", addr, VRX1_HR_SPAN_KHZ.load(Ordering::Relaxed));
+                                }
+                                ControlId::VrxSpectrumEnable2 => {
+                                    if ctrl.value != 0 {
+                                        if VRX2_HR_SPAN_KHZ.load(Ordering::Relaxed) == 0 {
+                                            VRX2_HR_SPAN_KHZ.store(24, Ordering::Relaxed);
+                                        }
+                                    } else {
+                                        VRX2_HR_SPAN_KHZ.store(0, Ordering::Relaxed);
+                                    }
+                                    // Per-client gating: alleen subscribers krijgen SpectrumVrx2.
+                                    self.session.lock().await.set_vrx_spectrum(addr, 1, ctrl.value != 0);
+                                    info!("Client {} VRX2 high-res spectrum span_khz: {}", addr, VRX2_HR_SPAN_KHZ.load(Ordering::Relaxed));
+                                }
+                                ControlId::VrxSpectrumSpanKhz => {
+                                    if VRX1_HR_SPAN_KHZ.load(Ordering::Relaxed) != 0 {
+                                        VRX1_HR_SPAN_KHZ.store(ctrl.value.max(1), Ordering::Relaxed);
+                                    }
+                                }
+                                ControlId::VrxSpectrumSpanKhz2 => {
+                                    if VRX2_HR_SPAN_KHZ.load(Ordering::Relaxed) != 0 {
+                                        VRX2_HR_SPAN_KHZ.store(ctrl.value.max(1), Ordering::Relaxed);
+                                    }
+                                }
+                                // --- Dual-radio slot 1 controls (Optie B-prime) ---
+                                // Spiegel van de slot-0 Yaesu-controls, geroute naar yaesu2.
+                                // Yaesu2Enable is de subscription-gate (zelfde patroon als YaesuEnable).
+                                ControlId::Yaesu2Enable => {
+                                    let enabled = ctrl.value != 0;
+                                    self.session.lock().await.set_yaesu2_enabled(addr, enabled);
+                                    info!("Client {} [radio1]: {}", addr, if enabled { "ON" } else { "OFF" });
+                                }
+                                ControlId::Yaesu2Ptt => {
+                                    if let Some(ref yaesu) = yaesu2 {
+                                        let on = ctrl.value != 0;
+                                        yaesu.send_command(crate::yaesu::YaesuCmd::SetPtt(on));
+                                        yaesu2_ptt_active = on;
+                                        info!("Client {} [radio1] PTT: {}", addr, if on { "TX" } else { "RX" });
+                                    }
+                                }
+                                ControlId::Yaesu2Freq => {} // handled via FrequencyYaesu2 packet
+                                ControlId::Yaesu2MicGain => {
+                                    let gain = ctrl.value as f32 / 100.0 * 20.0;
+                                    yaesu2_mic_gain.store(gain.to_bits(), Ordering::Relaxed);
+                                    info!("Client {} [radio1] mic gain: {:.1}x", addr, gain);
+                                }
+                                ControlId::Yaesu2Mode => {
+                                    if let Some(ref yaesu) = yaesu2 {
+                                        yaesu.send_command(crate::yaesu::YaesuCmd::SetMode(ctrl.value as u8));
+                                    }
+                                }
+                                ControlId::Yaesu2SelectVfo => {
+                                    if let Some(ref yaesu) = yaesu2 {
+                                        yaesu.send_command(crate::yaesu::YaesuCmd::SelectVfo(ctrl.value as u8));
+                                    }
+                                }
+                                ControlId::Yaesu2Squelch => {
+                                    if let Some(ref yaesu) = yaesu2 {
+                                        yaesu.send_command(crate::yaesu::YaesuCmd::RawCat(
+                                            format!("SQ0{:03};", ctrl.value.min(255))));
+                                    }
+                                }
+                                ControlId::Yaesu2RfGain => {
+                                    if let Some(ref yaesu) = yaesu2 {
+                                        yaesu.send_command(crate::yaesu::YaesuCmd::RawCat(
+                                            format!("RG0{:03};", ctrl.value.min(255))));
+                                    }
+                                }
+                                ControlId::Yaesu2RadioMicGain => {
+                                    if let Some(ref yaesu) = yaesu2 {
+                                        yaesu.send_command(crate::yaesu::YaesuCmd::RawCat(
+                                            format!("MG{:03};", ctrl.value.min(100))));
+                                    }
+                                }
+                                ControlId::Yaesu2RfPower => {
+                                    if let Some(ref yaesu) = yaesu2 {
+                                        yaesu.send_command(crate::yaesu::YaesuCmd::SetTxPower(ctrl.value as u8));
+                                    }
+                                }
+                                ControlId::Yaesu2RecallMemory => {
+                                    if let Some(ref yaesu) = yaesu2 {
+                                        yaesu.send_command(crate::yaesu::YaesuCmd::RecallMemory(ctrl.value));
+                                    }
+                                }
+                                ControlId::Yaesu2Button => {
+                                    if let Some(ref yaesu) = yaesu2 {
+                                        let cat = match ctrl.value {
+                                            // FTX-1 SC heeft een MAIN/SUB-prefix (P1) + richting (P2):
+                                            // SC01=MAIN scan-up aan, SC00=MAIN scan uit. Zonder P1
+                                            // ("SC1;") wordt het commando genegeerd. USB-audio = MAIN,
+                                            // dus scannen op MAIN-side.
+                                            0 => "AB;", 1 => "SC01;", 2 => "SC00;", 3 => "AC002;",
+                                            4 => "AC000;", 5 => "BU0;", 6 => "BD0;", 7 => "ST1;", 8 => "ST0;",
+                                            // Dual-RX MAIN/SUB actieve-TX/RX-keuze (FTX-1) — geverifieerd
+                                            // commando-formaat uit cat-ftx1: FT0=MAIN, FT1=SUB.
+                                            11 => "FT0;", 12 => "FT1;",
+                                            // Quick Memory Bank (FTX-1): QI=store huidige VFO,
+                                            // QR=recall/doorloop. Actie-commando's, geen antwoord.
+                                            13 => "QI;", 14 => "QR;",
+                                            _ => "",
+                                        };
+                                        if !cat.is_empty() {
+                                            yaesu.send_command(crate::yaesu::YaesuCmd::RawCat(cat.to_string()));
+                                        }
+                                        if ctrl.value == 9 || ctrl.value == 10 {
+                                            let cur = yaesu.status().memory_channel;
+                                            let next = if ctrl.value == 9 {
+                                                if cur >= 99 { 1 } else { cur + 1 }
+                                            } else if cur <= 1 { 99 } else { cur - 1 };
+                                            yaesu.send_command(crate::yaesu::YaesuCmd::RecallMemory(next));
+                                        }
+                                    }
+                                }
+                                // Slot-1 geheugens (Fase B) — read/write naar radio 2.
+                                ControlId::Yaesu2ReadMemories => {
+                                    if let Some(ref yaesu) = yaesu2 {
+                                        info!("Client {} [radio1] requested memory read", addr);
+                                        yaesu.send_command(crate::yaesu::YaesuCmd::ReadAllMemories);
+                                    }
+                                }
+                                ControlId::Yaesu2WriteMemories => {
+                                    if let Some(ref yaesu) = yaesu2 {
+                                        if let Some(text) = yaesu2_write_pending.take() {
+                                            info!("Client {} [radio1] writing memories", addr);
+                                            yaesu.send_command(crate::yaesu::YaesuCmd::WriteAllMemories(text));
+                                        } else {
+                                            info!("Client {} [radio1] write memories: data not yet received, arming latch", addr);
+                                            yaesu2_write_armed = true;
+                                        }
+                                    }
+                                }
+                                // Slot-1 EX-menu (Fase C1): read = hiërarchische scan
+                                // op de FTX-1. De write komt binnen via YaesuMemoryData2
+                                // met "SETMENU:"-prefix (zie handler hieronder).
+                                ControlId::Yaesu2ReadMenus => {
+                                    if let Some(ref yaesu) = yaesu2 {
+                                        info!("Client {} [radio1] requested EX menu read", addr);
+                                        yaesu.send_command(crate::yaesu::YaesuCmd::ReadAllMenus);
+                                    }
+                                }
+                                ControlId::Yaesu2SetMenu => {}
                                 _ => {
                                     // Unknown or unhandled control, ignore
                                     debug!("Unhandled control: {:?} = {}", ctrl.control_id, ctrl.value);

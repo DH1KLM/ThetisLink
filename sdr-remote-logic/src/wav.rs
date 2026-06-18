@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 //! Simple WAV file writer — no external dependencies.
-//! Writes 8kHz 16-bit mono PCM.
+//! Writes 16-bit mono PCM at the sample rate given to `new()`.
 
 use std::fs::File;
 use std::io::{self, Seek, SeekFrom, Write};
@@ -10,20 +10,30 @@ use std::path::Path;
 pub struct WavWriter {
     file: File,
     data_bytes: u32,
+    /// 0 = nog onbekend; gezet bij de eerste `write_samples` zodat de WAV-rate
+    /// automatisch de werkelijke decode-rate volgt (8k NB / 16k WB / toekomstig).
+    sample_rate: u32,
 }
 
 impl WavWriter {
-    /// Create a new WAV file at the given path (8kHz, 16-bit, mono).
+    /// Create a new WAV file at the given path (16-bit, mono). De sample-rate
+    /// wordt dynamisch bepaald door de eerste `write_samples`-aanroep — niet
+    /// vooraf vastgelegd, zodat een toekomstige rate-wijziging vanzelf meeschaalt.
     pub fn new(path: &Path) -> io::Result<Self> {
         let mut file = File::create(path)?;
-        // Write placeholder header (44 bytes), finalized on close
-        let header = wav_header(0);
+        // Placeholder header (rate 8000) — bij finalize herschreven met de echte rate.
+        let header = wav_header(0, 8000);
         file.write_all(&header)?;
-        Ok(Self { file, data_bytes: 0 })
+        Ok(Self { file, data_bytes: 0, sample_rate: 0 })
     }
 
-    /// Write decoded i16 PCM samples.
-    pub fn write_samples(&mut self, samples: &[i16]) -> io::Result<()> {
+    /// Write decoded i16 PCM samples at `sample_rate` Hz. De rate van de eerste
+    /// write bepaalt de WAV-header — de aanroeper geeft de rate van de gebruikte
+    /// decoder mee, dus de opname klopt ongeacht NB/WB of toekomstige rates.
+    pub fn write_samples(&mut self, samples: &[i16], sample_rate: u32) -> io::Result<()> {
+        if self.sample_rate == 0 {
+            self.sample_rate = sample_rate;
+        }
         for &s in samples {
             self.file.write_all(&s.to_le_bytes())?;
         }
@@ -41,9 +51,10 @@ impl WavWriter {
         Ok(())
     }
 
-    /// Finalize: rewrite header with correct sizes.
+    /// Finalize: rewrite header with correct sizes + de bepaalde sample-rate.
     pub fn finalize(mut self) -> io::Result<()> {
-        let header = wav_header(self.data_bytes);
+        let rate = if self.sample_rate == 0 { 8000 } else { self.sample_rate };
+        let header = wav_header(self.data_bytes, rate);
         self.file.seek(SeekFrom::Start(0))?;
         self.file.write_all(&header)?;
         self.file.flush()?;
@@ -52,7 +63,8 @@ impl WavWriter {
 
     /// Duration in seconds based on bytes written.
     pub fn duration_secs(&self) -> f32 {
-        self.data_bytes as f32 / (8000.0 * 2.0)
+        let rate = if self.sample_rate == 0 { 8000 } else { self.sample_rate };
+        self.data_bytes as f32 / (rate as f32 * 2.0)
     }
 }
 
@@ -127,8 +139,7 @@ pub fn read_wav(path: &Path) -> io::Result<(u32, Vec<i16>)> {
     Ok((sample_rate, samples))
 }
 
-fn wav_header(data_bytes: u32) -> [u8; 44] {
-    let sample_rate: u32 = 8000;
+fn wav_header(data_bytes: u32, sample_rate: u32) -> [u8; 44] {
     let bits_per_sample: u16 = 16;
     let channels: u16 = 1;
     let byte_rate: u32 = sample_rate * channels as u32 * bits_per_sample as u32 / 8;

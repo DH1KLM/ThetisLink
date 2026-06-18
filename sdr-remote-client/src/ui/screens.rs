@@ -35,6 +35,10 @@ fn packet_type_label(t: u8) -> String {
         0x1E => "S-meter RX2 Sig".into(),
         0x1F => "S-meter RX2 MaxBin".into(),
         0x20 => "Amplitec power table".into(),
+        0x21 => "Audio VRX".into(),
+        0x22 => "VRX frequency".into(),
+        0x23 => "Spectrum VRX1 (high-res)".into(),
+        0x24 => "Spectrum VRX2 (high-res)".into(),
         0x30 => "Auth challenge".into(),
         0x32 => "Auth result".into(),
         0x33 => "TOTP challenge".into(),
@@ -1844,6 +1848,26 @@ impl SdrRemoteApp {
             ui.horizontal(|ui| {
                 ui.label("Yaesu RX:  ");
                 level_bar(ui, self.playback_level_yaesu);
+            });
+        }
+        // Dual-radio slot 1 (FTX-1): eigen audio-niveau-bar, alleen tonen als
+        // radio 2 verbonden is. Label volgt de model-naamgeving.
+        if self.yaesu2_connected {
+            ui.horizontal(|ui| {
+                ui.label(format!("{} RX:", self.yaesu_panel_name(1)));
+                level_bar(ui, self.playback_level_yaesu2);
+            });
+        }
+        if self.vrx1_enabled || self.playback_level_vrx1 > 0.0 {
+            ui.horizontal(|ui| {
+                ui.label("VRX1:      ");
+                level_bar(ui, self.playback_level_vrx1);
+            });
+        }
+        if self.vrx2_enabled || self.playback_level_vrx2 > 0.0 {
+            ui.horizontal(|ui| {
+                ui.label("VRX2:      ");
+                level_bar(ui, self.playback_level_vrx2);
             });
         }
 

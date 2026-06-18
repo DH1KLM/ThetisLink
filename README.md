@@ -1,23 +1,20 @@
 # ThetisLink
 
-> **Current release: [v2.1.1](https://github.com/cjenschede/ThetisLink/releases/tag/v2.1.1)** —
-> PstRotator and Log4OM can now drive the rotor directly through a
-> parallel UDP+TCP listener on the server (port 12001) regardless of
-> which rotor backend is selected; auto-detects Yaesu GS-232A/B,
-> Prosistel/EA7HG, PstRotator-XML and AZ-text formats. Log4OM works
-> without an intermediate PstRotator instance (PstRotator-emulation).
-> Plus: direction-reversal ramp protection — a new GoTo with opposite
-> delta sign now ramps the DAC down to zero before flipping the
-> CW/CCW gates, preventing abrupt full-power direction reversal on
-> the Adafruit backend. And three Yaesu FT-991A memory-write fixes:
-> UDP packet-reorder race latch, MT-frame P9 spec compliance, and
-> FM/DATA-FM/AM-N/C4FM mode round-trip integrity (writes no longer
-> force-map FM to DATA-FM on storage). **Backwards-compatible with
-> v2.1.0** — wire-protocol unchanged; pair with **Thetis fork PA3GHM
-> TL2-4** for the full feature-set, stock Thetis remains supported.
-> Download `ThetisLink-2.1.1.zip` from the
+> **Current release: [v2.2.0](https://github.com/cjenschede/ThetisLink/releases/tag/v2.2.0)** —
+> **Virtual receivers (VRX):** two independent receivers (VRX1/VRX2) carved from
+> the wideband DDC stream by an FFT channelizer, each with its own frequency,
+> mode (USB/LSB/AM/SAM/FM), filter, high-res spectrum/waterfall and S-meter in a
+> joint pop-out window. **Dual-radio:** a second Yaesu radio (FT-991A + FTX-1)
+> runs as an independent channel with auto-detected model, per-radio audio/CAT/
+> memory, FTX-1 WIRES-X and a server-side software squelch. Plus a switchable
+> RX audio bandwidth and a `#N` device-index suffix to tell two identical USB
+> codecs apart. Illustrated VRX explainers are online — see **Documentation**
+> below. **Backwards-compatible with v2.1.x** — wire-protocol `VERSION` 3
+> unchanged (new types are additive and per-client gated); pair with **Thetis
+> fork PA3GHM TL2-4** for the full feature-set, stock Thetis remains supported.
+> Download `ThetisLink-2.2.0.zip` from the
 > [Releases page](https://github.com/cjenschede/ThetisLink/releases) — the ZIP
-> contains both Windows binaries, the Android APK, all six PDF manuals,
+> contains both Windows binaries, the Android APK, all PDF manuals,
 > `LICENSE` and `SHA256SUMS.txt`. SBOM and third-party license artefacts are
 > attached to the same release as separate download assets.
 
@@ -50,29 +47,13 @@ Included with each release:
 - `User-Manual.md` / `User-Manual-EN.md` — user manual (Dutch / English)
 - `Technische-Referentie.md` / `Technical-Reference.md` — technical reference
 
-### Online learning guides
-
-Browser-readable explainers hosted on GitHub Pages — friendly introductions with
-diagrams, no DSP or networking background needed:
-
-- **How a VRX works / Hoe een VRX werkt** — from radio wave to sound (FFT channelizer,
-  filtering, demodulation, S-meter, filter properties):
-  [English](https://cjenschede.github.io/ThetisLink/VRX-explained.html) ·
-  [Nederlands](https://cjenschede.github.io/ThetisLink/VRX-uitleg.html)
-- **From server to client / Van server naar client** — Opus audio over UDP, jitter
-  buffer, spectrum, S-meter, PTT safety and the latency budget:
-  [English](https://cjenschede.github.io/ThetisLink/Network-explained.html) ·
-  [Nederlands](https://cjenschede.github.io/ThetisLink/Netwerk-uitleg.html)
-
-Start page: <https://cjenschede.github.io/ThetisLink/>
-
 ## Thetis compatibility
 
 ThetisLink talks to the radio through Thetis. It targets **Thetis v2.10.3.15**
 (the latest official release by ramdor) and works with stock Thetis out of the
 box. Optionally use the [PA3GHM Thetis fork](https://github.com/cjenschede/Thetis/tree/thetislink-tl2)
 (branch `thetislink-tl2`) for the additional `_ex` TCI extensions used by
-ThetisLink v2.1.1 (capability broadcast, per-RX filter preset, diversity
+ThetisLink v2.2.0 (capability broadcast, per-RX filter preset, diversity
 control suite, server-side DDC recenter, relaxed IQ-stream rate cap,
 wideband RX audio, modulation-change filter fan-out). All
 extensions are gated behind the **ThetisLink extensions** checkbox in Setup

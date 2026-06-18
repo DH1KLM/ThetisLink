@@ -87,6 +87,39 @@ pub(crate) struct ClientConfig {
     pub(crate) popout_joined_size: Option<(f32, f32)>,
     pub(crate) yaesu_popout_pos: Option<(f32, f32)>,
     pub(crate) yaesu_popout_size: Option<(f32, f32)>,
+    pub(crate) yaesu2_popout_pos: Option<(f32, f32)>,
+    pub(crate) yaesu2_popout_size: Option<(f32, f32)>,
+    pub(crate) vrx_popout_pos: Option<(f32, f32)>,
+    pub(crate) vrx_popout_size: Option<(f32, f32)>,
+    // VRX1 per-channel state (was `vrx_volume`/`vrx_enabled`/etc. in
+    // build 48 — renamed in build 50 when VRX2 was added; the loader
+    // still accepts the old keys for one-version backwards compat).
+    pub(crate) vrx1_volume: Option<f32>,
+    pub(crate) vrx1_enabled: Option<bool>,
+    pub(crate) vrx1_freq_hz: Option<u64>,
+    pub(crate) vrx1_mode: Option<u8>,
+    pub(crate) vrx2_volume: Option<f32>,
+    pub(crate) vrx2_enabled: Option<bool>,
+    pub(crate) vrx2_freq_hz: Option<u64>,
+    pub(crate) vrx2_mode: Option<u8>,
+    pub(crate) vrx1_spectrum_zoom: Option<f32>,
+    pub(crate) vrx2_spectrum_zoom: Option<f32>,
+    pub(crate) vrx1_ref_db: Option<f32>,
+    pub(crate) vrx1_range_db: Option<f32>,
+    pub(crate) vrx1_wf_contrast: Option<f32>,
+    pub(crate) vrx1_pan: Option<f32>,
+    pub(crate) vrx1_auto_ref: Option<bool>,
+    pub(crate) vrx1_filter_low_hz: Option<i32>,
+    pub(crate) vrx1_filter_high_hz: Option<i32>,
+    pub(crate) vrx1_high_res_spectrum: Option<bool>,
+    pub(crate) vrx2_ref_db: Option<f32>,
+    pub(crate) vrx2_range_db: Option<f32>,
+    pub(crate) vrx2_wf_contrast: Option<f32>,
+    pub(crate) vrx2_pan: Option<f32>,
+    pub(crate) vrx2_auto_ref: Option<bool>,
+    pub(crate) vrx2_filter_low_hz: Option<i32>,
+    pub(crate) vrx2_filter_high_hz: Option<i32>,
+    pub(crate) vrx2_high_res_spectrum: Option<bool>,
     pub(crate) wf_contrast_per_band: HashMap<String, f32>,
     pub(crate) rx2_spectrum_ref_db: f32,
     pub(crate) rx2_spectrum_range_db: f32,
@@ -115,6 +148,8 @@ pub(crate) struct ClientConfig {
     // Tuple: (name, enabled, eq-gains, mic_gain)
     pub(crate) yaesu_eq_profiles: Vec<(String, bool, [f32; 5], f32)>,
     pub(crate) yaesu_eq_active: String,
+    pub(crate) yaesu2_eq_profiles: Vec<(String, bool, [f32; 5], f32)>,
+    pub(crate) yaesu2_eq_active: String,
     pub(crate) yaesu_mem_file: String,
     pub(crate) band_mem: HashMap<String, BandMemory>,
     pub(crate) window_w: f32,
@@ -125,6 +160,16 @@ pub(crate) struct ClientConfig {
     pub(crate) ptt_toggle: bool,
     pub(crate) yaesu_ptt_toggle: bool,
     pub(crate) midi_ptt_toggle: bool,
+    // Dual-radio slot 1 (FTX-1): eigen enable + PTT-mode + volume, persistent.
+    pub(crate) yaesu2_enabled: bool,
+    pub(crate) yaesu2_ptt_toggle: bool,
+    pub(crate) yaesu2_volume: f32,
+    /// USB-TX mic-gain multiplier per radio, persistent (los van EQ-profiel
+    /// zodat de schuif-waarde altijd onthouden wordt). Range 0.05..=3.0.
+    pub(crate) yaesu_mic_gain: f32,
+    pub(crate) yaesu2_mic_gain: f32,
+    /// FTX-1 (radio 2) popout-window open/dicht-stand, persistent.
+    pub(crate) yaesu2_popout: bool,
     /// S-meter source choice: 0=Sig, 1=Avg (default), 2=MaxBin.
     /// Shared by RX1 and RX2 — same presentation method for both receivers.
     pub(crate) smeter_source: u8,
@@ -185,6 +230,36 @@ impl Default for ClientConfig {
             popout_joined_size: None,
             yaesu_popout_pos: None,
             yaesu_popout_size: None,
+            yaesu2_popout_pos: None,
+            yaesu2_popout_size: None,
+            vrx_popout_pos: None,
+            vrx_popout_size: None,
+            vrx1_volume: None,
+            vrx1_enabled: None,
+            vrx1_freq_hz: None,
+            vrx1_mode: None,
+            vrx2_volume: None,
+            vrx2_enabled: None,
+            vrx2_freq_hz: None,
+            vrx2_mode: None,
+            vrx1_spectrum_zoom: None,
+            vrx2_spectrum_zoom: None,
+            vrx1_ref_db: None,
+            vrx1_range_db: None,
+            vrx1_wf_contrast: None,
+            vrx1_pan: None,
+            vrx1_auto_ref: None,
+            vrx1_filter_low_hz: None,
+            vrx1_filter_high_hz: None,
+            vrx1_high_res_spectrum: None,
+            vrx2_ref_db: None,
+            vrx2_range_db: None,
+            vrx2_wf_contrast: None,
+            vrx2_pan: None,
+            vrx2_auto_ref: None,
+            vrx2_filter_low_hz: None,
+            vrx2_filter_high_hz: None,
+            vrx2_high_res_spectrum: None,
             wf_contrast_per_band: HashMap::new(),
             rx2_spectrum_ref_db: -20.0,
             rx2_spectrum_range_db: 100.0,
@@ -198,6 +273,8 @@ impl Default for ClientConfig {
             yaesu_volume: 0.05,
             yaesu_eq_profiles: Vec::new(),
             yaesu_eq_active: String::new(),
+            yaesu2_eq_profiles: Vec::new(),
+            yaesu2_eq_active: String::new(),
             yaesu_popout: false,
             yaesu_mem_file: String::new(),
             popout_meter_analog: false,
@@ -218,6 +295,12 @@ impl Default for ClientConfig {
             midi_encoder_hz: 100,
             ptt_toggle: false,
             yaesu_ptt_toggle: false,
+            yaesu2_enabled: false,
+            yaesu2_ptt_toggle: false,
+            yaesu2_volume: 0.05,
+            yaesu_mic_gain: 0.5,
+            yaesu2_mic_gain: 1.0,
+            yaesu2_popout: false,
             midi_ptt_toggle: true, // MIDI defaults to toggle (existing behavior)
             smeter_source: 1,      // Avg matches pre-multi-source server default
             catsync_enabled: false,
@@ -378,6 +461,88 @@ pub(crate) fn load_config() -> ClientConfig {
         } else if let Some(val) = line.strip_prefix("yaesu_popout_size=") {
             config.yaesu_popout_size = parse_f32_pair(val);
             has_keys = true;
+        } else if let Some(val) = line.strip_prefix("yaesu2_popout_pos=") {
+            config.yaesu2_popout_pos = parse_f32_pair(val);
+            has_keys = true;
+        } else if let Some(val) = line.strip_prefix("yaesu2_popout_size=") {
+            config.yaesu2_popout_size = parse_f32_pair(val);
+            has_keys = true;
+        } else if let Some(val) = line.strip_prefix("vrx_popout_pos=") {
+            config.vrx_popout_pos = parse_f32_pair(val);
+            has_keys = true;
+        } else if let Some(val) = line.strip_prefix("vrx_popout_size=") {
+            config.vrx_popout_size = parse_f32_pair(val);
+            has_keys = true;
+        // VRX1 keys — accept both legacy `vrx_*` (build 48 and earlier)
+        // and new `vrx1_*` (build 50+). New writes use only `vrx1_*`.
+        } else if let Some(val) = line.strip_prefix("vrx1_volume=").or_else(|| line.strip_prefix("vrx_volume=")) {
+            config.vrx1_volume = val.trim().parse().ok();
+            has_keys = true;
+        } else if let Some(val) = line.strip_prefix("vrx1_enabled=").or_else(|| line.strip_prefix("vrx_enabled=")) {
+            config.vrx1_enabled = Some(val.trim() == "true");
+            has_keys = true;
+        } else if let Some(val) = line.strip_prefix("vrx1_freq_hz=").or_else(|| line.strip_prefix("vrx_freq_hz=")) {
+            config.vrx1_freq_hz = val.trim().parse().ok();
+            has_keys = true;
+        } else if let Some(val) = line.strip_prefix("vrx1_mode=").or_else(|| line.strip_prefix("vrx_mode=")) {
+            config.vrx1_mode = val.trim().parse().ok();
+            has_keys = true;
+        } else if let Some(val) = line.strip_prefix("vrx2_volume=") {
+            config.vrx2_volume = val.trim().parse().ok();
+            has_keys = true;
+        } else if let Some(val) = line.strip_prefix("vrx2_enabled=") {
+            config.vrx2_enabled = Some(val.trim() == "true");
+            has_keys = true;
+        } else if let Some(val) = line.strip_prefix("vrx2_freq_hz=") {
+            config.vrx2_freq_hz = val.trim().parse().ok();
+            has_keys = true;
+        } else if let Some(val) = line.strip_prefix("vrx2_mode=") {
+            config.vrx2_mode = val.trim().parse().ok();
+            has_keys = true;
+        } else if let Some(val) = line.strip_prefix("vrx1_spectrum_zoom=") {
+            config.vrx1_spectrum_zoom = val.trim().parse().ok();
+            has_keys = true;
+        } else if let Some(val) = line.strip_prefix("vrx2_spectrum_zoom=") {
+            config.vrx2_spectrum_zoom = val.trim().parse().ok();
+            has_keys = true;
+        } else if let Some(val) = line.strip_prefix("vrx1_ref_db=") {
+            config.vrx1_ref_db = val.trim().parse().ok();
+            has_keys = true;
+        } else if let Some(val) = line.strip_prefix("vrx1_range_db=") {
+            config.vrx1_range_db = val.trim().parse().ok();
+            has_keys = true;
+        } else if let Some(val) = line.strip_prefix("vrx1_wf_contrast=") {
+            config.vrx1_wf_contrast = val.trim().parse().ok();
+            has_keys = true;
+        } else if let Some(val) = line.strip_prefix("vrx2_ref_db=") {
+            config.vrx2_ref_db = val.trim().parse().ok();
+            has_keys = true;
+        } else if let Some(val) = line.strip_prefix("vrx2_range_db=") {
+            config.vrx2_range_db = val.trim().parse().ok();
+            has_keys = true;
+        } else if let Some(val) = line.strip_prefix("vrx2_wf_contrast=") {
+            config.vrx2_wf_contrast = val.trim().parse().ok();
+        } else if let Some(val) = line.strip_prefix("vrx1_pan=") {
+            config.vrx1_pan = val.trim().parse().ok();
+        } else if let Some(val) = line.strip_prefix("vrx2_pan=") {
+            config.vrx2_pan = val.trim().parse().ok();
+        } else if let Some(val) = line.strip_prefix("vrx1_auto_ref=") {
+            config.vrx1_auto_ref = Some(val.trim() == "true");
+        } else if let Some(val) = line.strip_prefix("vrx2_auto_ref=") {
+            config.vrx2_auto_ref = Some(val.trim() == "true");
+        } else if let Some(val) = line.strip_prefix("vrx1_filter_low_hz=") {
+            config.vrx1_filter_low_hz = val.trim().parse().ok();
+        } else if let Some(val) = line.strip_prefix("vrx1_filter_high_hz=") {
+            config.vrx1_filter_high_hz = val.trim().parse().ok();
+        } else if let Some(val) = line.strip_prefix("vrx2_filter_low_hz=") {
+            config.vrx2_filter_low_hz = val.trim().parse().ok();
+        } else if let Some(val) = line.strip_prefix("vrx2_filter_high_hz=") {
+            config.vrx2_filter_high_hz = val.trim().parse().ok();
+        } else if let Some(val) = line.strip_prefix("vrx1_high_res_spectrum=") {
+            config.vrx1_high_res_spectrum = Some(val.trim() == "true");
+        } else if let Some(val) = line.strip_prefix("vrx2_high_res_spectrum=") {
+            config.vrx2_high_res_spectrum = Some(val.trim() == "true");
+            has_keys = true;
         } else if let Some(val) = line.strip_prefix("auto_ref_enabled=") {
             config.auto_ref_enabled = val.trim() == "true";
             has_keys = true;
@@ -438,6 +603,10 @@ pub(crate) fn load_config() -> ClientConfig {
             if let Ok(v) = val.trim().parse::<f32>() {
                 config.yaesu_volume = v.clamp(0.001, 1.0);
             }
+        } else if let Some(val) = line.strip_prefix("yaesu2_volume=") {
+            if let Ok(v) = val.trim().parse::<f32>() {
+                config.yaesu2_volume = v.clamp(0.001, 1.0);
+            }
         } else if let Some(val) = line.strip_prefix("yaesu_popout=") {
             config.yaesu_popout = val.trim() == "true";
         } else if let Some(val) = line.strip_prefix("mic_profile=") {
@@ -463,6 +632,24 @@ pub(crate) fn load_config() -> ClientConfig {
                         .and_then(|s| s.trim().parse::<f32>().ok())
                         .unwrap_or(0.5);
                     config.yaesu_eq_profiles.push((name, enabled,
+                        [gains[0], gains[1], gains[2], gains[3], gains[4]],
+                        mic_gain));
+                }
+            }
+        } else if let Some(val) = line.strip_prefix("yaesu2_eq_active=") {
+            config.yaesu2_eq_active = val.trim().to_string();
+        } else if let Some(val) = line.strip_prefix("yaesu2_eq_profile=") {
+            let parts: Vec<&str> = val.trim().splitn(4, '|').collect();
+            if parts.len() >= 3 {
+                let name = parts[0].to_string();
+                let enabled = parts[1] == "1";
+                let gains: Vec<f32> = parts[2].split(',')
+                    .filter_map(|s| s.trim().parse().ok()).collect();
+                if gains.len() == 5 {
+                    let mic_gain = parts.get(3)
+                        .and_then(|s| s.trim().parse::<f32>().ok())
+                        .unwrap_or(1.0);
+                    config.yaesu2_eq_profiles.push((name, enabled,
                         [gains[0], gains[1], gains[2], gains[3], gains[4]],
                         mic_gain));
                 }
@@ -583,6 +770,16 @@ pub(crate) fn load_config() -> ClientConfig {
             config.ptt_toggle = val.trim() == "true";
         } else if let Some(val) = line.strip_prefix("yaesu_ptt_toggle=") {
             config.yaesu_ptt_toggle = val.trim() == "true";
+        } else if let Some(val) = line.strip_prefix("yaesu2_enabled=") {
+            config.yaesu2_enabled = val.trim() == "true";
+        } else if let Some(val) = line.strip_prefix("yaesu2_ptt_toggle=") {
+            config.yaesu2_ptt_toggle = val.trim() == "true";
+        } else if let Some(val) = line.strip_prefix("yaesu_mic_gain=") {
+            if let Ok(v) = val.trim().parse::<f32>() { config.yaesu_mic_gain = v.clamp(0.05, 3.0); }
+        } else if let Some(val) = line.strip_prefix("yaesu2_mic_gain=") {
+            if let Ok(v) = val.trim().parse::<f32>() { config.yaesu2_mic_gain = v.clamp(0.05, 3.0); }
+        } else if let Some(val) = line.strip_prefix("yaesu2_popout=") {
+            config.yaesu2_popout = val.trim() == "true";
         } else if let Some(val) = line.strip_prefix("midi_ptt_toggle=") {
             config.midi_ptt_toggle = val.trim() == "true";
         } else if let Some(val) = line.strip_prefix("smeter_source=") {
@@ -670,6 +867,36 @@ pub(crate) fn save_config(
     popout_joined_size: Option<(f32, f32)>,
     yaesu_popout_pos_arg: Option<(f32, f32)>,
     yaesu_popout_size_arg: Option<(f32, f32)>,
+    yaesu2_popout_pos_arg: Option<(f32, f32)>,
+    yaesu2_popout_size_arg: Option<(f32, f32)>,
+    vrx_popout_pos_arg: Option<(f32, f32)>,
+    vrx_popout_size_arg: Option<(f32, f32)>,
+    vrx1_volume_arg: Option<f32>,
+    vrx1_enabled_arg: Option<bool>,
+    vrx1_freq_hz_arg: Option<u64>,
+    vrx1_mode_arg: Option<u8>,
+    vrx2_volume_arg: Option<f32>,
+    vrx2_enabled_arg: Option<bool>,
+    vrx2_freq_hz_arg: Option<u64>,
+    vrx2_mode_arg: Option<u8>,
+    vrx1_spectrum_zoom_arg: Option<f32>,
+    vrx2_spectrum_zoom_arg: Option<f32>,
+    vrx1_ref_db_arg: Option<f32>,
+    vrx1_range_db_arg: Option<f32>,
+    vrx1_wf_contrast_arg: Option<f32>,
+    vrx1_pan_arg: Option<f32>,
+    vrx1_auto_ref_arg: Option<bool>,
+    vrx1_filter_low_hz_arg: Option<i32>,
+    vrx1_filter_high_hz_arg: Option<i32>,
+    vrx1_high_res_spectrum_arg: Option<bool>,
+    vrx2_ref_db_arg: Option<f32>,
+    vrx2_range_db_arg: Option<f32>,
+    vrx2_wf_contrast_arg: Option<f32>,
+    vrx2_pan_arg: Option<f32>,
+    vrx2_auto_ref_arg: Option<bool>,
+    vrx2_filter_low_hz_arg: Option<i32>,
+    vrx2_filter_high_hz_arg: Option<i32>,
+    vrx2_high_res_spectrum_arg: Option<bool>,
     wf_contrast_per_band: &HashMap<String, f32>,
     rx2_spectrum_ref_db: f32,
     rx2_spectrum_range_db: f32,
@@ -691,9 +918,12 @@ pub(crate) fn save_config(
     device_tab: u8,
     yaesu_enabled: bool,
     yaesu_volume: f32,
+    yaesu2_volume: f32,
     yaesu_popout: bool,
     yaesu_eq_active: &str,
     yaesu_eq_profiles: &[(String, bool, [f32; 5], f32)],
+    yaesu2_eq_active: &str,
+    yaesu2_eq_profiles: &[(String, bool, [f32; 5], f32)],
     yaesu_mem_file: &str,
     band_mem: &HashMap<String, BandMemory>,
     window_w: f32,
@@ -750,6 +980,96 @@ pub(crate) fn save_config(
         if let Some((w, h)) = yaesu_popout_size_arg {
             content.push_str(&format!("yaesu_popout_size={:.0},{:.0}\n", w, h));
         }
+        if let Some((x, y)) = yaesu2_popout_pos_arg {
+            content.push_str(&format!("yaesu2_popout_pos={:.0},{:.0}\n", x, y));
+        }
+        if let Some((w, h)) = yaesu2_popout_size_arg {
+            content.push_str(&format!("yaesu2_popout_size={:.0},{:.0}\n", w, h));
+        }
+        if let Some((x, y)) = vrx_popout_pos_arg {
+            content.push_str(&format!("vrx_popout_pos={:.0},{:.0}\n", x, y));
+        }
+        if let Some((w, h)) = vrx_popout_size_arg {
+            content.push_str(&format!("vrx_popout_size={:.0},{:.0}\n", w, h));
+        }
+        if let Some(v) = vrx1_volume_arg {
+            content.push_str(&format!("vrx1_volume={:.3}\n", v));
+        }
+        if let Some(v) = vrx1_enabled_arg {
+            content.push_str(&format!("vrx1_enabled={}\n", v));
+        }
+        if let Some(v) = vrx1_freq_hz_arg {
+            content.push_str(&format!("vrx1_freq_hz={}\n", v));
+        }
+        if let Some(v) = vrx1_mode_arg {
+            content.push_str(&format!("vrx1_mode={}\n", v));
+        }
+        if let Some(v) = vrx2_volume_arg {
+            content.push_str(&format!("vrx2_volume={:.3}\n", v));
+        }
+        if let Some(v) = vrx2_enabled_arg {
+            content.push_str(&format!("vrx2_enabled={}\n", v));
+        }
+        if let Some(v) = vrx2_freq_hz_arg {
+            content.push_str(&format!("vrx2_freq_hz={}\n", v));
+        }
+        if let Some(v) = vrx2_mode_arg {
+            content.push_str(&format!("vrx2_mode={}\n", v));
+        }
+        if let Some(v) = vrx1_spectrum_zoom_arg {
+            content.push_str(&format!("vrx1_spectrum_zoom={:.1}\n", v));
+        }
+        if let Some(v) = vrx2_spectrum_zoom_arg {
+            content.push_str(&format!("vrx2_spectrum_zoom={:.1}\n", v));
+        }
+        if let Some(v) = vrx1_ref_db_arg {
+            content.push_str(&format!("vrx1_ref_db={:.1}\n", v));
+        }
+        if let Some(v) = vrx1_range_db_arg {
+            content.push_str(&format!("vrx1_range_db={:.1}\n", v));
+        }
+        if let Some(v) = vrx1_wf_contrast_arg {
+            content.push_str(&format!("vrx1_wf_contrast={:.2}\n", v));
+        }
+        if let Some(v) = vrx2_ref_db_arg {
+            content.push_str(&format!("vrx2_ref_db={:.1}\n", v));
+        }
+        if let Some(v) = vrx2_range_db_arg {
+            content.push_str(&format!("vrx2_range_db={:.1}\n", v));
+        }
+        if let Some(v) = vrx2_wf_contrast_arg {
+            content.push_str(&format!("vrx2_wf_contrast={:.2}\n", v));
+        }
+        if let Some(v) = vrx1_pan_arg {
+            content.push_str(&format!("vrx1_pan={:.4}\n", v));
+        }
+        if let Some(v) = vrx2_pan_arg {
+            content.push_str(&format!("vrx2_pan={:.4}\n", v));
+        }
+        if let Some(v) = vrx1_auto_ref_arg {
+            content.push_str(&format!("vrx1_auto_ref={}\n", v));
+        }
+        if let Some(v) = vrx2_auto_ref_arg {
+            content.push_str(&format!("vrx2_auto_ref={}\n", v));
+        }
+        if let Some(v) = vrx1_filter_low_hz_arg {
+            content.push_str(&format!("vrx1_filter_low_hz={}\n", v));
+        }
+        if let Some(v) = vrx1_filter_high_hz_arg {
+            content.push_str(&format!("vrx1_filter_high_hz={}\n", v));
+        }
+        if let Some(v) = vrx2_filter_low_hz_arg {
+            content.push_str(&format!("vrx2_filter_low_hz={}\n", v));
+        }
+        if let Some(v) = vrx2_filter_high_hz_arg {
+            content.push_str(&format!("vrx2_filter_high_hz={}\n", v));
+        }
+        if let Some(v) = vrx1_high_res_spectrum_arg {
+            content.push_str(&format!("vrx1_high_res_spectrum={}\n", v));
+        }
+        if let Some(v) = vrx2_high_res_spectrum_arg {
+            content.push_str(&format!("vrx2_high_res_spectrum={}\n", v));
+        }
         content.push_str(&format!("waterfall_contrast={:.2}\n", waterfall_contrast));
         // Per-band WF contrast
         if !wf_contrast_per_band.is_empty() {
@@ -781,10 +1101,17 @@ pub(crate) fn save_config(
         content.push_str(&format!("device_tab={}\n", device_tab));
         content.push_str(&format!("yaesu_enabled={}\n", yaesu_enabled));
         content.push_str(&format!("yaesu_volume={:.3}\n", yaesu_volume));
+        content.push_str(&format!("yaesu2_volume={:.3}\n", yaesu2_volume));
         content.push_str(&format!("yaesu_popout={}\n", yaesu_popout));
         content.push_str(&format!("yaesu_eq_active={}\n", yaesu_eq_active));
         for (name, enabled, gains, mic_gain) in yaesu_eq_profiles {
             content.push_str(&format!("yaesu_eq_profile={}|{}|{:.1},{:.1},{:.1},{:.1},{:.1}|{:.3}\n",
+                name, if *enabled { "1" } else { "0" },
+                gains[0], gains[1], gains[2], gains[3], gains[4], mic_gain));
+        }
+        content.push_str(&format!("yaesu2_eq_active={}\n", yaesu2_eq_active));
+        for (name, enabled, gains, mic_gain) in yaesu2_eq_profiles {
+            content.push_str(&format!("yaesu2_eq_profile={}|{}|{:.1},{:.1},{:.1},{:.1},{:.1}|{:.3}\n",
                 name, if *enabled { "1" } else { "0" },
                 gains[0], gains[1], gains[2], gains[3], gains[4], mic_gain));
         }
@@ -832,13 +1159,21 @@ pub(crate) fn save_config(
         for (i, mapping) in midi_mappings.iter().enumerate() {
             content.push_str(&format!("midi_map_{}={}\n", i, mapping.to_config()));
         }
-        // Preserve ptt_toggle + midi_ptt_toggle + allow_zoom_below_2x + smeter_source + successful_connects from existing config
+        // Preserve toggles die via save_ptt_config (read-modify-append) worden
+        // beheerd, zodat deze volledige herschrijf ze niet dropt. yaesu2_enabled/
+        // _ptt_toggle/_popout + de mic-gains horen hier expliciet bij — anders
+        // verdwijnt de radio2-enable/window/mic-stand bij elke andere wijziging.
         if let Ok(existing) = std::fs::read_to_string(&path) {
             for line in existing.lines() {
                 if line.starts_with("ptt_toggle=") || line.starts_with("yaesu_ptt_toggle=") || line.starts_with("midi_ptt_toggle=")
                     || line.starts_with("allow_zoom_below_2x=")
                     || line.starts_with("smeter_source=")
-                    || line.starts_with("successful_connects=") {
+                    || line.starts_with("successful_connects=")
+                    || line.starts_with("yaesu2_enabled=")
+                    || line.starts_with("yaesu2_ptt_toggle=")
+                    || line.starts_with("yaesu2_popout=")
+                    || line.starts_with("yaesu_mic_gain=")
+                    || line.starts_with("yaesu2_mic_gain=") {
                     content.push_str(line);
                     content.push('\n');
                 }
