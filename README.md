@@ -50,6 +50,22 @@ Included with each release:
 - `User-Manual.md` / `User-Manual-EN.md` — user manual (Dutch / English)
 - `Technische-Referentie.md` / `Technical-Reference.md` — technical reference
 
+### Online learning guides
+
+Browser-readable explainers hosted on GitHub Pages — friendly introductions with
+diagrams, no DSP or networking background needed:
+
+- **How a VRX works / Hoe een VRX werkt** — from radio wave to sound (FFT channelizer,
+  filtering, demodulation, S-meter, filter properties):
+  [English](https://cjenschede.github.io/ThetisLink/VRX-explained.html) ·
+  [Nederlands](https://cjenschede.github.io/ThetisLink/VRX-uitleg.html)
+- **From server to client / Van server naar client** — Opus audio over UDP, jitter
+  buffer, spectrum, S-meter, PTT safety and the latency budget:
+  [English](https://cjenschede.github.io/ThetisLink/Network-explained.html) ·
+  [Nederlands](https://cjenschede.github.io/ThetisLink/Netwerk-uitleg.html)
+
+Start page: <https://cjenschede.github.io/ThetisLink/>
+
 ## Thetis compatibility
 
 ThetisLink talks to the radio through Thetis. It targets **Thetis v2.10.3.15**
