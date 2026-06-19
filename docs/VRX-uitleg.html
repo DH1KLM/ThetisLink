@@ -836,66 +836,74 @@
   </ul>
   <p>Wil je dieper onderdrukken, dan is dat de klassieke <b>venster-afweging</b>: een Blackman-Harris-
   venster haalt ~&minus;90 dB zijlobben, maar de hoofdlob (en dus het overgangsgebied) wordt ~2× zo
-  breed. Steiler én dieper tegelijk kan met een nabewerking — zie hieronder.</p>
+  breed. Steiler én dieper tegelijk vraagt simpelweg méér rekenlengte — een groter venster, een
+  grotere FFT, of een lang FIR; gratis gaat het niet (zie de figuur).</p>
 
   <div class="fig">
-    <svg viewBox="0 0 760 362" role="img" aria-label="Filterrespons opgebouwd uit de deelfilters">
-      <!-- dB-gridlijnen -->
+    <svg viewBox="0 0 760 380" role="img" aria-label="Filterrespons — LSB-voorbeeld, realistische niveaus">
+      <!-- dB-gridlijnen (0..-150, per 30 dB) -->
       <g stroke="#26304d">
-        <line x1="80" y1="40" x2="712" y2="40"/><line x1="80" y1="80" x2="712" y2="80"/>
-        <line x1="80" y1="120" x2="712" y2="120"/><line x1="80" y1="160" x2="712" y2="160"/>
-        <line x1="80" y1="200" x2="712" y2="200"/><line x1="80" y1="240" x2="712" y2="240"/>
-        <line x1="80" y1="280" x2="712" y2="280"/>
+        <line x1="70" y1="40" x2="720" y2="40"/><line x1="70" y1="94" x2="720" y2="94"/>
+        <line x1="70" y1="148" x2="720" y2="148"/><line x1="70" y1="202" x2="720" y2="202"/>
+        <line x1="70" y1="256" x2="720" y2="256"/><line x1="70" y1="310" x2="720" y2="310"/>
       </g>
       <g class="mut" text-anchor="end">
-        <text x="72" y="44">0</text><text x="72" y="84">&minus;10</text><text x="72" y="124">&minus;20</text>
-        <text x="72" y="164">&minus;30</text><text x="72" y="204">&minus;40</text>
-        <text x="72" y="244">&minus;50</text><text x="72" y="284">&minus;60</text>
+        <text x="64" y="44">0</text><text x="64" y="98">&minus;30</text><text x="64" y="152">&minus;60</text>
+        <text x="64" y="206">&minus;90</text><text x="64" y="260">&minus;120</text><text x="64" y="314">&minus;150</text>
       </g>
-      <text x="26" y="160" class="mut" transform="rotate(-90 26 160)" text-anchor="middle">demping (dB)</text>
-      <!-- bandrand-hulplijnen -->
+      <text x="20" y="175" class="mut" transform="rotate(-90 20 175)" text-anchor="middle">dBc (t.o.v. doorlaat)</text>
+      <!-- bandrand-hulplijnen (-3 kHz en 0 kHz) -->
       <g stroke="#3a4a73" stroke-dasharray="3 3">
-        <line x1="262" y1="40" x2="262" y2="288"/><line x1="458" y1="40" x2="458" y2="288"/>
+        <line x1="286" y1="40" x2="286" y2="310"/><line x1="502" y1="40" x2="502" y2="310"/>
       </g>
-      <text x="360" y="303" text-anchor="middle" class="mut">doorlaatband</text>
-      <text x="165" y="303" text-anchor="middle" class="mut">stopband</text>
-      <text x="585" y="303" text-anchor="middle" class="mut">stopband</text>
-      <!-- A: ideaal bin-masker (rechthoek) -->
-      <path d="M80 288 L262 288 L262 40 L458 40 L458 288 L712 288"
+      <!-- x-as: frequentie t.o.v. afstempunt (kHz) -->
+      <g class="mut" text-anchor="middle" font-size="11">
+        <text x="70" y="326">&minus;6</text><text x="142" y="326">&minus;5</text><text x="214" y="326">&minus;4</text>
+        <text x="286" y="326">&minus;3</text><text x="358" y="326">&minus;2</text><text x="430" y="326">&minus;1</text>
+        <text x="502" y="326">0</text><text x="574" y="326">+1</text><text x="646" y="326">+2</text><text x="718" y="326">+3</text>
+      </g>
+      <text x="395" y="343" class="mut" text-anchor="middle">frequentie t.o.v. afstempunt (kHz) &mdash; 1 bin = 62,5 Hz</text>
+      <text x="394" y="33" class="mut" text-anchor="middle">doorlaatband (LSB, 3 kHz: &minus;3&hellip;0 kHz)</text>
+      <!-- A: ideaal masker (perfecte rechthoek -3..0 kHz) -->
+      <path d="M70 310 L286 310 L286 40 L502 40 L502 310 L718 310"
         fill="none" stroke="#566187" stroke-width="1.4" stroke-dasharray="5 4"/>
-      <!-- B: -31 dBc worst-case randpunt (Hann eerste-zijlob), pal naast de band; daarna -18 dB/oct -->
-      <circle cx="252" cy="164" r="3.5" fill="#3ddc97"/>
-      <circle cx="468" cy="164" r="3.5" fill="#3ddc97"/>
-      <path d="M152 143 L248 163" stroke="#3ddc97" stroke-width="1" fill="none" opacity=".55"/>
-      <text x="152" y="126" text-anchor="middle" class="mut" font-size="11">&asymp; &minus;31 dBc pal naast de band</text>
-      <text x="152" y="137" text-anchor="middle" class="mut" font-size="11">&rarr; daarna ~18 dB/octaaf steiler</text>
-      <!-- D: met optionele FIR -->
-      <path d="M80 280 L256 280 L260 200 L262 40 L458 40 L460 200 L464 280 L712 280"
-        fill="none" stroke="#ffb454" stroke-width="1.7" stroke-dasharray="2 3" opacity=".9"/>
-      <!-- C: resultante (totaal) -->
-      <path d="M80 280 L242 280 L248 200 L252 164 L257 90 L261 55 L266 43 L300 41 L360 40 L420 41 L454 43 L459 55 L463 90 L468 164 L472 200 L478 280 L712 280"
+      <!-- 32-bit reken-/quantisatieruisvloer ~-145 dBc -->
+      <line x1="70" y1="301" x2="720" y2="301" stroke="#9aa6c4" stroke-width="1" stroke-dasharray="2 3" opacity=".55"/>
+      <text x="716" y="297" class="mut" text-anchor="end" font-size="10.5">32-bit reken-/quantisatieruis ~&minus;145 dBc</text>
+      <!-- C: resultante — werkelijke -18 dB/oct-cascade vanaf elke rand-bin -->
+      <path d="M70 276 L142 258 L214 225 L250 193 L268 161 L277 128 L281 96 L286 40 L502 40 L507 96 L511 128 L520 161 L538 193 L574 225 L646 258 L718 276"
         fill="none" stroke="#4ea1ff" stroke-width="2.6"/>
+      <!-- -31 dBc randpunten (1 bin buiten de rand) -->
+      <circle cx="281" cy="96" r="3.2" fill="#3ddc97"/><circle cx="507" cy="96" r="3.2" fill="#3ddc97"/>
+      <!-- cascade-annotatie -->
+      <text x="158" y="64" class="mut" text-anchor="middle" font-size="10.5">bins buiten de rand:</text>
+      <text x="158" y="76" class="mut" text-anchor="middle" font-size="10.5">1:&minus;31  2:&minus;49  4:&minus;67  8:&minus;85 &hellip;</text>
+      <path d="M158 80 L279 94" stroke="#3ddc97" stroke-width="1" fill="none" opacity=".5"/>
       <!-- legenda -->
       <g font-size="12">
-        <line x1="96" y1="328" x2="126" y2="328" stroke="#566187" stroke-width="1.4" stroke-dasharray="5 4"/>
-        <text x="132" y="332" class="mut">ideaal bin-masker</text>
-        <circle cx="315" cy="328" r="3.5" fill="#3ddc97"/>
-        <text x="336" y="332" class="mut">&minus;31 dBc randpunt (worst case)</text>
-        <line x1="96" y1="350" x2="126" y2="350" stroke="#4ea1ff" stroke-width="2.6"/>
-        <text x="132" y="354">resultante (totaal)</text>
-        <line x1="300" y1="350" x2="330" y2="350" stroke="#ffb454" stroke-width="1.7" stroke-dasharray="2 3"/>
-        <text x="336" y="354" class="mut">met optionele FIR: scherper, dichter bij ideaal</text>
+        <line x1="86" y1="362" x2="114" y2="362" stroke="#566187" stroke-width="1.4" stroke-dasharray="5 4"/>
+        <text x="120" y="366" class="mut">ideaal masker</text>
+        <line x1="290" y1="362" x2="318" y2="362" stroke="#4ea1ff" stroke-width="2.6"/>
+        <text x="324" y="366">resultante</text>
       </g>
     </svg>
-    <div class="cap">Figuur 11 — De filterrespons in het frequentiedomein, opgebouwd uit de
-    deelfilters. Het <b>ideale bin-masker</b> (grijs) is een perfecte rechthoek; de <b>resultante</b>
-    (dik, blauw) is vlak in de doorlaatband, met een flank van ~1–2 bins en daarna een <b>steile
-    stopband-skirt</b>. De <b>&minus;31 dBc</b> (groen punt, de Hann-eerste-zijlob) geldt alléén
-    <i>pal</i> naast de bandgrens — als worst case; daarna zakt het ~18 dB per octaaf, dus al op
-    enkele honderden Hz is de onderdrukking tientallen dB dieper (en op enkele kHz praktisch tot de
-    reken-ruisvloer). Een <b>optionele FIR</b> (oranje, gestippeld) kan de flank nóg scherper maken —
-    dichter tegen het ideale masker — als ontwerpkeuze, ten koste van latency of de vlakke group delay.</div>
+    <div class="cap">Figuur 11 — De filterrespons voor een concreet <b>LSB</b>-kanaal van 3 kHz, met het
+    afstempunt (de draaggolf) op 0 kHz. LSB ligt <i>onder</i> de draaggolf, dus de doorlaatband loopt van
+    &minus;3 tot 0 kHz; voor het gemak valt de bovenste bandrand precies op 0 Hz (links &minus;6 kHz,
+    rechts +3 kHz). De <b>resultante</b> (blauw) is vlak op 0 dBc in de band; op elke rand zakt hij de
+    werkelijke Hann-cascade af: <b>~&minus;31 dBc op 1 bin</b> (62,5 Hz) buiten de rand, daarna ~18 dB per
+    octaaf — dus &minus;49 op 2 bins, &minus;67 op 4, &minus;85 op 8, &minus;103 op 16… — doorzakkend tot
+    de <b>32-bit reken-/quantisatieruisvloer (~&minus;145 dBc)</b>, de echte ondergrens (níét de eerder
+    voor het gemak getekende &minus;60). De x-as is frequentie t.o.v. het afstempunt; 1 bin = 62,5 Hz, en
+    3 kHz = 48 bins. Het <b>ideale masker</b> (grijs) is de perfecte rechthoek.</div>
   </div>
+
+  <p>De FFT/iFFT-methode geeft dus zeer scherpe filtering, maar met een <b>vaste vorm</b> (rechthoekig
+  bin-masker + Hann-skirt). Een aanvullend FIR is alleen zinvol als je juist een <i>andere</i> vorm nodig
+  hebt — bijvoorbeeld een bewuste passband-helling, een matched/raised-cosine-vorm voor datamodes, of een
+  notch in de band. Steiler maken kan in principe ook, maar alleen met een <b>zeer groot</b> FIR (honderden
+  taps), niet met een eenvoudige. Voor luisteren naar SSB, AM en FM is een vlakke, scherpe band precies wat
+  je wilt, dus een aanvullend FIR is hier niet nodig.</p>
 
   <h3>Group delay — vlak, zoals een lineair-fase FIR</h3>
   <p>Dit is een sterke troef van de methode. Het bin-masker is <b>reëel</b> (een bin telt mee of niet —
