@@ -865,7 +865,7 @@
       <text x="152" y="126" text-anchor="middle" class="mut" font-size="11">&asymp; &minus;31 dBc pal naast de band</text>
       <text x="152" y="137" text-anchor="middle" class="mut" font-size="11">&rarr; daarna ~18 dB/octaaf steiler</text>
       <!-- D: met optionele FIR -->
-      <path d="M80 284 L255 280 L268 180 L273 60 L279 40 L437 40 L443 60 L448 180 L461 280 L712 284"
+      <path d="M80 280 L256 280 L260 200 L262 40 L458 40 L460 200 L464 280 L712 280"
         fill="none" stroke="#ffb454" stroke-width="1.7" stroke-dasharray="2 3" opacity=".9"/>
       <!-- C: resultante (totaal) -->
       <path d="M80 280 L242 280 L248 200 L252 164 L257 90 L261 55 L266 43 L300 41 L360 40 L420 41 L454 43 L459 55 L463 90 L468 164 L472 200 L478 280 L712 280"
@@ -879,7 +879,7 @@
         <line x1="96" y1="350" x2="126" y2="350" stroke="#4ea1ff" stroke-width="2.6"/>
         <text x="132" y="354">resultante (totaal)</text>
         <line x1="300" y1="350" x2="330" y2="350" stroke="#ffb454" stroke-width="1.7" stroke-dasharray="2 3"/>
-        <text x="336" y="354" class="mut">resultante mét FIR (toekomst)</text>
+        <text x="336" y="354" class="mut">met optionele FIR: scherper, dichter bij ideaal</text>
       </g>
     </svg>
     <div class="cap">Figuur 11 — De filterrespons in het frequentiedomein, opgebouwd uit de
@@ -888,8 +888,8 @@
     stopband-skirt</b>. De <b>&minus;31 dBc</b> (groen punt, de Hann-eerste-zijlob) geldt alléén
     <i>pal</i> naast de bandgrens — als worst case; daarna zakt het ~18 dB per octaaf, dus al op
     enkele honderden Hz is de onderdrukking tientallen dB dieper (en op enkele kHz praktisch tot de
-    reken-ruisvloer). Een <b>optionele FIR</b> (oranje, gestippeld) maakt de flank nog scherper en de
-    stopband nog dieper.</div>
+    reken-ruisvloer). Een <b>optionele FIR</b> (oranje, gestippeld) kan de flank nóg scherper maken —
+    dichter tegen het ideale masker — als ontwerpkeuze, ten koste van latency of de vlakke group delay.</div>
   </div>
 
   <h3>Group delay — vlak, zoals een lineair-fase FIR</h3>
@@ -922,13 +922,17 @@
   <b>FIR-filter</b> zetten. Dat is relatief goedkoop, want na de iFFT draait alles op de lage
   uitgangsrate (8 of 16 kHz). Zo'n FIR zou kunnen:</p>
   <ul>
+    <li>de flank <b>nóg scherper</b> maken — dichter tegen het ideale rechthoek-masker aan;</li>
     <li>de licht aflopende doorlaatband-rand <b>vlak</b> trekken;</li>
     <li>de stopband ver onder de venster-bodem duwen (echte &minus;60…&minus;80 dB);</li>
     <li>het overgangsgebied precies op maat zetten.</li>
   </ul>
-  <p>Omdat een symmetrische FIR óók lineair in fase is, blijft de vlakke group delay behouden — je
-  stapelt alleen een extra, exact vormgegeven trap bovenop de grove channelizer. Dit is het bekende
-  recept: <i>grove</i> kanaalselectie + decimatie met de FFT, <i>fijne</i> vormgeving met een FIR.</p>
+  <p>Maar daar zit een afweging in. Een <b>symmetrische (lineair-fase) FIR</b> houdt de group delay
+  vlak; een scherpere flank kost dan meer taps — dus meer <b>latency</b>. Wil je scherper <i>zonder</i>
+  die extra vertraging, dan moet je de lineaire fase opgeven en krijg je (net als bij een klassiek
+  analoog- of kristalfilter) <b>group-delay-vervorming</b> aan de bandranden terug. Kortom: scherpte
+  staat tegenover vlakke fase/latency — een bewuste ontwerpkeuze. Het blijft het bekende recept:
+  <i>grove</i> kanaalselectie + decimatie met de FFT, <i>fijne</i> vormgeving met een FIR.</p>
 
   <div class="tl"><b>In ThetisLink.</b> De huidige keten gebruikt een Hann-analysevenster met 50%
   overlap-add en het rechthoekige bin-masker — geen extra FIR en geen synthesevenster. Voor

@@ -865,7 +865,7 @@
       <text x="152" y="126" text-anchor="middle" class="mut" font-size="11">&asymp; &minus;31 dBc right next to the band</text>
       <text x="152" y="137" text-anchor="middle" class="mut" font-size="11">&rarr; then ~18 dB/octave steeper</text>
       <!-- D: met optionele FIR -->
-      <path d="M80 284 L255 280 L268 180 L273 60 L279 40 L437 40 L443 60 L448 180 L461 280 L712 284"
+      <path d="M80 280 L256 280 L260 200 L262 40 L458 40 L460 200 L464 280 L712 280"
         fill="none" stroke="#ffb454" stroke-width="1.7" stroke-dasharray="2 3" opacity=".9"/>
       <!-- C: resultante (totaal) -->
       <path d="M80 280 L242 280 L248 200 L252 164 L257 90 L261 55 L266 43 L300 41 L360 40 L420 41 L454 43 L459 55 L463 90 L468 164 L472 200 L478 280 L712 280"
@@ -879,7 +879,7 @@
         <line x1="96" y1="350" x2="126" y2="350" stroke="#4ea1ff" stroke-width="2.6"/>
         <text x="132" y="354">resultant (total)</text>
         <line x1="300" y1="350" x2="330" y2="350" stroke="#ffb454" stroke-width="1.7" stroke-dasharray="2 3"/>
-        <text x="336" y="354" class="mut">resultant with FIR (future)</text>
+        <text x="336" y="354" class="mut">optional FIR: sharper, closer to ideal</text>
       </g>
     </svg>
     <div class="cap">Figure 11 — The filter response in the frequency domain, built up from the
@@ -888,8 +888,8 @@
     skirt</b>. The <b>&minus;31 dBc</b> (green dot, the Hann first sidelobe) applies only <i>right</i>
     next to the band edge — as the worst case; beyond it the rejection drops ~18 dB per octave, so
     within a few hundred Hz it is already tens of dB deeper (and within a few kHz effectively down to
-    the numeric noise floor). An <b>optional FIR</b> (orange, dashed) makes the skirt sharper and the
-    stopband deeper still.</div>
+    the numeric noise floor). An <b>optional FIR</b> (orange, dashed) can make the skirt sharper still —
+    closer to the ideal mask — as a design choice, at the cost of latency or the flat group delay.</div>
   </div>
 
   <h3>Group delay — flat, like a linear-phase FIR</h3>
@@ -922,13 +922,17 @@
   <b>FIR filter</b> after the iFFT. That is relatively cheap, because after the iFFT everything runs at the low
   output rate (8 or 16 kHz). Such a FIR could:</p>
   <ul>
+    <li>make the skirt <b>sharper still</b> — hugging the ideal rectangular mask more closely;</li>
     <li>flatten the slightly sloping passband edge;</li>
     <li>push the stopband far below the window floor (real &minus;60…&minus;80 dB);</li>
     <li>set the transition region to exactly the right size.</li>
   </ul>
-  <p>Because a symmetric FIR is <i>also</i> linear in phase, the flat group delay is preserved — you
-  only stack an extra, precisely shaped stage on top of the coarse channelizer. This is the well-known
-  recipe: <i>coarse</i> channel selection + decimation with the FFT, <i>fine</i> shaping with a FIR.</p>
+  <p>But there is a trade-off. A <b>symmetric (linear-phase) FIR</b> keeps the group delay flat; a
+  sharper skirt then costs more taps — i.e. more <b>latency</b>. If you want it sharper <i>without</i>
+  that extra delay, you give up the linear phase and get <b>group-delay distortion</b> at the band
+  edges back (just like a classic analogue or crystal filter). In short: sharpness versus flat
+  phase/latency — a deliberate design choice. It remains the well-known recipe: <i>coarse</i> channel
+  selection + decimation with the FFT, <i>fine</i> shaping with a FIR.</p>
 
   <div class="tl"><b>In ThetisLink.</b> The current chain uses a Hann analysis window with 50%
   overlap-add and the rectangular bin mask — no extra FIR and no synthesis window. For
