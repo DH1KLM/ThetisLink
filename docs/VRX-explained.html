@@ -825,9 +825,14 @@
     narrow channel effectively more thanks to process gain).</li>
     <li><b>The ultimate out-of-band suppression is set by the window, not by the
     bin mask.</b> A strong signal just outside your passband leaks via the <i>sidelobes</i> of the
-    Hann window (§5) a little bit into the passband bins anyway. For a Hann window that first
-    sidelobe lies at about <b>&minus;31 dB</b>, with a further roll-off of ~18 dB per octave. A neighbour at
-    &minus;31 dBc just next to the band is therefore the practical limit — further away it drops quickly.</li>
+    Hann window (§5) a little into the passband anyway — through the <b>nearest edge bin</b> (the last
+    retained, non-zeroed bin). Two things to read the numbers by: the <b>0 dB reference is the passband
+    level</b> (hence dB<i>c</i>), and the distance is counted <b>from that band edge</b> — not from the
+    band centre or 0 Hz (for SSB the band isn't even symmetric about 0). The first sidelobe sits at
+    ~<b>&minus;31 dBc</b>, ~1 bin (62.5 Hz) outside the edge; beyond that it drops ~<b>18 dB per
+    octave</b>, where an "octave" = a <i>doubling of the distance from the edge</i> (≈ &minus;49 dBc at
+    2 bins, &minus;67 at 4, &minus;85 at 8). A neighbour right next to the band (~&minus;31 dBc) is
+    therefore the practical limit; further away it drops quickly.</li>
   </ul>
   <p>Want to suppress deeper? Then that is the classic <b>window trade-off</b>: a Blackman-Harris
   window achieves ~&minus;90 dB sidelobes, but the main lobe (and thus the transition region) becomes ~2× as

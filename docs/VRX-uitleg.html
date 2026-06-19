@@ -825,9 +825,14 @@
     smal kanaal effectief méér door process-gain).</li>
     <li><b>De ultieme onderdrukking buiten de band wordt gezet door het venster, niet door het
     bin-masker.</b> Een sterk signaal nét buiten je doorlaatband lekt via de <i>zijlobben</i> van het
-    Hann-venster (§5) tóch een beetje de doorlaatbins in. Voor een Hann-venster ligt die eerste
-    zijlob op ongeveer <b>&minus;31 dB</b>, met een verdere afval van ~18 dB per octaaf. Een buurman op
-    &minus;31 dBc net naast de band is dus de praktische grens — verder weg zakt het snel.</li>
+    Hann-venster (§5) tóch een beetje de doorlaatband in — en wel via de <b>dichtstbijzijnde rand-bin</b>
+    (de laatste meegenomen, niet-genulde bin). Twee dingen om de getallen te lezen: de <b>0 dB-referentie
+    is het doorlaatniveau</b> (vandaar dB<i>c</i>), en de afstand telt <b>vanaf die bandrand</b> — niet
+    vanaf het bandmidden of 0 Hz (bij SSB ligt de band niet eens symmetrisch rond 0). De eerste zijlob
+    ligt op ~<b>&minus;31 dBc</b>, ~1 bin (62,5 Hz) buiten de rand; daarna zakt het ~<b>18 dB per
+    octaaf</b>, waarbij "octaaf" = <i>verdubbeling van de afstand tot de rand</i> (≈ &minus;49 dBc op
+    2 bins, &minus;67 op 4, &minus;85 op 8). Een buurman pal naast de band (~&minus;31 dBc) is dus de
+    praktische grens; verder weg zakt het snel.</li>
   </ul>
   <p>Wil je dieper onderdrukken, dan is dat de klassieke <b>venster-afweging</b>: een Blackman-Harris-
   venster haalt ~&minus;90 dB zijlobben, maar de hoofdlob (en dus het overgangsgebied) wordt ~2× zo
