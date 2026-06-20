@@ -350,7 +350,7 @@
   einde → veel minder kunstmatige harmonischen → een veel schoner spectrum. (Helemaal lekvrij wordt
   het niet — het venster heeft zelf ook een vorm — maar de lekkage zakt drastisch.)</p>
   <div class="fig">
-    <svg viewBox="0 0 760 180" role="img" aria-label="Windowing">
+    <svg viewBox="0 0 760 198" role="img" aria-label="Windowing">
       <text x="190" y="24" text-anchor="middle">harde knip — begint op +1, eindigt op −1</text>
       <rect x="60" y="40" width="264" height="64" fill="none" stroke="#ff7a7a" stroke-dasharray="4 3"/>
       <!-- 0-niveau buiten het blok -->
@@ -375,6 +375,8 @@
       <path d="M440 95 q16 -8 32 0 q16 22 32 0 q16 -42 32 0 q16 56 32 0 q16 -56 32 0 q16 42 32 0 q16 -22 32 0 q16 8 32 0"
         fill="none" stroke="#4ea1ff" stroke-width="2"/>
       <text x="570" y="150" text-anchor="middle" class="mut">→ scherp, geen lekkage</text>
+      <text x="190" y="188" text-anchor="middle" class="mut">tijd →</text>
+      <text x="570" y="188" text-anchor="middle" class="mut">tijd →</text>
     </svg>
     <div class="cap">Figuur 4 — Links: 5,5 golven die op +1 beginnen en op −1 eindigen. Het blok start
     dus met een grote stap van 0 naar +1 en stopt met een grote stap van −1 naar 0; grote stappen =
@@ -456,7 +458,7 @@
   de juiste plek in de iFFT. Méér bins open = bredere doorlaat; meer nullen = smaller. Zo verander je
   je bandbreedte direct, zonder iets aan de sample-rate te veranderen.</p>
   <div class="fig">
-    <svg viewBox="0 0 760 165" role="img" aria-label="Vaste iFFT met nullen als filter">
+    <svg viewBox="0 0 760 181" role="img" aria-label="Vaste iFFT met nullen als filter">
       <text x="380" y="22" text-anchor="middle" class="mut">de 128-bins iFFT (= 8 kHz, vaste rate)</text>
       <line x1="40" y1="125" x2="720" y2="125" stroke="#26304d"/>
       <rect x="300" y="34" width="160" height="91" fill="#1f3a5a" opacity=".5"/>
@@ -477,6 +479,7 @@
       </g>
       <text x="150" y="150" text-anchor="middle" class="mut">op nul (weg)</text>
       <text x="600" y="150" text-anchor="middle" class="mut">op nul (weg)</text>
+      <text x="380" y="174" text-anchor="middle" class="mut">frequentie →</text>
     </svg>
     <div class="cap">Figuur 5 — Een vaste iFFT (hier 128 bins = 8 kHz). Alleen de bins binnen de gekozen
     doorlaat blijven staan; de rest staat op nul. Méér of minder nullen = smallere of bredere bandbreedte.</div>
@@ -495,7 +498,7 @@
   <b>parkeervak</b> (op 62,5 Hz). Maar je wilt voor de déur staan. De <b>NCO</b> is het laatste stukje
   lopen: hij schuift het signaal nog dat kleine restje op (tot op een fractie van een Hz).</div>
   <div class="fig">
-    <svg viewBox="0 0 760 150" role="img" aria-label="NCO fijntuning">
+    <svg viewBox="0 0 760 168" role="img" aria-label="NCO fijntuning">
       <line x1="40" y1="100" x2="720" y2="100" stroke="#26304d"/>
       <g stroke="#3a4a73">
         <line x1="120" y1="90" x2="120" y2="100"/><line x1="240" y1="90" x2="240" y2="100"/>
@@ -511,6 +514,7 @@
       <text x="430" y="84" fill="#ffb454">gewenste frequentie</text>
       <path d="M360 100 H408" stroke="#3ddc97" stroke-width="2.5" fill="none" marker-end="url(#ar3)"/>
       <text x="384" y="138" text-anchor="middle" fill="#3ddc97">NCO schuift dit restje (≤ 31 Hz)</text>
+      <text x="380" y="162" text-anchor="middle" class="mut">frequentie →</text>
       <defs><marker id="ar3" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
         <path d="M0,0 L7,3 L0,6 Z" fill="#3ddc97"/></marker></defs>
     </svg>
@@ -539,7 +543,7 @@
   het geluid mee. Frequentie is &ldquo;hoe snel de fase draait&rdquo;. We meten van sample tot sample
   hoeveel de fase verdraaide — dat verschil ís het geluid.</p>
   <div class="fig">
-    <svg viewBox="0 0 760 200" role="img" aria-label="AM en FM demodulatie">
+    <svg viewBox="0 0 760 216" role="img" aria-label="AM en FM demodulatie">
       <text x="190" y="24" text-anchor="middle">AM: lees de omhullende</text>
       <path d="M40 110 q6 -28 12 0 q6 38 12 0 q6 -48 12 0 q6 56 12 0 q6 -64 12 0 q6 70 12 0 q6 -74 12 0 q6 78 12 0 q6 -80 12 0 q6 80 12 0 q6 -78 12 0 q6 74 12 0 q6 -70 12 0 q6 64 12 0 q6 -56 12 0 q6 48 12 0 q6 -38 12 0 q6 28 12 0"
         fill="none" stroke="#4ea1ff" stroke-width="1.6"/>
@@ -550,6 +554,7 @@
       <path d="M58 129 C66 133 74 135 82 138 C90 141 98 143 106 145 C114 147 122 148 130 149 C138 150 146 150 154 150 C162 150 170 149 178 147 C186 145 194 144 202 142 C210 139 218 137 226 134 C234 131 242 127 250 124"
         fill="none" stroke="#ffb454" stroke-width="2.2" opacity=".75"/>
       <text x="190" y="180" text-anchor="middle" class="mut">de oranje omhullende (boven + onder) raakt de pieken — dát is het geluid</text>
+      <text x="140" y="206" text-anchor="middle" class="mut">tijd →</text>
       <text x="570" y="24" text-anchor="middle">FM: hoe snel draait de wijzer</text>
       <circle cx="570" cy="105" r="55" fill="none" stroke="#2a3350"/>
       <line x1="570" y1="105" x2="610" y2="68" stroke="#3ddc97" stroke-width="3"/>
@@ -600,18 +605,40 @@
   helft <b>overlappen</b> met het vorige en tel ze op. Waar het ene blok uitdooft, komt het volgende
   op — samen een gladde, ononderbroken stroom.</p>
   <div class="fig">
-    <svg viewBox="0 0 760 160" role="img" aria-label="Overlap-add">
-      <path d="M40 120 q70 -90 140 0" fill="none" stroke="#4ea1ff" stroke-width="2" opacity=".8"/>
-      <path d="M110 120 q70 -90 140 0" fill="none" stroke="#3ddc97" stroke-width="2" opacity=".8"/>
-      <path d="M180 120 q70 -90 140 0" fill="none" stroke="#4ea1ff" stroke-width="2" opacity=".8"/>
-      <path d="M250 120 q70 -90 140 0" fill="none" stroke="#3ddc97" stroke-width="2" opacity=".8"/>
-      <path d="M320 120 q70 -90 140 0" fill="none" stroke="#4ea1ff" stroke-width="2" opacity=".8"/>
-      <path d="M390 120 q70 -90 140 0" fill="none" stroke="#3ddc97" stroke-width="2" opacity=".8"/>
-      <line x1="40" y1="55" x2="600" y2="55" stroke="#ffb454" stroke-width="2.5" stroke-dasharray="6 4"/>
-      <text x="320" y="44" text-anchor="middle" fill="#ffb454">som = gladde, constante audio</text>
-      <text x="320" y="148" text-anchor="middle" class="mut">elk blok overlapt 50% met het vorige</text>
+    <svg viewBox="0 0 760 172" role="img" aria-label="Overlap-add in de tijd">
+      <!-- som = constante audio -->
+      <line x1="110" y1="74" x2="460" y2="74" stroke="#ffb454" stroke-width="2.5" stroke-dasharray="6 4"/>
+      <text x="285" y="64" text-anchor="middle" fill="#ffb454">som = constante, naadloze audio</text>
+      <!-- opeenvolgende, afgezwakte audioblokken (Hann-vensters) langs de tijd -->
+      <path d="M40 130 q70 -98 140 0" fill="none" stroke="#4ea1ff" stroke-width="2" opacity=".85"/>
+      <path d="M110 130 q70 -98 140 0" fill="none" stroke="#3ddc97" stroke-width="2" opacity=".85"/>
+      <path d="M180 130 q70 -98 140 0" fill="none" stroke="#4ea1ff" stroke-width="2" opacity=".85"/>
+      <path d="M250 130 q70 -98 140 0" fill="none" stroke="#3ddc97" stroke-width="2" opacity=".85"/>
+      <path d="M320 130 q70 -98 140 0" fill="none" stroke="#4ea1ff" stroke-width="2" opacity=".85"/>
+      <path d="M390 130 q70 -98 140 0" fill="none" stroke="#3ddc97" stroke-width="2" opacity=".85"/>
+      <!-- tijd-as -->
+      <line x1="30" y1="130" x2="645" y2="130" stroke="#9aa6c4" stroke-width="1.5"/>
+      <path d="M645 130 l-9 -4 v8 z" fill="#9aa6c4"/>
+      <text x="656" y="134" class="mut">tijd</text>
+      <g stroke="#3a4a73">
+        <line x1="40" y1="130" x2="40" y2="137"/><line x1="110" y1="130" x2="110" y2="137"/>
+        <line x1="180" y1="130" x2="180" y2="137"/><line x1="250" y1="130" x2="250" y2="137"/>
+        <line x1="320" y1="130" x2="320" y2="137"/><line x1="390" y1="130" x2="390" y2="137"/>
+        <line x1="460" y1="130" x2="460" y2="137"/><line x1="530" y1="130" x2="530" y2="137"/>
+      </g>
+      <!-- hop = halve blok -->
+      <line x1="180" y1="146" x2="250" y2="146" stroke="#3ddc97" stroke-width="1.4"/>
+      <line x1="180" y1="143" x2="180" y2="149" stroke="#3ddc97"/><line x1="250" y1="143" x2="250" y2="149" stroke="#3ddc97"/>
+      <text x="215" y="163" text-anchor="middle" class="mut" font-size="11">hop = ½ blok</text>
+      <!-- 1 blok -->
+      <line x1="250" y1="146" x2="390" y2="146" stroke="#9aa6c4" stroke-width="1.2"/>
+      <line x1="250" y1="143" x2="250" y2="149" stroke="#9aa6c4"/><line x1="390" y1="143" x2="390" y2="149" stroke="#9aa6c4"/>
+      <text x="320" y="163" text-anchor="middle" class="mut" font-size="11">1 blok (N samples)</text>
     </svg>
-    <div class="cap">Figuur 8 — Overlappende, afgezwakte blokjes tellen op tot een vlakke, naadloze audiostroom.</div>
+    <div class="cap">Figuur 8 — Overlap-add gebeurt in de <b>tijd</b>: de horizontale as is tijd, niet
+    frequentie. Opeenvolgende, afgezwakte audioblokken (elk een Hann-venster, §5) starten telkens na een
+    halve bloklengte, overlappen dus 50% en worden opgeteld. Waar het ene blok uitdooft, komt het volgende
+    op — de som is een vlakke, naadloze audiostroom.</div>
   </div>
 </section>
 
@@ -666,6 +693,7 @@
       </g>
       <text x="190" y="34" text-anchor="middle" class="mut">vermogen van de bins in de band</text>
       <text x="170" y="142" text-anchor="middle" class="mut">→ optellen → dBm</text>
+      <text x="170" y="162" text-anchor="middle" class="mut" font-size="11">frequentie →</text>
       <!-- arrow -->
       <path d="M312 90 H372" stroke="#4ea1ff" stroke-width="2" fill="none" marker-end="url(#ar5)"/>
       <!-- s-meter scale right -->
@@ -737,6 +765,7 @@
         L602 84 L622 92 L642 70 L662 90 L682 86 L702 92 L720 90 L720 96 Z"
         fill="#1f3a2e" stroke="#3ddc97" stroke-width="1.2"/>
       <line x1="40" y1="96" x2="720" y2="96" stroke="#26304d"/>
+      <text x="688" y="112" text-anchor="middle" class="mut" font-size="11">frequentie →</text>
       <!-- three highlighted sub-bands -->
       <rect x="104" y="42" width="60" height="54" fill="#4ea1ff" opacity=".28" stroke="#4ea1ff"/>
       <rect x="316" y="42" width="60" height="54" fill="#3ddc97" opacity=".28" stroke="#3ddc97"/>
