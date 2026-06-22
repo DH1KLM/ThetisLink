@@ -241,7 +241,9 @@
     </svg>
     <div class="cap">Figuur 2 — Hetzelfde signaal, twee presentaties. Een zuivere sinus is één enkele
     frequentie; een korte impuls bevat juist álle frequenties tegelijk; blok en zaagtand zijn een
-    grondtoon plus een reeks harmonischen.</div>
+    grondtoon plus een reeks harmonischen. Die korte, krachtige impuls herken je in de praktijk als
+    <b>bliksem / atmosferische ontlading</b>: één heel kort signaal dat alle frequenties tegelijk bevat,
+    en daarom in de waterval als een <b>horizontale streep dwars door de hele band</b> verschijnt.</div>
   </div>
   <p>De uitkomst van de FFT is een rij <b>bins</b> (vakjes), elk voor een smal frequentiebereik.
   Daarover gaat het volgende hoofdstuk.</p>
@@ -385,8 +387,17 @@
   </div>
   <div class="tl"><b>In ThetisLink.</b> Zowel de audio-channelizer als het spectrumbeeld gebruiken een
   Hann-venster. De audio-channelizer overlapt opeenvolgende blokken voor 50% (zie §14); het
-  spectrumbeeld overlapt nog sterker (~87,5%, een hop van ⅛ blok) voor een vloeiender beeld. Door die
-  overlap kosten de afgezwakte randen geen informatie.</div>
+  spectrumbeeld overlapt nog sterker — <b>~87,5%</b> (een hop van ⅛ blok) — voor een vloeiender beeld.</div>
+  <details>
+    <summary>Voor de liefhebber: waarom het spectrumbeeld zóveel overlapt</summary>
+    <p>Het venster zwakt de blokranden naar 0 af, dus een gebeurtenis die nét bij een rand valt, telt in
+    dát blok bijna niet mee. Door 8× zo vaak een FFT te maken (a) valt elk stukje signaal in mínstens
+    één blok dicht bij het midden — volle weging, niets gaat structureel verloren — en (b) krijg je veel
+    meer watervalregels per seconde: vloeiender beeld én fijnere tijd-resolutie, zodat korte pieken
+    (CW-punten, een bliksem-impuls, een diepe fade) niet gemist worden. Het spectrumbeeld hoeft — anders
+    dan de channelizer — geen audio te reconstrueren, dus die extra overlap mag puur voor het beeld; de
+    enige prijs is wat meer rekenwerk.</p>
+  </details>
 </section>
 
 <section id="complex">
@@ -458,31 +469,41 @@
   de juiste plek in de iFFT. Méér bins open = bredere doorlaat; meer nullen = smaller. Zo verander je
   je bandbreedte direct, zonder iets aan de sample-rate te veranderen.</p>
   <div class="fig">
-    <svg viewBox="0 0 760 181" role="img" aria-label="Vaste iFFT met nullen als filter">
-      <text x="380" y="22" text-anchor="middle" class="mut">de 128-bins iFFT (= 8 kHz, vaste rate)</text>
+    <svg viewBox="0 0 760 204" role="img" aria-label="Vaste iFFT met nullen als filter (USB: doorlaat grenst aan de draaggolf)">
+      <text x="380" y="22" text-anchor="middle" class="mut">de 128-bins iFFT (= 8 kHz, vaste rate) — USB-voorbeeld</text>
       <line x1="40" y1="125" x2="720" y2="125" stroke="#26304d"/>
-      <rect x="300" y="34" width="160" height="91" fill="#1f3a5a" opacity=".5"/>
-      <text x="380" y="50" text-anchor="middle" fill="#bcd6ff">open (~3 kHz)</text>
-      <g fill="#566187" opacity=".55">
-        <rect x="50" y="117" width="30" height="8"/><rect x="86" y="115" width="30" height="10"/>
-        <rect x="122" y="118" width="30" height="7"/><rect x="158" y="116" width="30" height="9"/>
-        <rect x="194" y="118" width="30" height="7"/><rect x="230" y="117" width="30" height="8"/>
-        <rect x="266" y="115" width="30" height="10"/>
-        <rect x="468" y="117" width="30" height="8"/><rect x="504" y="116" width="30" height="9"/>
-        <rect x="540" y="118" width="30" height="7"/><rect x="576" y="115" width="30" height="10"/>
-        <rect x="612" y="117" width="30" height="8"/><rect x="648" y="118" width="30" height="7"/>
-        <rect x="684" y="116" width="30" height="9"/>
-      </g>
+      <!-- draaggolf / 0 Hz-marker aan de linkerrand (label in de legenda) -->
+      <line x1="44" y1="40" x2="44" y2="128" stroke="#ffb454" stroke-width="1.5"/>
+      <!-- open doorlaat: grenst aan de draaggolf -->
+      <rect x="48" y="34" width="188" height="91" fill="#1f3a5a" opacity=".5"/>
+      <text x="142" y="50" text-anchor="middle" fill="#bcd6ff">open (~3 kHz)</text>
+      <!-- gehouden bins: net boven de draaggolf (laagste audiofrequenties);
+           toppen onder het 'open'-label gehouden zodat dat leesbaar blijft -->
       <g fill="#3ddc97">
-        <rect x="302" y="74" width="30" height="51"/><rect x="338" y="54" width="30" height="71"/>
-        <rect x="374" y="46" width="30" height="79"/><rect x="410" y="64" width="30" height="61"/>
+        <rect x="52" y="80" width="30" height="45"/><rect x="88" y="67" width="30" height="58"/>
+        <rect x="124" y="62" width="30" height="63"/><rect x="160" y="73" width="30" height="52"/>
+        <rect x="196" y="85" width="30" height="40"/>
       </g>
-      <text x="150" y="150" text-anchor="middle" class="mut">op nul (weg)</text>
-      <text x="600" y="150" text-anchor="middle" class="mut">op nul (weg)</text>
-      <text x="380" y="174" text-anchor="middle" class="mut">frequentie →</text>
+      <!-- de rest: op nul -->
+      <g fill="#566187" opacity=".55">
+        <rect x="240" y="117" width="30" height="8"/><rect x="276" y="115" width="30" height="10"/>
+        <rect x="312" y="118" width="30" height="7"/><rect x="348" y="116" width="30" height="9"/>
+        <rect x="384" y="118" width="30" height="7"/><rect x="420" y="117" width="30" height="8"/>
+        <rect x="456" y="115" width="30" height="10"/><rect x="492" y="118" width="30" height="7"/>
+        <rect x="528" y="116" width="30" height="9"/><rect x="564" y="117" width="30" height="8"/>
+        <rect x="600" y="118" width="30" height="7"/><rect x="636" y="116" width="30" height="9"/>
+        <rect x="672" y="117" width="30" height="8"/>
+      </g>
+      <text x="470" y="148" text-anchor="middle" class="mut">op nul (weg)</text>
+      <text x="380" y="170" text-anchor="middle" class="mut">frequentie →</text>
+      <!-- legenda -->
+      <line x1="300" y1="186" x2="300" y2="198" stroke="#ffb454" stroke-width="1.5"/>
+      <text x="308" y="196" text-anchor="start" fill="#ffb454" font-size="11">= draaggolf (0 Hz), op index 0 (links)</text>
     </svg>
-    <div class="cap">Figuur 5 — Een vaste iFFT (hier 128 bins = 8 kHz). Alleen de bins binnen de gekozen
-    doorlaat blijven staan; de rest staat op nul. Méér of minder nullen = smallere of bredere bandbreedte.</div>
+    <div class="cap">Figuur 5 — Een vaste iFFT (hier 128 bins = 8 kHz). De doorlaat <b>grenst aan de
+    draaggolf</b> (0 Hz, links): bij <b>USB</b> hou je de bins net erboven (de laagste audiofrequenties)
+    en nul je de rest. Méér of minder nullen = bredere of smallere bandbreedte. (LSB is het spiegelbeeld
+    aan de andere kant; AM houdt beide.)</div>
   </div>
   <div class="tl"><b>In ThetisLink.</b> De iFFT is 128 bins in smalband (= 8 kHz) of 256 bins in
   breedband (= 16 kHz). Je sleept de filterranden op het spectrum; de client/server vertalen dat naar
