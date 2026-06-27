@@ -613,6 +613,19 @@ impl PttController {
         self.tci.filter_high_hz
     }
 
+    // TX modulation filter (PATCH-tx-modulation-bandwidth)
+    pub fn tx_filter_low_hz(&self) -> i32 {
+        self.tci.tx_filter_low_hz
+    }
+
+    pub fn tx_filter_high_hz(&self) -> i32 {
+        self.tci.tx_filter_high_hz
+    }
+
+    pub fn tx_filter_known(&self) -> bool {
+        self.tci.tx_filter_known
+    }
+
     pub fn ctun(&self) -> bool {
         self.tci.ctun
     }
@@ -713,6 +726,11 @@ impl PttController {
 
     pub async fn set_filter(&mut self, low_hz: i32, high_hz: i32) {
         self.tci.set_filter(low_hz, high_hz).await
+    }
+
+    /// Set the TX modulation filter band (tx_filter_band_ex). Hoofdradio-TX.
+    pub async fn set_tx_filter_band(&mut self, low_hz: i32, high_hz: i32) {
+        self.tci.set_tx_filter_band(low_hz, high_hz).await
     }
 
     // --- RX2 / VFO-B ---

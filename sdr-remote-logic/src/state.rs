@@ -254,6 +254,18 @@ pub struct RadioState {
     pub vrx2_extracted_span_hz: u32,
     pub vrx2_extracted_sequence: u16,
 
+    // SAM auto-tune follow frequency (PATCH-vrx-wide-sam-ux). Latest carrier
+    // frequency the server is following while auto-tune is on; 0 = no update.
+    // The UI applies it to the VRX VFO display when it changes.
+    pub vrx1_autotune_freq_hz: u64,
+    pub vrx2_autotune_freq_hz: u64,
+
+    // TX modulation filter band (PATCH-tx-modulation-bandwidth). Pushed by the
+    // server when Thetis reports it; `tx_filter_supported` gates the client UI.
+    pub tx_filter_low_hz: i32,
+    pub tx_filter_high_hz: i32,
+    pub tx_filter_supported: bool,
+
     // External equipment: Amplitec 6/2 antenna switch
     pub amplitec_connected: bool,
     pub amplitec_switch_a: u8,  // 0=unknown, 1-6
@@ -545,6 +557,11 @@ impl Default for RadioState {
             vrx2_extracted_center_hz: 0,
             vrx2_extracted_span_hz: 0,
             vrx2_extracted_sequence: 0,
+            vrx1_autotune_freq_hz: 0,
+            vrx2_autotune_freq_hz: 0,
+            tx_filter_low_hz: 0,
+            tx_filter_high_hz: 0,
+            tx_filter_supported: false,
             amplitec_connected: false,
             amplitec_switch_a: 0,
             amplitec_switch_b: 0,

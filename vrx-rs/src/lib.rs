@@ -34,6 +34,7 @@
 //!     volume: 1.0,
 //!     filter_low_hz: 0,
 //!     filter_high_hz: 3000,
+//!     sam_auto_tune: false,
 //! }));
 //! let mut runtime = VrxRuntime::new(VrxRuntimeOptions::default(), control);
 //! let mut sink = MySink;
@@ -67,7 +68,10 @@ pub use channelizer::{
     fft_n_for_rate, VrxChannelizer, DEFAULT_FFT_N, DEFAULT_INPUT_HOP, IFFT_N,
     OUTPUT_HOP, OUTPUT_RATE_HZ,
 };
-pub use config::{AUDIO_BIN_HZ, VrxConfig, VrxControlState, VrxMode};
+pub use config::{
+    rate_mode_wants_wideband, AUDIO_BIN_HZ, AUTO_WB_THRESHOLD_HZ, VrxConfig, VrxControlState,
+    VrxMode, VrxRateMode,
+};
 pub use opus::{VrxOpusEncoder, FRAME_SAMPLES};
 pub use runtime::{VrxAudioCallback, VrxRuntime, VrxRuntimeOptions};
 pub use wav::RollingWavWriter;

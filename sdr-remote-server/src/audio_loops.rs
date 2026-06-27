@@ -686,13 +686,16 @@ pub async fn tci_iq_consumer(
     // avoid filename collisions (acceptable for dev tooling, can grow
     // a per-channel sub-dir later if needed).
     let vrx_dir = std::env::var("VRX_LIVE_DIR").ok();
-    let initial_wb = session.lock().await.any_client_wants_thetis_wideband();
+    // VRX output rate is now per-VRX, decoupled from the global Thetis-WB
+    // toggle (PATCH-vrx-wide-sam-ux): each VRX follows the NB/WB/Auto
+    // dropdown (VRX_AUDIO_RATE_MODE) resolved against its own filter width.
+    // Start narrowband; the loop bumps to WB on the first batch if needed.
     let mut vrx1_runtime = vrx_rs::VrxRuntime::new(
         vrx_rs::VrxRuntimeOptions {
             vrx_id: 0,
             wav_dir: vrx_dir.clone(),
             wav_segment_sec: 10,
-            wideband: initial_wb,
+            wideband: false,
         },
         crate::vrx_bridge::vrx_control_thetislink(0),
     );
@@ -701,13 +704,25 @@ pub async fn tci_iq_consumer(
             vrx_id: 1,
             wav_dir: None,
             wav_segment_sec: 10,
-            wideband: initial_wb,
+            wideband: false,
         },
         crate::vrx_bridge::vrx_control_thetislink(1),
     );
     let mut vrx1_sink = crate::vrx_bridge::ThetisVrxSink::new(socket.clone());
     let mut vrx2_sink = crate::vrx_bridge::ThetisVrxSink::new(socket.clone());
-    let mut vrx_current_wb = initial_wb;
+    let mut vrx1_current_wb = false;
+    let mut vrx2_current_wb = false;
+
+    // Resolve the per-VRX wideband flag from the NB/WB/Auto mode + filter
+    // width. Auto switches up at ≥4 kHz audio BW and back down below 3.75 kHz
+    // (hysteresis to avoid rebuild-thrash while dragging the filter edge).
+    fn vrx_desired_wb(low_hz: i32, high_hz: i32, current_wb: bool) -> bool {
+        let mode = vrx_rs::VrxRateMode::from_u8(
+            crate::network::VRX_AUDIO_RATE_MODE.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        // Single source of truth in vrx-rs (incl. the Auto hysteresis).
+        vrx_rs::rate_mode_wants_wideband(mode, low_hz, high_hz, current_wb)
+    }
 
     let mut fft_size = spectrum.lock().await.ddc_fft_size();
     let mut rx2_fft_size = rx2_spectrum.lock().await.ddc_fft_size();
@@ -771,25 +786,40 @@ pub async fn tci_iq_consumer(
                         let spec = spectrum.lock().await;
                         (spec.vfo_freq_hz(), spec.ddc_center_hz())
                     };
-                    vrx1_sink.addrs = session.lock().await.vrx_audio_addrs(0);
+                    {
+                        let sess = session.lock().await;
+                        vrx1_sink.addrs = sess.vrx_audio_addrs(0);
+                        vrx1_sink.autotune_addrs = sess.vrx_autotune_addrs(0);
+                    }
+                    // AFC enable = aggregate (any active subscriber), not a single
+                    // client's toggle — keeps multi-client ownership clean.
+                    crate::vrx_bridge::vrx_control_thetislink(0).lock().unwrap().sam_auto_tune =
+                        !vrx1_sink.autotune_addrs.is_empty();
                     vrx1_sink.timestamp_ms = server_start.elapsed().as_millis() as u32;
-                    // Wideband toggle change → recreate runtimes (output
-                    // rate is fixed at construction). Brief audio gap is
-                    // acceptable, toggle is a rare user action.
-                    let want_wb = session.lock().await.any_client_wants_thetis_wideband();
-                    if want_wb != vrx_current_wb {
-                        info!("VRX wideband toggle: {} → {} — recreating runtimes", vrx_current_wb, want_wb);
-                        vrx_current_wb = want_wb;
+                    // Per-VRX rate (NB/WB/Auto). Recreate the runtime only when
+                    // the resolved rate actually changes (output rate is fixed
+                    // at construction); the hysteresis avoids drag-thrash.
+                    let (f1_lo, f1_hi) = {
+                        let ctl = crate::vrx_bridge::vrx_control_thetislink(0);
+                        let s = ctl.lock().unwrap();
+                        (s.filter_low_hz, s.filter_high_hz)
+                    };
+                    let want_wb1 = vrx_desired_wb(f1_lo, f1_hi, vrx1_current_wb);
+                    if want_wb1 != vrx1_current_wb {
+                        info!("VRX1 audio rate: {} → {} — recreating runtime",
+                            if vrx1_current_wb { "WB" } else { "NB" }, if want_wb1 { "WB" } else { "NB" });
+                        vrx1_current_wb = want_wb1;
+                        // Carry the auto-tune follow across the rebuild so a
+                        // WB↔NB switch re-locks instantly instead of re-pulling
+                        // in from the original manual tuning (seconds of beat).
+                        let (afc_o, afc_b) = vrx1_runtime.afc_state();
                         vrx1_runtime = vrx_rs::VrxRuntime::new(
-                            vrx_rs::VrxRuntimeOptions { vrx_id: 0, wav_dir: vrx_dir.clone(), wav_segment_sec: 10, wideband: want_wb },
+                            vrx_rs::VrxRuntimeOptions { vrx_id: 0, wav_dir: vrx_dir.clone(), wav_segment_sec: 10, wideband: want_wb1 },
                             crate::vrx_bridge::vrx_control_thetislink(0),
                         );
-                        vrx2_runtime = vrx_rs::VrxRuntime::new(
-                            vrx_rs::VrxRuntimeOptions { vrx_id: 1, wav_dir: None, wav_segment_sec: 10, wideband: want_wb },
-                            crate::vrx_bridge::vrx_control_thetislink(1),
-                        );
+                        vrx1_runtime.restore_afc_state(afc_o, afc_b);
                     }
-                    vrx1_sink.wideband = want_wb;
+                    vrx1_sink.wideband = want_wb1;
                     // Mute VRX during TX: skip the channelizer + Opus encode
                     // + UDP send. Avoids the “insensitive RX” sound during
                     // own transmissions; saves bandwidth + CPU too.
@@ -840,9 +870,33 @@ pub async fn tci_iq_consumer(
                         let spec = rx2_spectrum.lock().await;
                         (spec.vfo_freq_hz(), spec.ddc_center_hz())
                     };
-                    vrx2_sink.addrs = session.lock().await.vrx_audio_addrs(1);
+                    {
+                        let sess = session.lock().await;
+                        vrx2_sink.addrs = sess.vrx_audio_addrs(1);
+                        vrx2_sink.autotune_addrs = sess.vrx_autotune_addrs(1);
+                    }
+                    crate::vrx_bridge::vrx_control_thetislink(1).lock().unwrap().sam_auto_tune =
+                        !vrx2_sink.autotune_addrs.is_empty();
                     vrx2_sink.timestamp_ms = server_start.elapsed().as_millis() as u32;
-                    vrx2_sink.wideband = vrx_current_wb;
+                    // Per-VRX rate (NB/WB/Auto) for VRX2, same as VRX1.
+                    let (f2_lo, f2_hi) = {
+                        let ctl = crate::vrx_bridge::vrx_control_thetislink(1);
+                        let s = ctl.lock().unwrap();
+                        (s.filter_low_hz, s.filter_high_hz)
+                    };
+                    let want_wb2 = vrx_desired_wb(f2_lo, f2_hi, vrx2_current_wb);
+                    if want_wb2 != vrx2_current_wb {
+                        info!("VRX2 audio rate: {} → {} — recreating runtime",
+                            if vrx2_current_wb { "WB" } else { "NB" }, if want_wb2 { "WB" } else { "NB" });
+                        vrx2_current_wb = want_wb2;
+                        let (afc_o, afc_b) = vrx2_runtime.afc_state();
+                        vrx2_runtime = vrx_rs::VrxRuntime::new(
+                            vrx_rs::VrxRuntimeOptions { vrx_id: 1, wav_dir: None, wav_segment_sec: 10, wideband: want_wb2 },
+                            crate::vrx_bridge::vrx_control_thetislink(1),
+                        );
+                        vrx2_runtime.restore_afc_state(afc_o, afc_b);
+                    }
+                    vrx2_sink.wideband = want_wb2;
                     let tx_active = ptt.lock().await.is_tx_or_prefill();
                     if !tx_active {
                         vrx2_runtime.feed(frame_rate, &iq_pairs, vfo_hz, ddc_center_hz, &mut vrx2_sink);

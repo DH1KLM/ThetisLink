@@ -4,6 +4,7 @@
 
 mod helpers;
 mod meters;
+mod window_placement;
 mod spectrum;
 pub(crate) mod theme;
 mod config;
@@ -18,6 +19,19 @@ pub(crate) mod ftx1_ex_chart;
 pub(crate) use helpers::*;
 pub(crate) use meters::*;
 pub(crate) use spectrum::*;
+
+/// Convert RX filter edges (signed Hz) to the TX modulation filter band — a
+/// POSITIVE audio passband (Thetis applies the sideband per mode).
+/// - one-sided (USB both ≥0, LSB both ≤0) → min..max of magnitudes;
+/// - straddling 0 (AM/SAM/FM/DSB stored as −W..+W) → 0..max(|lo|,|hi|).
+/// Without the straddle case a symmetric AM band collapses to W..W (zero-wide).
+pub(crate) fn rx_to_tx_band(low_hz: i32, high_hz: i32) -> (i32, i32) {
+    if low_hz < 0 && high_hz > 0 {
+        (0, low_hz.abs().max(high_hz.abs()))
+    } else {
+        (low_hz.abs().min(high_hz.abs()), low_hz.abs().max(high_hz.abs()))
+    }
+}
 pub(crate) use config::{load_window_size, load_window_pos, save_config, load_config, NUM_MEMORIES};
 
 use std::time::Instant;
@@ -278,6 +292,16 @@ pub struct SdrRemoteApp {
     filter_low_hz: i32,
     filter_high_hz: i32,
     filter_changed_at: Option<Instant>,
+    // TX modulation filter (PATCH-tx-modulation-bandwidth) — main-radio TX,
+    // not VRX. `follow_rx` mirrors the RX filter 1:1; otherwise the low/high
+    // fields set it independently. Greyed unless the server reports support.
+    tx_filter_follow_rx: bool,
+    tx_filter_low_hz: i32,
+    tx_filter_high_hz: i32,
+    tx_filter_supported: bool,
+    tx_filter_initialized: bool,
+    last_tx_follow_sent: Option<(i32, i32)>,
+    tx_follow_last_send_at: Option<Instant>,
     thetis_starting: bool,
     // Spectrum + waterfall
     spectrum_enabled: bool,
@@ -356,6 +380,18 @@ pub struct SdrRemoteApp {
     vrx2_freq_hz: u64,
     vrx2_mode: u8,
     vrx2_volume: f32,
+    /// SAM auto-tune-to-carrier per VRX (PATCH-vrx-wide-sam-ux). When on
+    /// and the mode is SAM, the server follows the carrier and pushes the
+    /// new freq; the VRX VFO display tracks it. Persisted.
+    vrx1_auto_tune: bool,
+    vrx2_auto_tune: bool,
+    /// VRX audio-rate mode: 0=NB, 1=WB, 2=Auto. One setting for both VRX
+    /// (server-tab dropdown). Persisted.
+    vrx_rate_mode: u8,
+    /// Last auto-tune freq applied to the display (per VRX) — to detect
+    /// fresh server pushes without re-snapping every frame.
+    last_vrx1_autotune_hz: u64,
+    last_vrx2_autotune_hz: u64,
     vrx_popout_pos: Option<egui::Pos2>,
     vrx_popout_size: Option<egui::Vec2>,
     vrx_popout_init_applied: bool,
@@ -1033,6 +1069,20 @@ impl SdrRemoteApp {
             }
         });
 
+        // SAM auto-tune-to-carrier (alleen zinvol in SAM, mode 3)
+        if mode == 3 {
+            ui.horizontal(|ui| {
+                let mut at = match ch { VrxChannel::Vrx1 => self.vrx1_auto_tune, VrxChannel::Vrx2 => self.vrx2_auto_tune };
+                if ui.add_enabled(connected, egui::Checkbox::new(&mut at, "Auto-tune to carrier"))
+                    .on_hover_text("SAM: follow the AM carrier — the VFO snaps onto the carrier so the filter stays symmetric around it. Locks within ±3 kHz.")
+                    .changed()
+                    && self.cmd_tx.send(Command::SetVrxAutoTune(id, at)).is_ok()
+                {
+                    match ch { VrxChannel::Vrx1 => self.vrx1_auto_tune = at, VrxChannel::Vrx2 => self.vrx2_auto_tune = at };
+                }
+            });
+        }
+
         // BW (gedeelde segmented selector; mode-afhankelijke presets)
         ui.horizontal(|ui| {
             ui.label("BW:");
@@ -1485,6 +1535,13 @@ impl SdrRemoteApp {
             filter_low_hz: 0,
             filter_high_hz: 0,
             filter_changed_at: None,
+            tx_filter_follow_rx: true,
+            tx_filter_low_hz: 0,
+            tx_filter_high_hz: 0,
+            tx_filter_supported: false,
+            tx_filter_initialized: false,
+            last_tx_follow_sent: None,
+            tx_follow_last_send_at: None,
             thetis_starting: false,
             spectrum_enabled: config.spectrum_enabled,
             spectrum_bins: Vec::new(),
@@ -1543,6 +1600,11 @@ impl SdrRemoteApp {
             vrx2_freq_hz: config.vrx2_freq_hz.unwrap_or(0),
             vrx2_mode: config.vrx2_mode.unwrap_or(0),
             vrx2_volume: config.vrx2_volume.unwrap_or(1.0),
+            vrx1_auto_tune: false,
+            vrx2_auto_tune: false,
+            vrx_rate_mode: 2, // default Auto
+            last_vrx1_autotune_hz: 0,
+            last_vrx2_autotune_hz: 0,
             vrx_popout_pos: config.vrx_popout_pos.map(|(x, y)| egui::pos2(x, y)),
             vrx_popout_size: config.vrx_popout_size.map(|(w, h)| egui::vec2(w, h)),
             vrx_popout_init_applied: false,
@@ -2000,11 +2062,19 @@ impl SdrRemoteApp {
     /// without that gating the OS gets a fresh "go to this rect" request
     /// every frame and the window oscillates between successive committed
     /// rects during an active move / resize gesture.
+    /// Scale factor (physical px per logical point) of the main viewport, used
+    /// to compare saved logical positions against OS monitor rects (physical).
+    fn viewport_native_ppp(ctx: &egui::Context) -> f32 {
+        ctx.input(|i| i.viewport().native_pixels_per_point)
+            .unwrap_or_else(|| ctx.pixels_per_point())
+    }
+
     fn apply_popout_geometry(
         builder: ViewportBuilder,
         pos: Option<egui::Pos2>,
         size: Option<egui::Vec2>,
         default_size: [f32; 2],
+        native_ppp: f32,
         init_applied: &mut bool,
     ) -> ViewportBuilder {
         let mut b = builder;
@@ -2012,19 +2082,24 @@ impl SdrRemoteApp {
             let sz = size.map(|v| [v.x, v.y]).unwrap_or(default_size);
             b = b.with_inner_size(sz);
             if let Some(p) = pos {
-                // Sanity-check the persisted position. A previously
-                // attached second monitor leaves coordinates that fall
-                // outside any current display; egui will then open the
-                // viewport off-screen (= invisible). Allow a generous
-                // band that covers common multi-monitor layouts (left,
-                // right and stacked secondary monitors of up to ~4K).
-                let plausible = p.x > -3000.0 && p.x < 8000.0
-                             && p.y > -300.0 && p.y < 4000.0;
-                if plausible {
+                // Validate the persisted position against the live monitor
+                // layout. A previously-attached second monitor leaves
+                // coordinates that fall outside any current display; egui would
+                // then open the viewport off-screen (= invisible). Query the OS
+                // work-areas and only re-apply the position when a usable part
+                // of the window lands on a connected monitor — otherwise omit
+                // with_position() and let it open on the primary monitor. On
+                // non-Windows / query failure this returns true (trust the
+                // saved value). Manual "Recenter windows" stays as a fallback.
+                if window_placement::saved_window_is_visible(
+                    p,
+                    egui::vec2(sz[0], sz[1]),
+                    native_ppp,
+                ) {
                     b = b.with_position(p);
                 } else {
                     log::warn!(
-                        "popout: saved pos ({}, {}) lijkt buiten beeld (vorige tweede monitor?) — gebruik default",
+                        "popout: saved pos ({}, {}) valt buiten alle aangesloten monitoren — open op primair scherm",
                         p.x, p.y
                     );
                 }
@@ -2065,6 +2140,37 @@ impl SdrRemoteApp {
             state_changed = true;
         }
         state_changed && !ctx.input(|i| i.pointer.any_down())
+    }
+
+    /// Bring every pop-out window back onto the main window's monitor.
+    /// Recovery for a pop-out left on a now-disconnected second monitor:
+    /// egui/eframe never tell the app which monitors are currently connected,
+    /// so the restored absolute position cannot be auto-validated against the
+    /// live monitor layout. This is the manual escape hatch — it replaces
+    /// hand-editing the `*_popout_pos` lines in the .conf and restarting.
+    /// Positions are anchored just inside the main window (always visible) and
+    /// staggered so stacked pop-outs don't perfectly overlap. Clearing each
+    /// `*_init_applied` flag makes `apply_popout_geometry` re-apply the new
+    /// position on the next frame, so an open pop-out moves immediately — no
+    /// restart needed.
+    fn recenter_popouts(&mut self, ctx: &egui::Context) {
+        let anchor = ctx.input(|i| i.viewport().outer_rect)
+            .map(|r| r.min)
+            .unwrap_or(egui::pos2(80.0, 80.0));
+        let base = egui::pos2(anchor.x + 40.0, anchor.y + 40.0);
+        let place = |pos: &mut Option<egui::Pos2>, init: &mut bool, dx: f32, dy: f32| {
+            *pos = Some(egui::pos2(base.x + dx, base.y + dy));
+            *init = false;
+        };
+        place(&mut self.vrx_popout_pos, &mut self.vrx_popout_init_applied, 0.0, 0.0);
+        place(&mut self.spectrum_popout_pos, &mut self.spectrum_popout_init_applied, 24.0, 24.0);
+        place(&mut self.rx2_popout_pos, &mut self.rx2_popout_init_applied, 48.0, 48.0);
+        place(&mut self.yaesu_popout_pos, &mut self.yaesu_popout_init_applied, 72.0, 72.0);
+        place(&mut self.yaesu2_popout_pos, &mut self.yaesu2_popout_init_applied, 96.0, 96.0);
+        // The joined RX1+RX2 spectrum popout also restores via apply_popout_geometry.
+        place(&mut self.popout_joined_pos, &mut self.popout_joined_init_applied, 120.0, 120.0);
+        self.save_full_config();
+        log::info!("Pop-out windows recentered onto main monitor at {:?}", base);
     }
 
     fn render_split_join_button(
@@ -2277,8 +2383,12 @@ impl SdrRemoteApp {
                 Vfo::A => (self.mode, self.nr_level),
                 Vfo::B => (self.rx2_mode, self.rx2_nr_level),
             };
-            // Set mode first (filter range depends on mode)
-            if mem.mode != cur_mode {
+            // Set mode first (filter range depends on mode). Skip a VFO-A (TX)
+            // mode change during own TX: the server drops it (Thetis-bug
+            // workaround) and Thetis won't echo, so an optimistic update would
+            // leave the indication stuck out of sync. RX2 is RX-only.
+            let block_mode = matches!(vfo, Vfo::A) && self.ptt;
+            if mem.mode != cur_mode && !block_mode {
                 let _ = self.cmd_tx.send(match vfo {
                     Vfo::A => Command::SetMode(mem.mode),
                     Vfo::B => Command::SetModeRx2(mem.mode),
@@ -2545,6 +2655,10 @@ impl SdrRemoteApp {
             let _ = self.cmd_tx.send(Command::SetVrx2Enabled(self.vrx2_enabled));
             let _ = self.cmd_tx.send(Command::SetVrxFilter(0, self.vrx1_filter_low_hz, self.vrx1_filter_high_hz));
             let _ = self.cmd_tx.send(Command::SetVrxFilter(1, self.vrx2_filter_low_hz, self.vrx2_filter_high_hz));
+            // VRX rate-mode + SAM auto-tune (PATCH-vrx-wide-sam-ux) — resync.
+            let _ = self.cmd_tx.send(Command::SetVrxRateMode(self.vrx_rate_mode));
+            let _ = self.cmd_tx.send(Command::SetVrxAutoTune(0, self.vrx1_auto_tune));
+            let _ = self.cmd_tx.send(Command::SetVrxAutoTune(1, self.vrx2_auto_tune));
             // Re-send effective high-res spectrum on (re)connect.
             // Effective = VRX enabled AND high-res toggle on.
             if self.vrx1_enabled && self.vrx1_high_res_spectrum {
@@ -2773,6 +2887,48 @@ impl SdrRemoteApp {
                 self.vrx2_extracted_span_hz,
                 self.vrx2_extracted_sequence,
             );
+        }
+        // SAM auto-tune: mirror the server-followed carrier freq onto the VRX
+        // VFO display (display-only; we do NOT echo it back as a tune command,
+        // so there's no feedback loop with the server's AFC).
+        if state.vrx1_autotune_freq_hz != 0
+            && state.vrx1_autotune_freq_hz != self.last_vrx1_autotune_hz
+        {
+            self.last_vrx1_autotune_hz = state.vrx1_autotune_freq_hz;
+            self.vrx1_freq_hz = state.vrx1_autotune_freq_hz;
+        }
+        if state.vrx2_autotune_freq_hz != 0
+            && state.vrx2_autotune_freq_hz != self.last_vrx2_autotune_hz
+        {
+            self.last_vrx2_autotune_hz = state.vrx2_autotune_freq_hz;
+            self.vrx2_freq_hz = state.vrx2_autotune_freq_hz;
+        }
+        // TX modulation filter: mirror server-reported support + value. Seed the
+        // editable fields once from the first push so they show the real band.
+        self.tx_filter_supported = state.tx_filter_supported;
+        if state.tx_filter_supported && !self.tx_filter_initialized {
+            self.tx_filter_initialized = true;
+            self.tx_filter_low_hz = state.tx_filter_low_hz;
+            self.tx_filter_high_hz = state.tx_filter_high_hz;
+        }
+        // Follow-RX: while enabled, keep TX = RX filter. The TX filter is a
+        // POSITIVE audio passband (Thetis applies the sideband per mode);
+        // `rx_to_tx_band` converts the RX edges, incl. the straddle-zero case
+        // for AM/SAM/FM so a symmetric band doesn't collapse to zero width.
+        // Rate-limited to ~7/s so a spectrum drag doesn't spam Thetis with
+        // tx_filter_band_ex; the dedupe still guarantees the final value lands.
+        if self.tx_filter_follow_rx && self.tx_filter_supported {
+            let cur = (self.filter_low_hz, self.filter_high_hz);
+            if self.last_tx_follow_sent != Some(cur) {
+                let ready = self.tx_follow_last_send_at
+                    .map_or(true, |t| t.elapsed().as_millis() >= 150);
+                if ready {
+                    self.last_tx_follow_sent = Some(cur);
+                    self.tx_follow_last_send_at = Some(Instant::now());
+                    let (tlo, thi) = rx_to_tx_band(cur.0, cur.1);
+                    let _ = self.cmd_tx.send(Command::SetTxFilter(tlo, thi));
+                }
+            }
         }
         if state.full_spectrum_sequence != self.full_spectrum_sequence && !state.full_spectrum_bins.is_empty() {
             // Adjust default zoom when span first becomes known (0 → real value)
@@ -3921,12 +4077,16 @@ impl SdrRemoteApp {
         }
 
         // -- Mode selector (via controls::render_mode_selector) --
+        // Disabled during own TX: a mid-TX mode change is dropped by the server
+        // (Thetis-bug workaround), so block it in the UI too to avoid a misleading
+        // indication.
+        let ptt_active = self.ptt;
         let mode_action = self.with_rx_ctx(
             controls::RxChannel::Rx1,
             controls::UiDensity::Extended,
             surface,
             |ctx| {
-                controls::render_mode_selector(ui, ctx).map(|c| {
+                ui.add_enabled_ui(!ptt_active, |ui| controls::render_mode_selector(ui, ctx)).inner.map(|c| {
                     let intent = controls::UiIntent::SelectMode {
                         channel: controls::RxChannel::Rx1,
                         mode: c.mode,
@@ -4446,17 +4606,34 @@ impl SdrRemoteApp {
             use sdr_remote_core::protocol::ControlId;
             let drag_lo: Option<i32> = ctx.memory(|mem| mem.data.get_temp(egui::Id::new("spectrum_filter_low")));
             let drag_hi: Option<i32> = ctx.memory(|mem| mem.data.get_temp(egui::Id::new("spectrum_filter_high")));
+            // In symmetric modes (AM/SAM/DSB/FM/DRM) Thetis forces ±W around the
+            // carrier — dragging one edge there must mirror to both, otherwise
+            // TL2 shows an asymmetric band Thetis can't honour and narrowing one
+            // edge appears to do nothing (Thetis keeps the wider side).
+            let sym = is_symmetric_mode(self.mode);
             if let Some(hz) = drag_lo {
-                self.filter_low_hz = hz;
-                let _ = self.cmd_tx.send(Command::SetControl(ControlId::FilterLow, hz as i16 as u16));
+                if sym {
+                    let w = hz.abs();
+                    self.filter_low_hz = -w;
+                    self.filter_high_hz = w;
+                } else {
+                    self.filter_low_hz = hz;
+                }
+                let _ = self.cmd_tx.send(Command::SetControl(ControlId::FilterLow, self.filter_low_hz as i16 as u16));
                 let _ = self.cmd_tx.send(Command::SetControl(ControlId::FilterHigh, self.filter_high_hz as i16 as u16));
                 self.filter_changed_at = Some(std::time::Instant::now());
                 ctx.memory_mut(|mem| { mem.data.remove::<i32>(egui::Id::new("spectrum_filter_low")); });
             }
             if let Some(hz) = drag_hi {
-                self.filter_high_hz = hz;
+                if sym {
+                    let w = hz.abs();
+                    self.filter_low_hz = -w;
+                    self.filter_high_hz = w;
+                } else {
+                    self.filter_high_hz = hz;
+                }
                 let _ = self.cmd_tx.send(Command::SetControl(ControlId::FilterLow, self.filter_low_hz as i16 as u16));
-                let _ = self.cmd_tx.send(Command::SetControl(ControlId::FilterHigh, hz as i16 as u16));
+                let _ = self.cmd_tx.send(Command::SetControl(ControlId::FilterHigh, self.filter_high_hz as i16 as u16));
                 self.filter_changed_at = Some(std::time::Instant::now());
                 ctx.memory_mut(|mem| { mem.data.remove::<i32>(egui::Id::new("spectrum_filter_high")); });
             }
@@ -4487,17 +4664,31 @@ impl SdrRemoteApp {
         use sdr_remote_core::protocol::ControlId;
         let drag_lo: Option<i32> = ctx.memory(|mem| mem.data.get_temp(egui::Id::new("rx2_spectrum_filter_low")));
         let drag_hi: Option<i32> = ctx.memory(|mem| mem.data.get_temp(egui::Id::new("rx2_spectrum_filter_high")));
+        // Symmetric modes mirror a dragged edge to both sides (see RX1 above).
+        let sym = is_symmetric_mode(self.rx2_mode);
         if let Some(hz) = drag_lo {
-            self.rx2_filter_low_hz = hz;
-            let _ = self.cmd_tx.send(Command::SetControl(ControlId::Rx2FilterLow, hz as i16 as u16));
+            if sym {
+                let w = hz.abs();
+                self.rx2_filter_low_hz = -w;
+                self.rx2_filter_high_hz = w;
+            } else {
+                self.rx2_filter_low_hz = hz;
+            }
+            let _ = self.cmd_tx.send(Command::SetControl(ControlId::Rx2FilterLow, self.rx2_filter_low_hz as i16 as u16));
             let _ = self.cmd_tx.send(Command::SetControl(ControlId::Rx2FilterHigh, self.rx2_filter_high_hz as i16 as u16));
             self.rx2_filter_changed_at = Some(std::time::Instant::now());
             ctx.memory_mut(|mem| { mem.data.remove::<i32>(egui::Id::new("rx2_spectrum_filter_low")); });
         }
         if let Some(hz) = drag_hi {
-            self.rx2_filter_high_hz = hz;
+            if sym {
+                let w = hz.abs();
+                self.rx2_filter_low_hz = -w;
+                self.rx2_filter_high_hz = w;
+            } else {
+                self.rx2_filter_high_hz = hz;
+            }
             let _ = self.cmd_tx.send(Command::SetControl(ControlId::Rx2FilterLow, self.rx2_filter_low_hz as i16 as u16));
-            let _ = self.cmd_tx.send(Command::SetControl(ControlId::Rx2FilterHigh, hz as i16 as u16));
+            let _ = self.cmd_tx.send(Command::SetControl(ControlId::Rx2FilterHigh, self.rx2_filter_high_hz as i16 as u16));
             self.rx2_filter_changed_at = Some(std::time::Instant::now());
             ctx.memory_mut(|mem| { mem.data.remove::<i32>(egui::Id::new("rx2_spectrum_filter_high")); });
         }
@@ -5411,12 +5602,13 @@ impl eframe::App for SdrRemoteApp {
             // Mode buttons (via controls::render_mode_selector — Basic density = 4 modes)
             // Tab::Radio mode-block had voorheen `ui.add(btn)` zonder
             // connected-guard.
+            let ptt_active = self.ptt;
             let mode_action = self.with_rx_ctx(
                 controls::RxChannel::Rx1,
                 controls::UiDensity::Basic,
                 controls::UiSurface::MainTab,
                 |ctx| {
-                    controls::render_mode_selector(ui, ctx).map(|c| {
+                    ui.add_enabled_ui(!ptt_active, |ui| controls::render_mode_selector(ui, ctx)).inner.map(|c| {
                         let intent = controls::UiIntent::SelectMode {
                             channel: controls::RxChannel::Rx1,
                             mode: c.mode,
@@ -5633,6 +5825,7 @@ impl eframe::App for SdrRemoteApp {
                 self.popout_joined_pos,
                 self.popout_joined_size,
                 [900.0, 900.0],
+                Self::viewport_native_ppp(ctx),
                 &mut self.popout_joined_init_applied,
             );
             ctx.show_viewport_immediate(
@@ -5751,6 +5944,7 @@ impl eframe::App for SdrRemoteApp {
                     self.spectrum_popout_pos,
                     self.spectrum_popout_size,
                     [900.0, 600.0],
+                    Self::viewport_native_ppp(ctx),
                     &mut self.spectrum_popout_init_applied,
                 );
                 ctx.show_viewport_immediate(
@@ -5810,6 +6004,7 @@ impl eframe::App for SdrRemoteApp {
                     self.rx2_popout_pos,
                     self.rx2_popout_size,
                     [900.0, 600.0],
+                    Self::viewport_native_ppp(ctx),
                     &mut self.rx2_popout_init_applied,
                 );
                 ctx.show_viewport_immediate(
@@ -5872,6 +6067,7 @@ impl eframe::App for SdrRemoteApp {
                 self.yaesu_popout_pos,
                 self.yaesu_popout_size,
                 [465.0, 335.0],
+                Self::viewport_native_ppp(ctx),
                 &mut self.yaesu_popout_init_applied,
             );
             ctx.show_viewport_immediate(
@@ -5955,6 +6151,7 @@ impl eframe::App for SdrRemoteApp {
                 self.yaesu2_popout_pos,
                 self.yaesu2_popout_size,
                 [465.0, 335.0],
+                Self::viewport_native_ppp(ctx),
                 &mut self.yaesu2_popout_init_applied,
             );
             ctx.show_viewport_immediate(
@@ -6110,6 +6307,7 @@ impl eframe::App for SdrRemoteApp {
                 self.vrx_popout_pos,
                 self.vrx_popout_size,
                 [680.0, 520.0],
+                Self::viewport_native_ppp(ctx),
                 &mut self.vrx_popout_init_applied,
             );
             ctx.show_viewport_immediate(

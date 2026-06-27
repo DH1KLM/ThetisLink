@@ -1,4 +1,4 @@
-﻿# ThetisLink v2.2.0 — Gebruikershandleiding
+﻿# ThetisLink v2.3.0 — Gebruikershandleiding
 
 ## Inhoudsopgave
 
@@ -47,7 +47,7 @@ ThetisLink wordt gedistribueerd als een zip bestand met de volgende inhoud:
 |---------|-------------|
 | `ThetisLink-Server.exe` | Server executable (Windows) |
 | `ThetisLink-Client.exe` | Desktop client executable |
-| `ThetisLink-2.2.0.apk` | Android client app |
+| `ThetisLink-2.3.0.apk` | Android client app |
 | `Installatie.pdf` | Installatiehandleiding (Nederlands) |
 | `User-Manual.pdf` | Gebruikershandleiding (Nederlands, dit document) |
 | `Technische-Referentie.pdf` | Technische referentie (Nederlands) |
@@ -92,7 +92,9 @@ flowchart TB
     Server <--> Yaesu[Yaesu FT-991A<br>COM + USB Audio]
 ```
 
-Alle audio (RX/TX), IQ spectrum data en besturing gaan via één enkele TCI WebSocket verbinding. ThetisLink v2.2.0 gebruikt geen aparte CAT TCP verbinding — TCI dekt alle benodigde commando's, zowel met stock Thetis v2.10.3.15 als met de PA3GHM fork. Geen VB-Cable of andere drivers nodig.
+Alle audio (RX/TX), IQ spectrum data en besturing gaan via één enkele TCI WebSocket verbinding. ThetisLink v2.3.0 gebruikt geen aparte CAT TCP verbinding — TCI dekt alle benodigde commando's, zowel met stock Thetis v2.10.3.15 als met de PA3GHM fork. Geen VB-Cable of andere drivers nodig.
+
+> **Het netwerkpad in beeld:** een geïllustreerde uitleg van hoe audio, spectrum en besturing over het netwerk reizen staat online: **[Het netwerkpad](https://cjenschede.github.io/ThetisLink/Netwerk-uitleg.html)**.
 
 ---
 
@@ -244,6 +246,17 @@ Tijdens TX toont de S-meter een TX-meter met:
 
 De SWR-waarde wordt door Thetis broadcast via TCI tijdens elke TX-burst en is realtime zichtbaar voor alle verbonden clients.
 
+### TX-modulatiebandbreedte (v2.3.0)
+
+In het **Thetis-tabblad** van de desktop-client stel je de **TX-modulatiebandbreedte** van de hoofdradio in. Twee opties:
+
+- **Volg RX-bandbreedte (Follow RX):** de TX-modulatiefilter loopt 1-op-1 mee met het RX-filter. De handmatige velden worden dan uitgegrijsd. Het scherm toont de meelopende band, bijvoorbeeld `TX volgt RX: 0 .. 2800 Hz`.
+- **Onafhankelijk:** zet zelf de onder- en bovengrens (Low/High) van de modulatie.
+
+Het bereik is **0–8 kHz**. De TX-audio loopt op 16 kS/s, dus de modulatie kan tot 8 kHz; staat het RX-filter breder, dan wordt de TX-band op 8 kHz begrensd en meldt het scherm dat (`(RX wider — TX max 8 kHz)`). In de symmetrische modes (AM/SAM/DSB/FM) is het filter rond de draaggolf symmetrisch — sleep je in het spectrum één rand, dan beweegt de andere automatisch mee, net als in Thetis.
+
+> **Tip:** tijdens zenden (PTT actief) worden mode-wijzigingen niet doorgegeven aan Thetis; de mode-knoppen zijn dan uitgegrijsd. Dat voorkomt een desync waarbij Thetis op de oude mode blijft staan terwijl de indicatie de nieuwe toont.
+
 ### Spectrum en waterval
 
 - **Zoom:** verstelbaar, geeft nauwkeuriger frequentieweergave
@@ -298,11 +311,21 @@ Naast de twee fysieke ontvangers (RX1/RX2) biedt ThetisLink vanaf v2.2.0 twee **
 
 **Spectrum, waterval en S-meter:** elke VRX heeft een eigen **hoge-resolutie spectrum + waterval** rond zijn luisterfrequentie en een eigen S-meter. De hoge-resolutie weergave vraag je per VRX aan; de client toont dan een ingezoomd spectrum (met instelbare zoom, referentieniveau, bereik en waterval-contrast).
 
-**Smalle of brede audio:** de VRX-audio gebruikt dezelfde RX-bandbreedte-keuze als de rest van de ontvangst — smalband (8 kHz) of breedband (16 kHz) Opus (zie [RX-bandbreedte](#rx-bandbreedte-smalbreed-v220)).
+**Smalle of brede audio:** de VRX-audio is Opus smalband (8 kHz) of breedband (16 kHz). Vanaf v2.3.0 kies je dit **per VRX** (NB/WB/Auto) — zie [Per-VRX audiobandbreedte](#per-vrx-audiobandbreedte-v230) hieronder.
 
 **Persistentie:** de VRX-instellingen (aan/uit, frequentie, mode en filter) worden bewaard en hersteld bij een nieuwe verbinding.
 
 > **Hoe werkt een VRX precies?** Een geïllustreerde uitleg van de hele VRX-signaalketen — van radiogolf tot geluid — staat online: **[Hoe een VRX werkt](https://cjenschede.github.io/ThetisLink/VRX-uitleg.html)**.
+
+### Synchrone AM (SAM) met carrier-PLL (v2.3.0)
+
+In **SAM**-mode gebruikt een VRX vanaf v2.3.0 een echte synchrone AM-demodulator: een **fase-vergrendelde lus (PLL)** haakt aan op de draaggolf van het AM-station en demoduleert ten opzichte van die teruggewonnen draaggolf. Het resultaat is schonere AM dan de oude pseudo-SAM — ook als je een paar Hz naast de draaggolf staat verdwijnt de fluittoon (beat), en de ontvangst blijft stabiel door selectieve fading heen. De lus vangt de draaggolf binnen een bereik van ongeveer ±3 kHz.
+
+**Auto-afstemmen op de draaggolf:** je kunt SAM laten **meelopen met de draaggolf** — de luisterfrequentie (en je VFO) schuift dan automatisch precies op de draaggolf en blijft die volgen, ook als de zender langzaam wegdrijft. Dit is een keuze per VRX; staat hij uit, dan blijft de frequentie staan waar je hem zet en trekt alleen de PLL de fase recht.
+
+### Per-VRX audiobandbreedte (v2.3.0)
+
+Elke VRX heeft vanaf v2.3.0 een **eigen audiobandbreedte-keuze**: **NB** (smalband, 8 kHz), **WB** (breedband, 16 kHz) of **Auto**. Dit staat los van de globale [RX-bandbreedte](#rx-bandbreedte-smalbreed-v220)-schakelaar, zodat je bijvoorbeeld VRX1 smal en VRX2 breed kunt zetten. In **Auto** schakelt de VRX vanzelf naar breedband zodra je het filter breder dan ongeveer 4 kHz opent, en weer terug naar smalband bij een smaller filter.
 
 ### RX-bandbreedte (smal/breed, v2.2.0)
 
@@ -826,6 +849,7 @@ Als het spectrum (lijn) en de waterval niet synchroon lopen bij het pannen, hers
 
 | Versie | Hoogtepunten |
 |---|---|
+| **2.3.0** | **Synchrone AM (SAM-PLL) + AM auto-tune + instelbare TX-modulatiebandbreedte.** Backwards-compatible met v2.1.x/v2.2.0 — wire-protocol VERSION 3 ongewijzigd; nieuwe packet-/control-types (0x2A/0x2B, control 0x75–0x79) zijn additief en per-client gegate. **SAM** is nu een echte synchrone AM-demodulator (kritisch gedempte carrier-tracking PLL, WDSP `amd.c`-stijl, ±3 kHz vangbereik) i.p.v. pseudo-SAM; **auto-tune-to-carrier** laat de luisterfrequentie/VFO de draaggolf volgen via een twee-traps ruis-robuuste AFC. **Per-VRX audiobandbreedte** NB/WB/Auto, onafhankelijk per kanaal. **Instelbare TX-modulatiebandbreedte** in het desktop Thetis-tabblad (Volg RX of onafhankelijk low/high, 0–8 kHz), met symmetrische filter-mirror in AM/SAM/DSB/FM. Fixes: mode-wissel tijdens PTT niet meer doorgegeven (Thetis-desync-workaround), Follow-RX direct beschikbaar bij verbinden, automatisch terughalen van pop-out-vensters van een losgekoppelde monitor + handmatige "Recenter windows"-knop. Android ongewijzigd (geen VRX). Geen Thetis-fork-wijziging — stock v2.10.3.14+ volstaat. |
 | **2.2.0** | **Virtuele ontvangers (VRX) + tweede Yaesu-radio (FT-991A + FTX-1).** Backward-compatible met v2.1.x — wire-protocol VERSION 3 ongewijzigd; de nieuwe packet-types (0x21–0x29) zijn additief en per-client gegate, dus v2.1.x-clients ontvangen ze nooit. **VRX1/VRX2** virtuele ontvangers uit de brede DDC-stroom via een FFT-channelizer, elk met eigen frequentie, mode (USB/LSB/AM/SAM/FM), filter, high-res spectrum/waterval en S-meter in één gezamenlijk popout-venster; NB/WB Opus-audio; per-bucket frequentiegeheugen + persistentie. **Dual-radio** tweede Yaesu-kanaal met model-autodetect (`ID;` 0670/0840), per-radio audio/CAT/geheugen, `RadioInfo`-paneelnaamgeving, **FTX-1 WIRES-X** EX-menu en een **software-squelch** (alleen FM-familie). **Schakelbare RX-bandbreedte** (Thetis + VRX + Yaesu, alleen ontvangst) en een **`#N` audio-device-index** voor identieke USB-codecs; dynamische WAV-opnamerate. Geïllustreerde VRX-leerboeken online (zie Documentatie). Pair met **Thetis fork PA3GHM TL2-4**; stock Thetis blijft ondersteund. |
 | **2.1.0** | **Yaesu G-1000DXC rotor via MCP2221A, opt-in wideband Thetis RX, Amplitec reconnect, RX2 filter-fixes.** Backwards-compatible met v2.0.4 — wire-protocol ongewijzigd; 2.0.4-clients praten gewoon met 2.1.0-server (en omgekeerd). **Yaesu G-1000DXC rotor-backend** als 3e optie naast EA7HG en PstRotator: directe aansturing via Adafruit MCP2221A breakout (5 V mod), met soft-start/soft-stop ramp (1-200 %/s, default 50%), adaptive ADC poll-rate (30 Hz tijdens beweging / 1 Hz bij stilstand, mediaan-filter tegen 50/100 Hz netvoeding-ripple), kortste-route optie voor rotors met overlap-zone (max_deg > 360°), en kalibratie-wizard (Park CCW / Park CW). **Opt-in wideband Thetis RX** via fork-extensie — breekt geen stock-Thetis pad. **Amplitec 6/2 reconnect** na power-cycle + venster verschijnt ook bij offline-start (was: venster bleef onzichtbaar tot server-restart). **RX2 mode-switch filter-restore** (modulation-handler honoreert server filter-update bij modus-wissel) + per-channel filter-edge drag (RX1/RX2 drag-state gescheiden). **Yaesu EQ profile mic-gain persistence** (mic-slider wordt mee opgeslagen met band/treble); **scherpere TX resampler anti-alias filter**. **Modulaire multi-tuner wizard** met per-slot Add/Rename/Delete, classificatie-scan, inklapbaar MCP2221A-blok. **Status-paneel scroll-stabiliteit** (snapshot-cache bij lock-contentie; MCP2221A uitgeklapte sectie springt niet meer terug omhoog). UI-polish: chevron-labels op alle collapsible toggles, Settings-tab ScrollArea, Amplitec antenne-rename via right-click. Pair met **Thetis fork PA3GHM TL2-4** voor de volledige feature-set; stock Thetis blijft ondersteund. |
 | **2.0.4** | **Bandbreedte-toolkit, preventieve TX-inhibit, power-cap, PstRotator.** Backwards-compatible met v2.0.3 — wire-protocol uitsluitend additief. **Preventieve RX-only TX-inhibit** via nieuw `rx_only_ex` TCI-commando (vereist Thetis-fork PA3GHM TL2-3): MOX/spatiebalk/hardware-PTT/VOX worden aan de bron geweigerd op een RX-only Amplitec-positie, niet reactief teruggeflipt; stock Thetis valt terug op de reactieve `ZZTX0` catch-all. **Reactieve RF-power cap per positie** met PA-eigen DriveDown (SPE + RF2K-S), mode-multipliers (SSB/CW × 1.0, AM × 0.5, FM/DIG × 0.4); rate-limit 1 s/stap — korte CW-bursts (<1 s) kunnen de reactieve cap passeren, preventieve dekking bestaat alleen op RX-only posities. **PstRotator UDP/XML rotor-backend** (host = numeriek IP-adres, geen DNS). **Server-tab bandbreedte-monitor** (Down/Up Kbit/s, klikbaar voor per-stream breakdown) — telt UDP application-payload bytes (de Windows-netwerkmeter leest ~1,5-2× hoger door IP/UDP/Ethernet-headers). **Per-client DX-spots opt-out** (Desktop + Android Settings), met server-side dedup (~90 Kbit/s broadcast storm → ~6 Kbit/s). **WebSDR favorites edit-toggle**. Server-log cleanup (PowerCap state-change-only + DXC reconnect 1-regel-per-cycle). |

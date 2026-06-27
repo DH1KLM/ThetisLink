@@ -133,6 +133,19 @@ pub enum PacketType {
     /// Apart packet zodat de byte-identieke slot-0 YaesuState ongemoeid blijft
     /// (B-prime); oude clients negeren dit onbekende type.
     RadioInfo = 0x29,
+    /// VRX gevolgde draaggolf-frequentie (server → client) — SAM auto-tune.
+    /// Layout als VrxFrequencyPacket: header(4) + vrx_id(1) + frequency_hz(8)
+    /// = 13 bytes. Gestuurd (throttled, ≥~10 Hz delta) wanneer auto-tune aan
+    /// staat en de PLL de draaggolf volgt, zodat de client-VFO meeloopt.
+    /// Per-client gated op VrxSamAutoTune(2); oude clients abonneren nooit.
+    FrequencyVrxActual = 0x2A,
+    /// Huidige TX-modulatiefilterband (server → client) — PATCH-tx-modulation-
+    /// bandwidth. Layout: header(4) + low_hz(i32) + high_hz(i32) = 12 bytes.
+    /// Gestuurd zodra Thetis een tx_filter_band_ex meldt; de client toont de
+    /// actuele waarde en weet daardoor dat instellen wordt ondersteund. Oude
+    /// clients verwerken dit type niet — een onbekend packet-type is nonfatal
+    /// (ze loggen het hooguit als "unknown packet type" en lopen door).
+    TxFilterBand = 0x2B,
 }
 
 impl PacketType {
@@ -414,6 +427,25 @@ pub enum ControlId {
     VrxSpectrumSpanKhz = 0x73,
     /// VRX2 high-res spectrum span in kHz (client → server).
     VrxSpectrumSpanKhz2 = 0x74,
+
+    // ── Wide / synchronous-AM VRX-UX (PATCH-vrx-wide-sam-ux) ──
+    /// VRX audio-rate mode (client → server, 0=NB/8k, 1=WB/16k, 2=Auto).
+    /// Eén control voor VRX1+VRX2. In Auto kiest de server per VRX de rate
+    /// op basis van de filterbreedte (≥4 kHz audio-BW → 16k). De client
+    /// leest de werkelijke rate uit de AUDIO_WIDEBAND-flag per pakket.
+    VrxAudioRate = 0x75,
+    /// VRX1 SAM auto-tune-to-carrier enable (client → server, 0/1). Alleen
+    /// actief in SAM: bij lock volgt de luisterfrequentie de draaggolf.
+    VrxSamAutoTune = 0x76,
+    /// VRX2 SAM auto-tune-to-carrier enable (client → server, 0/1).
+    VrxSamAutoTune2 = 0x77,
+
+    // ── TX-modulatiebandbreedte (PATCH-tx-modulation-bandwidth) ──
+    /// TX-filter laagrand (client → server, signed Hz als u16). Server zet het
+    /// via tx_filter_band_ex (stock v2.10.3.14+ / fork). Hoofdradio-TX, niet VRX.
+    TxFilterLow = 0x78,
+    /// TX-filter hoogrand (client → server, signed Hz als u16).
+    TxFilterHigh = 0x79,
 
     // ── Dual-radio slot 1 (PATCH-dual-radio-991a-ftx1, Optie B-prime) ──
     // 1:1 spiegel van de slot-0 Yaesu-controls (0x20-0x2F) op de vrije range
@@ -715,7 +747,14 @@ impl VrxFrequencyPacket {
     pub const SIZE: usize = Header::SIZE + 1 + 8; // 13 bytes
 
     pub fn serialize(&self, buf: &mut [u8; Self::SIZE]) {
-        let header = Header::new(PacketType::FrequencyVrx, Flags::NONE);
+        self.serialize_with_type(PacketType::FrequencyVrx, buf);
+    }
+
+    /// Serialize with an explicit packet type — `FrequencyVrx` (client →
+    /// server tune) or `FrequencyVrxActual` (server → client SAM auto-tune
+    /// follow). Identical 13-byte layout.
+    pub fn serialize_with_type(&self, packet_type: PacketType, buf: &mut [u8; Self::SIZE]) {
+        let header = Header::new(packet_type, Flags::NONE);
         header.serialize(buf);
         buf[4] = self.vrx_id;
         buf[5..13].copy_from_slice(&self.frequency_hz.to_be_bytes());
@@ -723,8 +762,10 @@ impl VrxFrequencyPacket {
 
     pub fn deserialize(buf: &[u8]) -> Result<Self> {
         let header = Header::deserialize(buf)?;
-        if header.packet_type != PacketType::FrequencyVrx {
-            bail!("expected FrequencyVrx packet, got {:?}", header.packet_type);
+        if header.packet_type != PacketType::FrequencyVrx
+            && header.packet_type != PacketType::FrequencyVrxActual
+        {
+            bail!("expected FrequencyVrx(Actual) packet, got {:?}", header.packet_type);
         }
         if buf.len() < Self::SIZE {
             bail!("vrx frequency packet too short: {} < {}", buf.len(), Self::SIZE);
@@ -732,6 +773,34 @@ impl VrxFrequencyPacket {
         let vrx_id = buf[4];
         let frequency_hz = u64::from_be_bytes(buf[5..13].try_into().unwrap());
         Ok(Self { vrx_id, frequency_hz })
+    }
+}
+
+/// TX modulation filter band (server → client). Layout:
+///   header(4) + low_hz(i32) + high_hz(i32) = 12 bytes
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TxFilterBandPacket {
+    pub low_hz: i32,
+    pub high_hz: i32,
+}
+
+impl TxFilterBandPacket {
+    pub const SIZE: usize = Header::SIZE + 4 + 4; // 12 bytes
+
+    pub fn serialize(&self, buf: &mut [u8; Self::SIZE]) {
+        let header = Header::new(PacketType::TxFilterBand, Flags::NONE);
+        header.serialize(buf);
+        buf[4..8].copy_from_slice(&self.low_hz.to_be_bytes());
+        buf[8..12].copy_from_slice(&self.high_hz.to_be_bytes());
+    }
+
+    pub fn deserialize(buf: &[u8]) -> Result<Self> {
+        if buf.len() < Self::SIZE {
+            bail!("tx filter band packet too short: {} < {}", buf.len(), Self::SIZE);
+        }
+        let low_hz = i32::from_be_bytes(buf[4..8].try_into().unwrap());
+        let high_hz = i32::from_be_bytes(buf[8..12].try_into().unwrap());
+        Ok(Self { low_hz, high_hz })
     }
 }
 
@@ -1808,6 +1877,8 @@ pub enum Packet {
     TotpResponse(String),       // 6-digit TOTP code
     AudioVrx(VrxAudioPacket),
     FrequencyVrx(VrxFrequencyPacket),
+    FrequencyVrxActual(VrxFrequencyPacket),
+    TxFilterBand(TxFilterBandPacket),
 }
 
 /// AuthResult codes
@@ -1851,6 +1922,8 @@ impl Packet {
             PacketType::AudioBinR => Ok(Packet::AudioBinR(AudioPacket::deserialize(buf)?)),
             PacketType::AudioVrx => Ok(Packet::AudioVrx(VrxAudioPacket::deserialize(buf)?)),
             PacketType::FrequencyVrx => Ok(Packet::FrequencyVrx(VrxFrequencyPacket::deserialize(buf)?)),
+            PacketType::FrequencyVrxActual => Ok(Packet::FrequencyVrxActual(VrxFrequencyPacket::deserialize(buf)?)),
+            PacketType::TxFilterBand => Ok(Packet::TxFilterBand(TxFilterBandPacket::deserialize(buf)?)),
             PacketType::AudioMultiCh => Ok(Packet::AudioMultiCh(MultiChannelAudioPacket::deserialize(buf)?)),
             PacketType::YaesuState => Ok(Packet::YaesuState(YaesuStatePacket::deserialize(buf)?)),
             PacketType::FrequencyYaesu => Ok(Packet::FrequencyYaesu(FrequencyPacket::deserialize(buf)?)),

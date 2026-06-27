@@ -215,6 +215,16 @@ pub(crate) fn calc_filter_edges(mode: u8, filter_low: i32, filter_high: i32, new
     }
 }
 
+/// True for modes whose filter is symmetric around the carrier — AM, SAM, DSB,
+/// FM, DRM. Main-RX DSPMode numbering: LSB=0, USB=1, DSB=2, CWL=3, CWU=4,
+/// FM=5, AM=6, DIGU=7, SPEC=8, DIGL=9, SAM=10, DRM=11. One-sided modes (SSB,
+/// CW, DIG) and SPEC are NOT symmetric. Used to mirror a single dragged filter
+/// edge to both sides so the spectrum matches Thetis, which forces symmetry in
+/// these modes (it adopts the wider edge for both sides).
+pub(crate) fn is_symmetric_mode(mode: u8) -> bool {
+    !matches!(mode, 0 | 1 | 3 | 4 | 7 | 8 | 9)
+}
+
 /// Get current time as HH:MM:SS string
 pub(crate) fn chrono_time() -> String {
     let now = std::time::SystemTime::now()

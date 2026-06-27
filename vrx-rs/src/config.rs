@@ -12,8 +12,10 @@ pub const AUDIO_BIN_HZ: f32 = 62.5;
 ///
 /// SSB modes (Usb/Lsb) extract a single sideband and emit Re(z).
 /// AM-family modes (Am/Sam) extract both sidebands and demodulate
-/// either by envelope (Am) or coherent in-phase (Sam, assumes user
-/// is tuned on carrier — no PLL tracking yet).
+/// either by envelope (Am) or by a carrier-tracking PLL (Sam —
+/// synchronous AM, mirroring Thetis/WDSP amd.c: a 2nd-order loop
+/// (ζ=1.0, ωN=250 rad/s, ±3 kHz capture) locks the carrier to the real
+/// axis and the in-phase component is the recovered audio).
 /// Fm extracts both sidebands and emits the phase derivative
 /// between successive complex baseband samples.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -34,6 +36,63 @@ impl VrxMode {
             "sam" => Some(VrxMode::Sam),
             "fm" => Some(VrxMode::Fm),
             _ => None,
+        }
+    }
+}
+
+/// VRX audio-rate selection (one setting for all VRX; in `Auto` each VRX
+/// resolves independently from its own filter width). Decoupled from the
+/// global Thetis-wideband toggle (PATCH-vrx-wide-sam-ux).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum VrxRateMode {
+    /// Force narrowband (8 kHz, audio ~4 kHz).
+    Nb,
+    /// Force wideband (16 kHz, audio ~8 kHz).
+    Wb,
+    /// Auto: wideband when the audio bandwidth needs it, else narrowband.
+    Auto,
+}
+
+impl VrxRateMode {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => VrxRateMode::Wb,
+            2 => VrxRateMode::Auto,
+            _ => VrxRateMode::Nb,
+        }
+    }
+}
+
+/// Audio bandwidth (Hz) at/above which `Auto` selects wideband. NB output
+/// (8 kHz) carries audio up to its 4 kHz Nyquist, so a filter that needs
+/// ≥4 kHz audio bandwidth requires WB. Owner-chosen clean 4 kHz boundary.
+pub const AUTO_WB_THRESHOLD_HZ: i32 = 4000;
+
+/// Hysteresis band (Hz) below the threshold at which `Auto` drops back to
+/// narrowband — avoids rebuild-thrash while dragging the filter near 4 kHz.
+pub const AUTO_WB_HYSTERESIS_HZ: i32 = 250;
+
+/// Single source of truth: does this rate-mode + filter want wideband, given
+/// the current rate? For `Auto`, the audio bandwidth is the larger filter-edge
+/// magnitude (= hi-edge for SSB, the half-bandwidth for AM/SAM/FM); it
+/// switches up at `AUTO_WB_THRESHOLD_HZ` and back down `AUTO_WB_HYSTERESIS_HZ`
+/// below it (pass the current wideband state for the hysteresis).
+pub fn rate_mode_wants_wideband(
+    mode: VrxRateMode,
+    filter_low_hz: i32,
+    filter_high_hz: i32,
+    current_wb: bool,
+) -> bool {
+    match mode {
+        VrxRateMode::Nb => false,
+        VrxRateMode::Wb => true,
+        VrxRateMode::Auto => {
+            let bw = filter_low_hz.abs().max(filter_high_hz.abs());
+            if current_wb {
+                bw >= AUTO_WB_THRESHOLD_HZ - AUTO_WB_HYSTERESIS_HZ
+            } else {
+                bw >= AUTO_WB_THRESHOLD_HZ
+            }
         }
     }
 }
@@ -92,6 +151,12 @@ pub struct VrxControlState {
     /// both negative (-3000..=0).
     pub filter_low_hz: i32,
     pub filter_high_hz: i32,
+    /// SAM auto-tune-to-carrier (PATCH-vrx-wide-sam-ux). When true AND the
+    /// mode is SAM AND the PLL is locked, the runtime nudges the listen
+    /// frequency onto the detected carrier (continuous follow) and reports
+    /// the new frequency so the client VFO tracks it. Default off; ignored
+    /// outside SAM.
+    pub sam_auto_tune: bool,
 }
 
 impl Default for VrxControlState {
@@ -103,6 +168,7 @@ impl Default for VrxControlState {
             volume: 1.0,
             filter_low_hz: 0,
             filter_high_hz: 3000,
+            sam_auto_tune: false,
         }
     }
 }

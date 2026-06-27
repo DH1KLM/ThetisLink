@@ -114,6 +114,14 @@ pub enum Command {
     SetVrx2Mode(u8),
     SetVrx2Frequency(u64),
     SetVrx2Volume(f32),
+    // VRX wide / synchronous-AM UX (PATCH-vrx-wide-sam-ux)
+    /// VRX audio-rate mode: 0=NB, 1=WB, 2=Auto. One setting for both VRX.
+    SetVrxRateMode(u8),
+    /// (vrx_id 0|1, on) — SAM auto-tune-to-carrier per VRX.
+    SetVrxAutoTune(u8, bool),
+    /// TX modulation filter band (low_hz, high_hz) — PATCH-tx-modulation-bandwidth.
+    /// Main-radio TX, not VRX. Server applies via tx_filter_band_ex.
+    SetTxFilter(i32, i32),
     WriteYaesuMemories(String), // tab-separated text to write to radio
     WriteYaesu2Memories(String), // idem radio 2 (Fase B)
     SetYaesuTxGain(f32),

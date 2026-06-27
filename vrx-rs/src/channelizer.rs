@@ -118,6 +118,32 @@ pub struct VrxChannelizer {
     agc_decay_alpha: f32,
     agc_target: f32,
     agc_max_gain: f32,
+
+    // SAM carrier-recovery PLL (2nd-order, mirrors Thetis/WDSP amd.c
+    // mode 1). Only used in VrxMode::Sam. Tracks the carrier offset left
+    // after the residual NCO and pins the carrier to the real axis so the
+    // in-phase component is the recovered audio (synchronous AM).
+    pll_phs: f32,       // VCO phase (radians, kept in [0, 2π))
+    pll_omega: f32,     // loop-filter frequency estimate / integrator (rad/sample)
+    pll_fil_out: f32,   // last loop-filter output (instantaneous freq, rad/sample)
+    pll_g1: f32,        // proportional gain (WDSP g1)
+    pll_g2: f32,        // integral gain (WDSP g2)
+    pll_omega_min: f32, // integrator lower clamp (rad/sample) = -capture range
+    pll_omega_max: f32, // integrator upper clamp (rad/sample) = +capture range
+
+    // SAM lock detector + unlock-decay (PATCH-vrx-wide-sam-ux). The lock
+    // metric (in-phase vs quadrature power, amplitude-normalised) gates the
+    // host's auto-tune AFC; the carrier-present reference drives an
+    // unlock-decay that leaks the integrator back to 0 in a deep fade so
+    // re-acquisition restarts from centre (the wider ±3 kHz clamp would
+    // otherwise leave it wandered). First-cut design — see patch brief §5.2.
+    pll_lock_pi: f32,      // ema of in-phase power Re(z_d)²
+    pll_lock_pq: f32,      // ema of quadrature power Im(z_d)²
+    pll_mag_peak: f32,     // slow-decaying peak of total power (carrier-present ref)
+    pll_locked: bool,      // lock state (hysteresis on pi/pq ratio)
+    pll_lock_alpha: f32,   // ema coefficient for pi/pq (~50 ms)
+    pll_peak_decay: f32,   // per-sample decay of mag_peak (~3 s)
+    pll_unlock_decay: f32, // per-sample decay of pll_omega when carrier absent (~0.5 s)
 }
 
 impl VrxChannelizer {
@@ -161,6 +187,32 @@ impl VrxChannelizer {
             -std::f32::consts::TAU * residual_hz / output_rate_hz as f32;
         let nco_rotor = Complex32::from_polar(1.0, theta_per_sample);
 
+        // SAM carrier-recovery PLL coefficients — mirrors Thetis/WDSP
+        // amd.c (Warren Pratt, GPL-2.0): ζ = 1.0, ωN = 250 rad/s, scaled
+        // to the output rate. g1 = proportional, g2 = integral gain.
+        // Capture/hold range ±3 kHz (Thetis uses ±2 kHz; widened to ±3 kHz
+        // so the loop locks across a typical ≥6 kHz AM channel).
+        let pll_zeta = 1.0_f32;
+        let pll_omega_n = 250.0_f32; // rad/s
+        let fs = output_rate_hz as f32;
+        let pll_g1 = 1.0 - (-2.0 * pll_omega_n * pll_zeta / fs).exp();
+        let pll_g2 = -pll_g1
+            + 2.0
+                * (1.0
+                    - (-pll_omega_n * pll_zeta / fs).exp()
+                        * (pll_omega_n / fs * (1.0 - pll_zeta * pll_zeta).sqrt()).cos());
+        let pll_omega_max = std::f32::consts::TAU * 3000.0 / fs;
+        let pll_omega_min = -pll_omega_max;
+
+        // Lock-detector / unlock-decay time constants (scaled to rate).
+        let pll_lock_alpha = 1.0 - (-1.0 / (fs * 0.05)).exp(); // ~50 ms ema
+        // Slow peak-hold (~30 s) for the carrier-present reference: keeps the
+        // "what a carrier looks like" level long after a station drops, so a
+        // deep fade reads as carrier-absent (→ unlock-decay) rather than the
+        // peak adapting down to the noise floor within seconds.
+        let pll_peak_decay = (-1.0 / (fs * 30.0)).exp();
+        let pll_unlock_decay = (-1.0 / (fs * 0.5)).exp(); // ~0.5 s integrator leak
+
         Self {
             config,
             input_rate_hz,
@@ -191,6 +243,20 @@ impl VrxChannelizer {
             agc_decay_alpha,
             agc_target: 0.5,
             agc_max_gain: 100_000.0,
+            pll_phs: 0.0,
+            pll_omega: 0.0,
+            pll_fil_out: 0.0,
+            pll_g1,
+            pll_g2,
+            pll_omega_min,
+            pll_omega_max,
+            pll_lock_pi: 0.0,
+            pll_lock_pq: 0.0,
+            pll_mag_peak: 0.0,
+            pll_locked: false,
+            pll_lock_alpha,
+            pll_peak_decay,
+            pll_unlock_decay,
         }
     }
 
@@ -204,6 +270,32 @@ impl VrxChannelizer {
 
     pub fn config(&self) -> &VrxConfig {
         &self.config
+    }
+
+    /// Tracked SAM carrier offset in Hz (the loop's smoothed frequency
+    /// estimate, i.e. the integrator — not the jittery instantaneous
+    /// output). Meaningful only in `VrxMode::Sam` once locked; used by an
+    /// external AFC ("auto-tune to carrier") to re-centre the tuning.
+    pub fn sam_carrier_offset_hz(&self) -> f32 {
+        self.pll_omega * self.output_rate_hz as f32 / std::f32::consts::TAU
+    }
+
+    /// SAM lock state (in-phase power dominates quadrature, with
+    /// hysteresis). The host's auto-tune AFC only nudges the tuning while
+    /// this is true, so it never snaps to noise.
+    pub fn is_locked(&self) -> bool {
+        self.pll_locked
+    }
+
+    /// AFC handoff: after the host has moved the tuning (carrier offset) by
+    /// `applied_hz` toward the carrier, remove that amount from the PLL's
+    /// frequency estimate so the loop doesn't re-accumulate it. Net
+    /// frequency is unchanged; responsibility shifts from PLL to tuning,
+    /// which drives the residual (and thus the loop) to ~0.
+    pub fn apply_afc_handoff(&mut self, applied_hz: f32) {
+        let d = std::f32::consts::TAU * applied_hz / self.output_rate_hz as f32;
+        self.pll_omega =
+            (self.pll_omega - d).clamp(self.pll_omega_min, self.pll_omega_max);
     }
 
     /// Sample rate this channelizer was constructed for. Callers use
@@ -340,11 +432,72 @@ impl VrxChannelizer {
                         mag - self.am_dc_filter
                     }
                     VrxMode::Sam => {
-                        // Coherent product-detector: in-phase component of
-                        // carrier-aligned baseband. Subtract the same DC
-                        // tracker so the carrier doesn't dominate the AGC.
-                        self.am_dc_filter = 0.999 * self.am_dc_filter + 0.001 * z.re;
-                        z.re - self.am_dc_filter
+                        // Synchronous AM — mirrors Thetis/WDSP amd.c mode 1
+                        // (both-sideband): a 2nd-order PLL locks the carrier
+                        // to the real axis; the in-phase component is the
+                        // recovered audio. Removes the beat that plain Re(z)
+                        // shows on a mistuned carrier, and (with the ±3 kHz
+                        // integrator clamp) pulls in across a wide offset.
+                        let (sin_p, cos_p) = self.pll_phs.sin_cos();
+                        // Derotate: z_d = z · e^{-jθ}.
+                        let zd_re = z.re * cos_p + z.im * sin_p;
+                        let zd_im = z.im * cos_p - z.re * sin_p;
+                        // Phase detector. atan2 gives the true carrier phase
+                        // error; for AM-with-carrier Re(z_d) ≥ 0 at lock so
+                        // there is no Costas sign ambiguity — a plain PLL (not
+                        // Costas) is the correct choice vs suppressed carrier.
+                        let det = if zd_re == 0.0 && zd_im == 0.0 {
+                            0.0
+                        } else {
+                            zd_im.atan2(zd_re)
+                        };
+                        // Lock detector (amplitude-normalised): at lock the
+                        // in-phase power dominates the quadrature power. The
+                        // slow peak of total power is a "carrier-present"
+                        // reference — during pull-in the carrier is present
+                        // (total ≈ peak) so the unlock-decay does NOT fire and
+                        // a genuine wide-offset acquisition is preserved.
+                        let pi_p = zd_re * zd_re;
+                        let pq_p = zd_im * zd_im;
+                        self.pll_lock_pi += self.pll_lock_alpha * (pi_p - self.pll_lock_pi);
+                        self.pll_lock_pq += self.pll_lock_alpha * (pq_p - self.pll_lock_pq);
+                        let total = self.pll_lock_pi + self.pll_lock_pq;
+                        self.pll_mag_peak = total.max(self.pll_mag_peak * self.pll_peak_decay);
+                        if self.pll_locked {
+                            if self.pll_lock_pi < 1.5 * self.pll_lock_pq {
+                                self.pll_locked = false;
+                            }
+                        } else if self.pll_lock_pi > 3.0 * self.pll_lock_pq {
+                            self.pll_locked = true;
+                        }
+                        let carrier_present = total > 0.1 * self.pll_mag_peak;
+                        // Loop filter (PI) with a one-sample delay on the phase
+                        // update, exactly as WDSP. Integrator clamped to the
+                        // ±3 kHz capture/hold range.
+                        let del_out = self.pll_fil_out;
+                        self.pll_omega = (self.pll_omega + self.pll_g2 * det)
+                            .clamp(self.pll_omega_min, self.pll_omega_max);
+                        // Unlock-decay: in a deep fade / empty channel let the
+                        // integrator leak back toward 0 so re-acquisition after
+                        // the carrier returns restarts from centre instead of a
+                        // wandered ±3 kHz offset.
+                        if !carrier_present {
+                            self.pll_omega *= self.pll_unlock_decay;
+                        }
+                        self.pll_fil_out = self.pll_g1 * det + self.pll_omega;
+                        self.pll_phs += del_out;
+                        // Wrap into [0, 2π). A `while` (not a single test) keeps
+                        // this correct even when the step approaches the clamp.
+                        while self.pll_phs >= std::f32::consts::TAU {
+                            self.pll_phs -= std::f32::consts::TAU;
+                        }
+                        while self.pll_phs < 0.0 {
+                            self.pll_phs += std::f32::consts::TAU;
+                        }
+                        // Same slow DC tracker as AM so the recovered carrier
+                        // doesn't bias the AGC.
+                        self.am_dc_filter = 0.999 * self.am_dc_filter + 0.001 * zd_re;
+                        zd_re - self.am_dc_filter
                     }
                     VrxMode::Fm => {
                         // FM discriminator: phase difference between
@@ -374,5 +527,130 @@ impl VrxChannelizer {
         }
 
         audio_out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SAM mode must lock its carrier-recovery PLL onto a residual
+    /// frequency offset (operator a few Hz off the true carrier). After
+    /// the residual NCO, a pure tone at `carrier + Δf` sits at exactly
+    /// `Δf` in the baseband, so the loop's frequency estimate must
+    /// converge to `2π·Δf / output_rate` (rad/sample).
+    #[test]
+    fn sam_pll_locks_to_residual_carrier_offset() {
+        let input_rate = 48_000u32;
+        let output_rate = 8_000u32;
+        let carrier = 5_000.0f32;
+        let mistune_hz = 3.0f64; // a few Hz of operator mistuning
+
+        let config = VrxConfig {
+            carrier_offset_hz: carrier,
+            mode: VrxMode::Sam,
+            filter_lo_bins: 0,
+            filter_hi_bins: 48,
+        };
+        let mut ch =
+            VrxChannelizer::new_with_output_rate(config, input_rate, output_rate);
+
+        // Pure carrier at (carrier + mistune) Hz. f64 phase accumulation
+        // keeps the long tone numerically clean before casting to f32.
+        let f = carrier as f64 + mistune_hz;
+        let fs = input_rate as f64;
+        let n_total = input_rate as usize; // ~1 s — ample time to lock
+        let mut iq = Vec::with_capacity(n_total);
+        for n in 0..n_total {
+            let ph = std::f64::consts::TAU * f * (n as f64) / fs;
+            iq.push((ph.cos() as f32, ph.sin() as f32));
+        }
+        for chunk in iq.chunks(2048) {
+            let _ = ch.push_iq(chunk);
+        }
+
+        let expected =
+            std::f32::consts::TAU * mistune_hz as f32 / output_rate as f32;
+        let got = ch.pll_omega; // integrator converges to the freq offset
+        assert!(
+            got > 0.0 && (got - expected).abs() < 0.2 * expected,
+            "PLL did not lock: got {got}, expected ≈ {expected}"
+        );
+    }
+
+    fn sam_channelizer(carrier: f32) -> VrxChannelizer {
+        VrxChannelizer::new_with_output_rate(
+            VrxConfig { carrier_offset_hz: carrier, mode: VrxMode::Sam, filter_lo_bins: 0, filter_hi_bins: 48 },
+            48_000,
+            8_000,
+        )
+    }
+
+    /// A clean on-frequency carrier must drive the lock detector to locked
+    /// (in-phase power dominates quadrature) with a near-zero offset estimate.
+    #[test]
+    fn sam_lock_detector_locks_on_clean_carrier() {
+        let carrier = 5_000.0f32;
+        let mut ch = sam_channelizer(carrier);
+        let fs = 48_000f64;
+        let mut iq = Vec::with_capacity(48_000);
+        for n in 0..48_000usize {
+            let ph = std::f64::consts::TAU * carrier as f64 * (n as f64) / fs;
+            iq.push((ph.cos() as f32, ph.sin() as f32));
+        }
+        for chunk in iq.chunks(2048) {
+            let _ = ch.push_iq(chunk);
+        }
+        assert!(ch.is_locked(), "lock detector did not lock on a clean carrier");
+        assert!(
+            ch.sam_carrier_offset_hz().abs() < 5.0,
+            "on-frequency carrier should give ~0 Hz offset, got {}",
+            ch.sam_carrier_offset_hz()
+        );
+    }
+
+    /// Deterministic noise (no carrier) must NOT false-lock: with no coherent
+    /// carrier the in-phase and quadrature powers stay comparable.
+    #[test]
+    fn sam_lock_detector_rejects_noise() {
+        let mut ch = sam_channelizer(5_000.0);
+        // Simple deterministic LCG → pseudo-random complex samples in [-1,1].
+        let mut seed: u32 = 0x1234_5678;
+        let mut next = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / 8_388_608.0 - 1.0
+        };
+        let mut iq = Vec::with_capacity(48_000);
+        for _ in 0..48_000usize {
+            iq.push((next(), next()));
+        }
+        for chunk in iq.chunks(2048) {
+            let _ = ch.push_iq(chunk);
+        }
+        assert!(!ch.is_locked(), "lock detector false-locked on noise");
+    }
+
+    /// The AFC handoff must be net-zero: after the host moves the tuning by
+    /// `applied_hz`, subtracting the same amount from the loop estimate drives
+    /// the residual to ~0 — and with the correct sign/scale.
+    #[test]
+    fn afc_handoff_is_net_zero_and_signed() {
+        let mut ch = sam_channelizer(5_000.0);
+        let fs = ch.output_rate_hz as f32;
+        // Seed the integrator with a known +100 Hz offset; handoff of +100 Hz
+        // must cancel it to ~0.
+        ch.pll_omega = std::f32::consts::TAU * 100.0 / fs;
+        ch.apply_afc_handoff(100.0);
+        assert!(ch.pll_omega.abs() < 1e-6, "handoff not net-zero: {}", ch.pll_omega);
+        // Sign/scale: handoff of +50 Hz from 0 → -(2π·50/fs).
+        ch.pll_omega = 0.0;
+        ch.apply_afc_handoff(50.0);
+        let expected = -std::f32::consts::TAU * 50.0 / fs;
+        assert!(
+            (ch.pll_omega - expected).abs() < 1e-6,
+            "wrong sign/scale: {} vs {}",
+            ch.pll_omega,
+            expected
+        );
     }
 }

@@ -1608,6 +1608,23 @@ impl ClientEngine {
                     Command::SetVrx2Volume(v) => {
                         vrx2_volume = v.max(0.0);
                     }
+                    Command::SetVrxRateMode(mode) => {
+                        if let Some(ref addr) = server_addr {
+                            let ctrl = ControlPacket { control_id: ControlId::VrxAudioRate, value: mode as u16 };
+                            let mut buf = [0u8; ControlPacket::SIZE];
+                            ctrl.serialize(&mut buf);
+                            let _ = send_tx!(&buf, addr.as_str());
+                        }
+                    }
+                    Command::SetVrxAutoTune(vrx_id, on) => {
+                        if let Some(ref addr) = server_addr {
+                            let id = if vrx_id == 0 { ControlId::VrxSamAutoTune } else { ControlId::VrxSamAutoTune2 };
+                            let ctrl = ControlPacket { control_id: id, value: on as u16 };
+                            let mut buf = [0u8; ControlPacket::SIZE];
+                            ctrl.serialize(&mut buf);
+                            let _ = send_tx!(&buf, addr.as_str());
+                        }
+                    }
                     Command::SetVrxFilter(vrx_id, low_hz, high_hz) => {
                         if let Some(ref addr) = server_addr {
                             let (lo_id, hi_id) = if vrx_id == 0 {
@@ -1617,6 +1634,17 @@ impl ClientEngine {
                             };
                             let lo_pkt = ControlPacket { control_id: lo_id, value: low_hz as i16 as u16 };
                             let hi_pkt = ControlPacket { control_id: hi_id, value: high_hz as i16 as u16 };
+                            let mut buf = [0u8; ControlPacket::SIZE];
+                            lo_pkt.serialize(&mut buf);
+                            let _ = send_tx!(&buf, addr.as_str());
+                            hi_pkt.serialize(&mut buf);
+                            let _ = send_tx!(&buf, addr.as_str());
+                        }
+                    }
+                    Command::SetTxFilter(low_hz, high_hz) => {
+                        if let Some(ref addr) = server_addr {
+                            let lo_pkt = ControlPacket { control_id: ControlId::TxFilterLow, value: low_hz as i16 as u16 };
+                            let hi_pkt = ControlPacket { control_id: ControlId::TxFilterHigh, value: high_hz as i16 as u16 };
                             let mut buf = [0u8; ControlPacket::SIZE];
                             lo_pkt.serialize(&mut buf);
                             let _ = send_tx!(&buf, addr.as_str());
@@ -2376,6 +2404,13 @@ impl ClientEngine {
                                 | ControlId::Yaesu2RfGain | ControlId::Yaesu2RadioMicGain
                                 | ControlId::Yaesu2RfPower | ControlId::Yaesu2Button
                                 | ControlId::Yaesu2ReadMenus | ControlId::Yaesu2SetMenu => {}
+                                // VRX wide / synchronous-AM UX: client→server only.
+                                ControlId::VrxAudioRate
+                                | ControlId::VrxSamAutoTune
+                                | ControlId::VrxSamAutoTune2 => {}
+                                // TX modulation filter: client→server only (the
+                                // server pushes the current value via TxFilterBand).
+                                ControlId::TxFilterLow | ControlId::TxFilterHigh => {}
                             }
                         }
                         Ok(Packet::EquipmentStatus(eq)) => {
@@ -2613,6 +2648,22 @@ impl ClientEngine {
                         }
                         Ok(Packet::FrequencyYaesu(_)) => {} // clientâ†’server only
                         Ok(Packet::FrequencyVrx(_)) => {} // client→server only
+                        Ok(Packet::FrequencyVrxActual(pkt)) => {
+                            // SAM auto-tune: server is following the carrier.
+                            // Record the latest freq; the UI moves the VFO.
+                            if pkt.vrx_id == 0 {
+                                state.vrx1_autotune_freq_hz = pkt.frequency_hz;
+                            } else {
+                                state.vrx2_autotune_freq_hz = pkt.frequency_hz;
+                            }
+                        }
+                        Ok(Packet::TxFilterBand(pkt)) => {
+                            // Server reports the current TX modulation filter band;
+                            // its presence means setting it is supported.
+                            state.tx_filter_low_hz = pkt.low_hz;
+                            state.tx_filter_high_hz = pkt.high_hz;
+                            state.tx_filter_supported = true;
+                        }
                         Ok(Packet::AudioVrx(pkt)) => {
                             // Route on pkt.vrx_id: 0 → VRX1 jitter buf,
                             // 1 → VRX2 jitter buf. Unknown ids dropped.

@@ -16,6 +16,64 @@ hardware notes, see `docs-book/src/technical-reference.md` and
 
 ---
 
+## [2.3.0] — 2026-06-27 (Synchronous AM (SAM-PLL) + AM auto-tune + TX modulation bandwidth)
+
+> **Backwards-compatible with 2.1.x / 2.2.0.** Wire-protocol `VERSION` stays 3 —
+> the new VRX-AFC and TX-filter packet/control types are purely additive
+> (`0x2A`/`0x2B`, control `0x75`–`0x79`) and are sent only to clients that
+> support them, so older clients keep working. Stock Thetis (v2.10.3.14+) is
+> sufficient for the TX-bandwidth feature; no Thetis-fork update is required for
+> this release. The Android client is unchanged this release (it has no VRX);
+> the bundled APK is rebuilt at 2.3.0. Download `ThetisLink-2.3.0.zip` from the
+> [Releases page](https://github.com/cjenschede/ThetisLink/releases) — the ZIP
+> contains both Windows binaries, the Android APK, the PDF manuals, `LICENSE`
+> and `SHA256SUMS.txt`. SBOM and third-party license artefacts are attached to
+> the same release as separate assets.
+
+### Added — Synchronous AM with a carrier-tracking PLL (SAM)
+
+The VRX **SAM** mode is now a real synchronous-AM demodulator: a
+critically-damped (ζ=1.0) carrier-tracking PLL locks onto the AM carrier and
+demodulates against the recovered phase, mirroring Thetis/WDSP `amd.c`. This
+removes the beat-note of the previous pseudo-SAM when the tuning is a few Hz
+off and stays clean through selective fading. Capture range ±3 kHz.
+
+### Added — AM auto-tune-to-carrier (AFC) + per-VRX audio rate
+
+In SAM with auto-tune enabled, the listen frequency continuously follows the AM
+carrier onto exact zero-beat (the client VFO follows). The tracker is a
+two-speed, noise-robust AFC (fast pull-in when far out, slow ~2 s tracking near
+the carrier, 5 Hz deadband) that holds a strong/wide carrier without hunting and
+preserves the lock across an NB↔WB audio-rate rebuild. Each VRX gets its own
+audio-rate selector — **NB (8 kHz) / WB (16 kHz) / Auto** — independently per
+channel; Auto widens to 16 kHz when the filter is opened past ~4 kHz.
+
+### Added — Settable TX modulation bandwidth (desktop, Thetis tab)
+
+The main-radio TX modulation bandwidth is now adjustable from the desktop
+client's Thetis tab: **Follow RX bandwidth** (TX mirrors the RX filter 1:1,
+manual fields greyed) or independent **Low/High** edges. Range 0–8 kHz (TX audio
+is 16 kS/s, so the audio passband tops out at 8 kHz; a wider RX filter is flagged
+and clamped). In symmetric modes (AM/SAM/DSB/FM) the RX spectrum filter edges now
+mirror, so dragging one edge moves both sides — matching how Thetis enforces a
+symmetric filter.
+
+### Fixed
+
+- During PTT, mode changes are no longer forwarded to Thetis — works around a
+  Thetis desync where a mode change mid-transmit updated the indicator but not
+  the actual mode.
+- **Follow RX bandwidth** is now available immediately on connect: the server
+  reads the TX filter band at TCI connect (`tx_filter_band_ex`) instead of only
+  learning it when Thetis first changes it, so a server restart is no longer
+  needed for the feature to work.
+- **Pop-out windows on a disconnected monitor** are recovered automatically: the
+  client validates each saved pop-out position against the live monitor layout
+  (Windows) and opens off-screen windows on the primary monitor instead. A manual
+  **"Recenter windows"** button (Server tab) is also available.
+- AFC handoff is clamp-aware at the ±3 kHz capture edge (no offset double-count
+  or drift).
+
 ## [2.2.0] — 2026-06-18 (Virtual receivers + dual-radio FT-991A/FTX-1)
 
 > **Backwards-compatible with 2.1.x.** Wire-protocol `VERSION` stays 3 — the new

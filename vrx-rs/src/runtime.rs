@@ -77,6 +77,12 @@ pub trait VrxAudioCallback {
         opus_bytes: &[u8],
         sequence: u32,
     );
+
+    /// Called (throttled) while SAM auto-tune is following the carrier,
+    /// with the new absolute listen frequency (Hz) so the host can update
+    /// the client VFO. Default no-op — hosts that don't use auto-tune
+    /// (e.g. `vrx-spike`) need not implement it.
+    fn on_carrier_freq(&mut self, _vrx_id: u8, _freq_hz: u64) {}
 }
 
 pub struct VrxRuntime {
@@ -90,6 +96,16 @@ pub struct VrxRuntime {
     sequence: u32,
     wav: Option<RollingWavWriter>,
     last_logged_offset_hz: i32,
+    // SAM auto-tune AFC (PATCH-vrx-wide-sam-ux). `afc_offset_hz` is the
+    // accumulated correction added to the user's tuned frequency to follow
+    // the carrier; reset when the user retunes or auto-tune is inactive.
+    afc_offset_hz: f32,
+    afc_last_base_hz: u64,
+    afc_last_reported_hz: u64,
+    // Smoothed loop-frequency estimate the AFC acts on. Averaging rejects the
+    // per-batch noise on the PLL estimate at low SNR (weak-carrier jitter)
+    // while still tracking real drift.
+    afc_resid_ema: f32,
 }
 
 impl VrxRuntime {
@@ -120,12 +136,33 @@ impl VrxRuntime {
             sequence: 0,
             wav,
             last_logged_offset_hz: i32::MIN,
+            afc_offset_hz: 0.0,
+            afc_last_base_hz: 0,
+            afc_last_reported_hz: 0,
+            afc_resid_ema: 0.0,
         }
     }
 
     /// Output sample rate (8000 for NB, 16000 for WB). Const after construction.
     pub fn output_rate_hz(&self) -> u32 {
         self.output_rate_hz
+    }
+
+    /// Snapshot the SAM auto-tune state: `(afc_offset_hz, base_hz)`. Used to
+    /// carry the carrier-follow across a runtime rebuild (NB↔WB rate change)
+    /// so the switch doesn't drop the lock and force a slow re-pull-in from
+    /// the original (possibly kHz-off) manual tuning. `afc_offset_hz` is in Hz
+    /// so it transfers cleanly across the rate change.
+    pub fn afc_state(&self) -> (f32, u64) {
+        (self.afc_offset_hz, self.afc_last_base_hz)
+    }
+
+    /// Restore a snapshotted AFC state into a fresh runtime. Seeding both the
+    /// offset and the base it is relative to keeps the next `feed()` from
+    /// treating the rebuild as a manual retune (which would reset the offset).
+    pub fn restore_afc_state(&mut self, afc_offset_hz: f32, base_hz: u64) {
+        self.afc_offset_hz = afc_offset_hz;
+        self.afc_last_base_hz = base_hz;
     }
 
     /// Feed one batch of IQ samples + current radio state. Reads
@@ -140,9 +177,9 @@ impl VrxRuntime {
         ddc_center_hz: u64,
         callback: &mut impl VrxAudioCallback,
     ) {
-        let (enabled, target_freq_hz, mode, filter_low_hz, filter_high_hz) = {
+        let (enabled, target_freq_hz, mode, filter_low_hz, filter_high_hz, sam_auto_tune) = {
             let s = self.control.lock().expect("VrxControlState mutex poisoned").clone();
-            (s.enabled, s.target_freq_hz, s.mode, s.filter_low_hz, s.filter_high_hz)
+            (s.enabled, s.target_freq_hz, s.mode, s.filter_low_hz, s.filter_high_hz, s.sam_auto_tune)
         };
         if !enabled {
             // Reset opus accumulator so a stop/start doesn't bleed
@@ -198,7 +235,18 @@ impl VrxRuntime {
 
         // target_freq_hz=0 → fall back to VFO so the listener hears
         // the current passband until the user explicitly tunes.
-        let absolute_listen_hz = if target_freq_hz == 0 { vfo_hz } else { target_freq_hz };
+        let base_listen_hz = if target_freq_hz == 0 { vfo_hz } else { target_freq_hz };
+        // SAM auto-tune: add the accumulated AFC correction to the user's
+        // tuned frequency. Reset the correction whenever the user retunes,
+        // leaves SAM, or disables auto-tune (so we snap back to the set freq).
+        let afc_active = mode == VrxMode::Sam && sam_auto_tune;
+        if base_listen_hz != self.afc_last_base_hz || !afc_active {
+            self.afc_offset_hz = 0.0;
+            self.afc_resid_ema = 0.0;
+            self.afc_last_base_hz = base_listen_hz;
+        }
+        let absolute_listen_hz =
+            (base_listen_hz as i128 + self.afc_offset_hz.round() as i128).max(0) as u64;
         let effective_offset_hz =
             (absolute_listen_hz as i128 - ddc_center_hz as i128) as f32;
         if let Some(ch) = self.channelizer.as_mut() {
@@ -228,6 +276,67 @@ impl VrxRuntime {
         if audio.is_empty() {
             return;
         }
+
+        // SAM auto-tune AFC: once the PLL has locked, nudge the listen
+        // frequency onto the carrier and report it so the client VFO follows.
+        // The handoff removes the applied amount from the loop estimate so it
+        // doesn't double-count; the offset is clamped to the ±3 kHz capture.
+        if afc_active {
+            let (locked, residual_hz) = self
+                .channelizer
+                .as_ref()
+                .map(|ch| (ch.is_locked(), ch.sam_carrier_offset_hz()))
+                .unwrap_or((false, 0.0));
+            if locked {
+                // Two-speed AFC tracker. FAR from the carrier (raw residual
+                // > AFC_GEAR_HZ) the signal dominates noise, so pull in FAST
+                // with a short averaging constant. Within AFC_GEAR_HZ switch to
+                // a SLOW (~2 s) constant: a strong/wide AM carrier's modulation
+                // pulls the inner PLL and the estimate wobbles, and at low SNR
+                // it is noisy — slow averaging rejects both so a centred carrier
+                // sits below the deadband → zero corrections → silent. This
+                // keeps the fast phase going until close (no long humming tail)
+                // while the locked end-state stays stable. Time-based α keeps
+                // the constants independent of the IQ batch size.
+                const AFC_GEAR_HZ: f32 = 30.0;
+                const AFC_ACQUIRE_TAU_S: f32 = 0.3;
+                const AFC_TRACK_TAU_S: f32 = 2.0;
+                const AFC_DEADBAND_HZ: f32 = 5.0;
+                const AFC_MAX_STEP_HZ: f32 = 150.0;
+                let dt = audio.len() as f32 / self.output_rate_hz as f32;
+                let tau = if residual_hz.abs() > AFC_GEAR_HZ {
+                    AFC_ACQUIRE_TAU_S
+                } else {
+                    AFC_TRACK_TAU_S
+                };
+                let alpha = 1.0 - (-dt / tau).exp();
+                self.afc_resid_ema += alpha * (residual_hz - self.afc_resid_ema);
+                if self.afc_resid_ema.abs() >= AFC_DEADBAND_HZ {
+                    let step = self.afc_resid_ema.clamp(-AFC_MAX_STEP_HZ, AFC_MAX_STEP_HZ);
+                    // Clamp-aware handoff: at the ±3 kHz capture edge the offset
+                    // moves less than `step`, so remove from the estimate and
+                    // hand off only what was actually applied — keeps the handoff
+                    // net-zero (no double-count / drift at the edge).
+                    let old_offset = self.afc_offset_hz;
+                    self.afc_offset_hz = (old_offset + step).clamp(-3000.0, 3000.0);
+                    let actual_step = self.afc_offset_hz - old_offset;
+                    self.afc_resid_ema -= actual_step;
+                    if let Some(ch) = self.channelizer.as_mut() {
+                        ch.apply_afc_handoff(actual_step);
+                    }
+                    let followed_hz =
+                        (base_listen_hz as i128 + self.afc_offset_hz.round() as i128).max(0) as u64;
+                    if (followed_hz as i64 - self.afc_last_reported_hz as i64).abs() >= 10 {
+                        self.afc_last_reported_hz = followed_hz;
+                        callback.on_carrier_freq(self.opts_vrx_id, followed_hz);
+                    }
+                }
+            } else {
+                // Not locked → don't accumulate noise into the estimate.
+                self.afc_resid_ema = 0.0;
+            }
+        }
+
         if let Some(wav) = self.wav.as_mut() {
             if let Err(e) = wav.push(&audio) {
                 warn!("VRX{} runtime: WAV write failed: {}", self.opts_vrx_id + 1, e);

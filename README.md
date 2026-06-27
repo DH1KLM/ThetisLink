@@ -1,18 +1,18 @@
 # ThetisLink
 
-> **Current release: [v2.2.0](https://github.com/cjenschede/ThetisLink/releases/tag/v2.2.0)** —
-> **Virtual receivers (VRX):** two independent receivers (VRX1/VRX2) carved from
-> the wideband DDC stream by an FFT channelizer, each with its own frequency,
-> mode (USB/LSB/AM/SAM/FM), filter, high-res spectrum/waterfall and S-meter in a
-> joint pop-out window. **Dual-radio:** a second Yaesu radio (FT-991A + FTX-1)
-> runs as an independent channel with auto-detected model, per-radio audio/CAT/
-> memory, FTX-1 WIRES-X and a server-side software squelch. Plus a switchable
-> RX audio bandwidth and a `#N` device-index suffix to tell two identical USB
-> codecs apart. Illustrated VRX explainers are online — see **Documentation**
-> below. **Backwards-compatible with v2.1.x** — wire-protocol `VERSION` 3
+> **Current release: [v2.3.0](https://github.com/cjenschede/ThetisLink/releases/tag/v2.3.0)** —
+> **Synchronous AM (SAM-PLL):** the VRX **SAM** mode is now a real carrier-tracking
+> PLL demodulator — clean AM with no beat note when slightly off-tune, stable
+> through fading — with optional **auto-tune-to-carrier** (the VFO follows the
+> carrier). Each VRX gains its own **NB/WB/Auto audio rate**. **Settable TX
+> modulation bandwidth** in the desktop Thetis tab: follow the RX filter, or set
+> independent low/high edges (0–8 kHz). Built on the **virtual receivers
+> (VRX1/VRX2)** and **dual-radio** (second Yaesu FT-991A/FTX-1) introduced in
+> v2.2.0. Illustrated explainers are online — see **Documentation** below.
+> **Backwards-compatible with v2.1.x / v2.2.0** — wire-protocol `VERSION` 3
 > unchanged (new types are additive and per-client gated); pair with **Thetis
 > fork PA3GHM TL2-4** for the full feature-set, stock Thetis remains supported.
-> Download `ThetisLink-2.2.0.zip` from the
+> Download `ThetisLink-2.3.0.zip` from the
 > [Releases page](https://github.com/cjenschede/ThetisLink/releases) — the ZIP
 > contains both Windows binaries, the Android APK, all PDF manuals,
 > `LICENSE` and `SHA256SUMS.txt`. SBOM and third-party license artefacts are
@@ -41,6 +41,11 @@ radio control over the network via TCI WebSocket.
 
 ## Documentation
 
+**Illustrated explainers (GitHub Pages):** <https://cjenschede.github.io/ThetisLink/>
+
+- [How a VRX works](https://cjenschede.github.io/ThetisLink/VRX-explained.html) — the virtual-receiver signal chain from radio wave to sound (NL: [Hoe een VRX werkt](https://cjenschede.github.io/ThetisLink/VRX-uitleg.html))
+- [The network path](https://cjenschede.github.io/ThetisLink/Network-explained.html) — how audio, spectrum and control travel over the network (NL: [Het netwerkpad](https://cjenschede.github.io/ThetisLink/Netwerk-uitleg.html))
+
 Included with each release:
 
 - `Installatie.md` / `Installation.md` — installation guide (Dutch / English)
@@ -53,7 +58,7 @@ ThetisLink talks to the radio through Thetis. It targets **Thetis v2.10.3.15**
 (the latest official release by ramdor) and works with stock Thetis out of the
 box. Optionally use the [PA3GHM Thetis fork](https://github.com/cjenschede/Thetis/tree/thetislink-tl2)
 (branch `thetislink-tl2`) for the additional `_ex` TCI extensions used by
-ThetisLink v2.2.0 (capability broadcast, per-RX filter preset, diversity
+ThetisLink v2.3.0 (capability broadcast, per-RX filter preset, diversity
 control suite, server-side DDC recenter, relaxed IQ-stream rate cap,
 wideband RX audio, modulation-change filter fan-out). All
 extensions are gated behind the **ThetisLink extensions** checkbox in Setup

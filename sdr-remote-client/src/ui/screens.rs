@@ -126,6 +126,47 @@ impl SdrRemoteApp {
             });
         }
 
+        // TX modulation bandwidth (main-radio TX) — PATCH-tx-modulation-bandwidth.
+        // "Volg RX" mirrors the RX filter 1:1; otherwise set low/high directly.
+        ui.separator();
+        ui.label(RichText::new("TX modulation bandwidth").strong());
+        if !self.tx_filter_supported {
+            ui.label(RichText::new("Unavailable (Thetis reports no TX filter; requires v2.10.3.14+).").weak());
+        } else {
+            if ui.checkbox(&mut self.tx_filter_follow_rx, "Follow RX bandwidth").changed() {
+                self.last_tx_follow_sent = None; // force resend when following
+                if !self.tx_filter_follow_rx {
+                    // Switched to independent → apply the current manual band now.
+                    let _ = self.cmd_tx.send(Command::SetTxFilter(self.tx_filter_low_hz, self.tx_filter_high_hz));
+                }
+            }
+            ui.horizontal(|ui| {
+                let editable = !self.tx_filter_follow_rx;
+                ui.label("Low:");
+                let lo = ui.add_enabled(editable,
+                    egui::DragValue::new(&mut self.tx_filter_low_hz).range(0..=8000).suffix(" Hz").speed(10));
+                ui.label("High:");
+                let hi = ui.add_enabled(editable,
+                    egui::DragValue::new(&mut self.tx_filter_high_hz).range(0..=8000).suffix(" Hz").speed(10));
+                if editable && (lo.changed() || hi.changed()) {
+                    let _ = self.cmd_tx.send(Command::SetTxFilter(self.tx_filter_low_hz, self.tx_filter_high_hz));
+                }
+            });
+            if self.tx_filter_follow_rx {
+                // Show the actual (positive) audio passband that follows RX,
+                // clamped to the TX limit: TX audio is 16 kS/s, so modulation
+                // tops out at 8 kHz. A wider RX filter cannot be followed.
+                let (tlo, thi) = rx_to_tx_band(self.filter_low_hz, self.filter_high_hz);
+                let chi = thi.min(8000);
+                if thi > 8000 {
+                    ui.label(RichText::new(format!(
+                        "TX follows RX: {} .. {} Hz (RX wider — TX max 8 kHz)", tlo, chi)).weak());
+                } else {
+                    ui.label(RichText::new(format!("TX follows RX: {} .. {} Hz", tlo, chi)).weak());
+                }
+            }
+        }
+
         // Thetis TUNE button (with PA bypass + delays)
         // Process delayed tune-on: PA standby sent, wait 500ms then ZZTU1
         if let Some(t) = self.tune_pending_on {
@@ -1572,6 +1613,15 @@ impl SdrRemoteApp {
                         self.password_input.clone(),
                     ));
                 }
+                let recenter_tip = if self.ui_language == "nl" {
+                    "Pop-out vensters terughalen naar het hoofdscherm (bijv. na loskoppelen 2e monitor)"
+                } else {
+                    "Bring pop-out windows back onto the main screen (e.g. after disconnecting a 2nd monitor)"
+                };
+                if ui.small_button("Recenter windows").on_hover_text(recenter_tip).clicked() {
+                    let ctx = ui.ctx().clone();
+                    self.recenter_popouts(&ctx);
+                }
             });
         });
 
@@ -2006,6 +2056,26 @@ impl SdrRemoteApp {
             let _ = self.cmd_tx.send(sdr_remote_logic::commands::Command::SetThetisWidebandAudio(wb));
             self.save_full_config();
         }
+
+        // VRX audio-rate: NB / WB / Auto (PATCH-vrx-wide-sam-ux). Auto kiest
+        // per VRX 16 kHz zodra de filter-bandbreedte ≥ 4 kHz is. Geldt voor
+        // VRX1 én VRX2; losgekoppeld van de Thetis-wideband-toggle hierboven.
+        ui.horizontal(|ui| {
+            ui.label("VRX audio rate:");
+            let labels = ["NB (8k)", "WB (16k)", "Auto"];
+            let mut sel = (self.vrx_rate_mode as usize).min(2);
+            egui::ComboBox::from_id_source("vrx_audio_rate")
+                .selected_text(labels[sel])
+                .show_ui(ui, |ui| {
+                    for (i, lbl) in labels.iter().enumerate() {
+                        ui.selectable_value(&mut sel, i, *lbl);
+                    }
+                });
+            if sel as u8 != self.vrx_rate_mode {
+                self.vrx_rate_mode = sel as u8;
+                let _ = self.cmd_tx.send(sdr_remote_logic::commands::Command::SetVrxRateMode(self.vrx_rate_mode));
+            }
+        }).response.on_hover_text("VRX audio sample rate. Auto: 16 kHz when the VRX filter is ≥4 kHz wide, else 8 kHz — per VRX.");
 
         // TCI Status
         ui.separator();

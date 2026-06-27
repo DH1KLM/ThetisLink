@@ -174,6 +174,8 @@ pub struct ClientSession {
     pub vrx2_audio_enabled: bool,
     pub vrx1_spectrum_enabled: bool,
     pub vrx2_spectrum_enabled: bool,
+    pub vrx1_autotune_enabled: bool,
+    pub vrx2_autotune_enabled: bool,
     pub audio_mode: u8, // 255=default(CH0 only), 0=Mono, 1=BIN, 2=Split
     /// DX-cluster spot stream opt-out — default true (= stream actief).
     /// Wanneer false stuurt de server geen Spot-frames meer naar deze
@@ -332,6 +334,7 @@ impl SessionManager {
             thetis_wideband_audio: false,
             vrx1_audio_enabled: false, vrx2_audio_enabled: false,
             vrx1_spectrum_enabled: false, vrx2_spectrum_enabled: false,
+                vrx1_autotune_enabled: false, vrx2_autotune_enabled: false,
         });
         info!("Auth challenge sent to {}", addr);
         nonce
@@ -433,6 +436,7 @@ impl SessionManager {
                 thetis_wideband_audio: false,
                 vrx1_audio_enabled: false, vrx2_audio_enabled: false,
                 vrx1_spectrum_enabled: false, vrx2_spectrum_enabled: false,
+                vrx1_autotune_enabled: false, vrx2_autotune_enabled: false,
             });
             TouchResult::NewClient
         }
@@ -617,6 +621,25 @@ impl SessionManager {
         self.clients.values()
             .filter(|s| Self::is_active_authed(s)
                 && if ch == 0 { s.vrx1_spectrum_enabled } else { s.vrx2_spectrum_enabled })
+            .map(|s| s.addr)
+            .collect()
+    }
+
+    /// VRX per-client SAM auto-tune subscription (PATCH-vrx-wide-sam-ux).
+    /// ch 0 = VRX1, anders VRX2.
+    pub fn set_vrx_autotune(&mut self, addr: SocketAddr, ch: u8, on: bool) {
+        if let Some(s) = self.clients.get_mut(&addr) {
+            if ch == 0 { s.vrx1_autotune_enabled = on; } else { s.vrx2_autotune_enabled = on; }
+        }
+    }
+
+    /// Subscribers voor `FrequencyVrxActual` (SAM auto-tune follow). ch 0=VRX1,
+    /// 1=VRX2. Alleen clients die `VrxSamAutoTune*` aan hebben gezet — oude
+    /// clients krijgen nooit dit packet-type.
+    pub fn vrx_autotune_addrs(&self, ch: u8) -> Vec<SocketAddr> {
+        self.clients.values()
+            .filter(|s| Self::is_active_authed(s)
+                && if ch == 0 { s.vrx1_autotune_enabled } else { s.vrx2_autotune_enabled })
             .map(|s| s.addr)
             .collect()
     }
@@ -905,6 +928,7 @@ mod tests {
             thetis_wideband_audio: false,
             vrx1_audio_enabled: false, vrx2_audio_enabled: false,
             vrx1_spectrum_enabled: false, vrx2_spectrum_enabled: false,
+                vrx1_autotune_enabled: false, vrx2_autotune_enabled: false,
         }
     }
 

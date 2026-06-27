@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use tokio::net::UdpSocket;
 
-use sdr_remote_core::protocol::VrxAudioPacket;
+use sdr_remote_core::protocol::{PacketType, VrxAudioPacket, VrxFrequencyPacket};
 use sdr_remote_core::MAX_PACKET_SIZE;
 use vrx_rs::{VrxAudioCallback, VrxControlState};
 
@@ -47,6 +47,9 @@ pub fn vrx_control_thetislink(id: u8) -> Arc<Mutex<VrxControlState>> {
 pub struct ThetisVrxSink {
     pub socket: Arc<UdpSocket>,
     pub addrs: Vec<SocketAddr>,
+    /// SAM auto-tune subscribers (per-client gated on `VrxSamAutoTune*`).
+    /// Only these receive `FrequencyVrxActual` — old clients never do.
+    pub autotune_addrs: Vec<SocketAddr>,
     pub timestamp_ms: u32,
     pub buf: Vec<u8>,
     /// Tags every emitted VrxAudioPacket as wideband (16 kHz Opus) vs.
@@ -60,6 +63,7 @@ impl ThetisVrxSink {
         Self {
             socket,
             addrs: Vec::new(),
+            autotune_addrs: Vec::new(),
             timestamp_ms: 0,
             buf: Vec::with_capacity(MAX_PACKET_SIZE),
             wideband: false,
@@ -83,6 +87,18 @@ impl VrxAudioCallback for ThetisVrxSink {
         packet.serialize(&mut self.buf);
         for addr in &self.addrs {
             let _ = self.socket.try_send_to(&self.buf, *addr);
+        }
+    }
+
+    fn on_carrier_freq(&mut self, vrx_id: u8, freq_hz: u64) {
+        if self.autotune_addrs.is_empty() {
+            return;
+        }
+        let pkt = VrxFrequencyPacket { vrx_id, frequency_hz: freq_hz };
+        let mut buf = [0u8; VrxFrequencyPacket::SIZE];
+        pkt.serialize_with_type(PacketType::FrequencyVrxActual, &mut buf);
+        for addr in &self.autotune_addrs {
+            let _ = self.socket.try_send_to(&buf, *addr);
         }
     }
 }

@@ -1,4 +1,4 @@
-# ThetisLink v2.2.0 - User Manual
+# ThetisLink v2.3.0 - User Manual
 
 ## Table of Contents
 
@@ -47,7 +47,7 @@ ThetisLink is distributed as a zip file with the following contents:
 |---------|-------------|
 | `ThetisLink-Server.exe` | Server executable (Windows) |
 | `ThetisLink-Client.exe` | Desktop client executable |
-| `ThetisLink-2.2.0.apk` | Android client app |
+| `ThetisLink-2.3.0.apk` | Android client app |
 | `Installation.pdf` | Installation guide (English) |
 | `User-Manual-EN.pdf` | User manual (English, this document) |
 | `Technical-Reference.pdf` | Technical reference (English) |
@@ -92,7 +92,9 @@ flowchart TB
     Server <--> Yaesu[Yaesu FT-991A<br>COM + USB Audio]
 ```
 
-All audio (RX/TX), IQ spectrum data and control go through a single TCI WebSocket connection. ThetisLink v2.2.0 does not use a separate CAT TCP connection — TCI covers all required commands, with both stock Thetis v2.10.3.15 and the PA3GHM fork. No VB-Cable or other drivers required.
+All audio (RX/TX), IQ spectrum data and control go through a single TCI WebSocket connection. ThetisLink v2.3.0 does not use a separate CAT TCP connection — TCI covers all required commands, with both stock Thetis v2.10.3.15 and the PA3GHM fork. No VB-Cable or other drivers required.
+
+> **The network path, illustrated:** an illustrated explanation of how audio, spectrum and control travel over the network is published online: **[The network path](https://cjenschede.github.io/ThetisLink/Network-explained.html)**.
 
 ---
 
@@ -244,6 +246,17 @@ During TX the S-meter switches to a TX meter showing:
 
 The SWR value is broadcast by Thetis over TCI during every TX burst and is visible in real time on every connected client.
 
+### TX modulation bandwidth (v2.3.0)
+
+In the desktop client's **Thetis tab** you set the main radio's **TX modulation bandwidth**. Two options:
+
+- **Follow RX bandwidth:** the TX modulation filter mirrors the RX filter 1:1. The manual fields are then greyed out. The screen shows the followed band, e.g. `TX follows RX: 0 .. 2800 Hz`.
+- **Independent:** set the modulation's low and high edges (Low/High) yourself.
+
+The range is **0–8 kHz**. The TX audio runs at 16 kS/s, so modulation can reach 8 kHz; if the RX filter is wider, the TX band is clamped to 8 kHz and the screen flags it (`(RX wider — TX max 8 kHz)`). In the symmetric modes (AM/SAM/DSB/FM) the filter is symmetric around the carrier — drag one edge in the spectrum and the other moves with it, just like in Thetis.
+
+> **Tip:** while transmitting (PTT active) mode changes are not forwarded to Thetis; the mode buttons are greyed out. This avoids a desync where Thetis stays on the old mode while the indicator shows the new one.
+
 ### Spectrum and waterfall
 
 - **Zoom:** adjustable, provides more accurate frequency display
@@ -298,11 +311,21 @@ In addition to the two physical receivers (RX1/RX2), from v2.2.0 ThetisLink offe
 
 **Spectrum, waterfall and S-meter:** each VRX has its own **high-resolution spectrum + waterfall** around its listen frequency and its own S-meter. The high-resolution view is requested per VRX; the client then shows a zoomed-in spectrum (with adjustable zoom, reference level, range and waterfall contrast).
 
-**Narrow or wide audio:** the VRX audio uses the same RX bandwidth choice as the rest of reception — narrowband (8 kHz) or wideband (16 kHz) Opus (see [RX bandwidth](#rx-bandwidth-narrowwide-v220)).
+**Narrow or wide audio:** the VRX audio is Opus narrowband (8 kHz) or wideband (16 kHz). From v2.3.0 you choose this **per VRX** (NB/WB/Auto) — see [Per-VRX audio bandwidth](#per-vrx-audio-bandwidth-v230) below.
 
 **Persistence:** the VRX settings (on/off, frequency, mode and filter) are saved and restored across reconnects.
 
 > **How exactly does a VRX work?** An illustrated explanation of the whole VRX signal chain — from radio wave to sound — is published online: **[How a VRX works](https://cjenschede.github.io/ThetisLink/VRX-explained.html)**.
+
+### Synchronous AM (SAM) with a carrier PLL (v2.3.0)
+
+In **SAM** mode a VRX uses a real synchronous-AM demodulator from v2.3.0: a **phase-locked loop (PLL)** locks onto the AM station's carrier and demodulates against that recovered carrier. The result is cleaner AM than the previous pseudo-SAM — even a few Hz off the carrier the beat note disappears, and reception stays stable through selective fading. The loop captures the carrier within a range of about ±3 kHz.
+
+**Auto-tune to the carrier:** you can let SAM **follow the carrier** — the listen frequency (and your VFO) then snaps onto the carrier and keeps tracking it, even as the station slowly drifts. This is a per-VRX choice; with it off the frequency stays where you set it and only the PLL pulls the phase straight.
+
+### Per-VRX audio bandwidth (v2.3.0)
+
+From v2.3.0 each VRX has its **own audio-bandwidth choice**: **NB** (narrowband, 8 kHz), **WB** (wideband, 16 kHz) or **Auto**. This is independent of the global [RX bandwidth](#rx-bandwidth-narrowwide-v220) switch, so you can set VRX1 narrow and VRX2 wide, for example. In **Auto** the VRX widens to wideband as soon as you open the filter past roughly 4 kHz, and returns to narrowband for a narrower filter.
 
 ### RX bandwidth (narrow/wide, v2.2.0)
 
@@ -826,6 +849,7 @@ If the spectrum (line) and the waterfall are not in sync when panning, restart t
 
 | Version | Highlights |
 |---|---|
+| **2.3.0** | **Synchronous AM (SAM-PLL) + AM auto-tune + settable TX modulation bandwidth.** Backwards-compatible with v2.1.x/v2.2.0 — wire protocol VERSION 3 unchanged; new packet/control types (0x2A/0x2B, control 0x75–0x79) are additive and per-client gated. **SAM** is now a real synchronous-AM demodulator (critically-damped carrier-tracking PLL, WDSP `amd.c` style, ±3 kHz capture) instead of pseudo-SAM; **auto-tune-to-carrier** makes the listen frequency/VFO follow the carrier via a two-speed noise-robust AFC. **Per-VRX audio bandwidth** NB/WB/Auto, independent per channel. **Settable TX modulation bandwidth** in the desktop Thetis tab (Follow RX or independent low/high, 0–8 kHz), with a symmetric filter mirror in AM/SAM/DSB/FM. Fixes: mode change during PTT no longer forwarded (Thetis desync workaround), Follow RX available immediately on connect, automatic recovery of pop-out windows from a disconnected monitor + manual "Recenter windows" button. Android unchanged (no VRX). No Thetis-fork change — stock v2.10.3.14+ suffices. |
 | **2.2.0** | **Virtual receivers (VRX) + second Yaesu radio (FT-991A + FTX-1).** Backwards-compatible with v2.1.x — wire protocol VERSION 3 unchanged; the new packet types (0x21–0x29) are additive and per-client gated, so v2.1.x clients never receive them. **VRX1/VRX2** virtual receivers carved from the wideband DDC stream by an FFT channelizer, each with its own frequency, mode (USB/LSB/AM/SAM/FM), filter, high-res spectrum/waterfall and S-meter in a joint pop-out; NB/WB Opus audio; per-bucket frequency memory + persistence. **Dual-radio** second Yaesu channel with model auto-detect (`ID;` 0670/0840), per-radio audio/CAT/memory, `RadioInfo` panel naming, **FTX-1 WIRES-X** EX-menu and a **software squelch** (FM-family only). **Switchable RX bandwidth** (Thetis + VRX + Yaesu, receive only) and a **`#N` audio-device index** for identical USB codecs; dynamic WAV recording rate. Illustrated VRX explainers online (see Documentation). Pair with **Thetis fork PA3GHM TL2-4**; stock Thetis remains supported. |
 | **2.1.0** | **Yaesu G-1000DXC rotor via MCP2221A, opt-in wideband Thetis RX, Amplitec reconnect, RX2 filter fixes.** Backwards-compatible with v2.0.4 — wire protocol unchanged; 2.0.4 clients talk to a 2.1.0 server and vice versa. **Yaesu G-1000DXC rotor backend** as a third option alongside EA7HG and PstRotator: direct control via an Adafruit MCP2221A breakout (5 V mod), with soft-start / soft-stop ramp (1–200 %/s, default 50 %), adaptive ADC poll-rate (30 Hz during motion / 1 Hz when idle, with median filter rejecting 50/100 Hz mains ripple), shortest-route option for rotors with an overlap range (`max_deg > 360°`), and a calibration wizard (Park CCW / Park CW). **Opt-in wideband Thetis RX** via the fork extension — does not break the stock-Thetis path. **Amplitec 6/2 reconnect** after power-cycle, plus the window appears even when the device is offline at server start (was: window stayed invisible until server restart). **RX2 mode-switch filter restore** (modulation handler honours the server's filter-band update during the mode switch) plus per-channel filter-edge drag (RX1 / RX2 drag state decoupled). **Yaesu EQ profile mic-gain persistence** (mic slider saved alongside band/treble); **sharper TX resampler anti-alias filter**. **Modular multi-tuner wizard** with per-slot Add/Rename/Delete, classification scan, collapsible MCP2221A panel. **Status panel scroll stability** (snapshot cache on lock contention; the expanded MCP2221A section no longer jumps back up while scrolling). UI polish: chevron labels on all collapsible toggles, Settings-tab ScrollArea, Amplitec antenna rename via right-click. Pair with **Thetis fork PA3GHM TL2-4** for the full feature-set; stock Thetis remains supported. |
 | **2.0.4** | **Bandwidth toolkit, preventive TX-inhibit, power-cap, PstRotator.** Backwards-compatible with v2.0.3 — wire-protocol additive only. **Preventive RX-only TX-inhibit** via the new `rx_only_ex` TCI command (requires Thetis fork PA3GHM TL2-3): MOX, spacebar, hardware-PTT and VOX refused at the source on an RX-only Amplitec position rather than reactively flipped back; stock Thetis falls back to the reactive `ZZTX0` catch-all. **Reactive RF power-cap per position** with PA-native DriveDown (SPE + RF2K-S), mode-multipliers (SSB/CW × 1.0, AM × 0.5, FM/DIG × 0.4); rate-limited to one step per second — brief CW-bursts (<1 s) can pass the reactive cap, preventive coverage exists only on RX-only positions. **PstRotator UDP/XML rotor backend** (host = numeric IP address, no DNS resolution). **Server-tab bandwidth monitor** (Down/Up Kbit/s, clickable for per-stream breakdown) — counts UDP application-payload bytes (the Windows network meter reads ~1.5-2× higher because it includes IP/UDP/Ethernet headers). **Per-client DX-spots opt-out** (Desktop + Android Settings), with server-side dedup (~90 Kbit/s broadcast storm → ~6 Kbit/s). **WebSDR favorites edit-toggle**. Server-log cleanup (PowerCap state-change-only + DXC reconnect one-line-per-cycle). |

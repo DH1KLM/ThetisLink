@@ -8,6 +8,11 @@ use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 /// ControlId::VrxSpectrumEnable/SpanKhz; read by the spectrum tick.
 static VRX1_HR_SPAN_KHZ: AtomicU16 = AtomicU16::new(0);
 static VRX2_HR_SPAN_KHZ: AtomicU16 = AtomicU16::new(0);
+
+/// VRX audio-rate mode (PATCH-vrx-wide-sam-ux): 0=NB, 1=WB, 2=Auto. One
+/// setting for both VRX; the audio loop reads it (+ each VRX's filter) to
+/// pick the per-VRX output rate. Default Auto. Set via ControlId::VrxAudioRate.
+pub static VRX_AUDIO_RATE_MODE: AtomicU8 = AtomicU8::new(2);
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -629,6 +634,7 @@ impl NetworkService {
                 let mut prev_vfo_b_freq: u64 = 0;
                 let mut prev_vfo_b_mode: u8 = 255;
                 let mut prev_tx_profile_names: Vec<String> = Vec::new();
+                let mut prev_tx_filter: Option<(i32, i32)> = None;
                 let mut prev_equipment: std::collections::HashMap<u8, Vec<u8>> = std::collections::HashMap::new();
                 let mut prev_eq_client_count: usize = 0;
                 // DX-spot dedup + refresh-tracking. Vóór deze fix stuurde de
@@ -1420,6 +1426,9 @@ impl NetworkService {
                             let rx_af_gain = ptt_guard.rx_af_gain();
                             let filter_low = ptt_guard.filter_low_hz();
                             let filter_high = ptt_guard.filter_high_hz();
+                            let tx_filter_low = ptt_guard.tx_filter_low_hz();
+                            let tx_filter_high = ptt_guard.tx_filter_high_hz();
+                            let tx_filter_known = ptt_guard.tx_filter_known();
                             let thetis_starting = ptt_guard.thetis_starting();
                             let ctun = ptt_guard.ctun();
                             // RX2 state
@@ -1715,6 +1724,20 @@ impl NetworkService {
                                 }
                             }
 
+                            // TX modulation filter band — push only when Thetis
+                            // reports it (stock 2.10.3.14+/fork), on change. The
+                            // client uses this both to display the value and to
+                            // know that setting it is supported.
+                            if tx_filter_known && prev_tx_filter != Some((tx_filter_low, tx_filter_high)) {
+                                prev_tx_filter = Some((tx_filter_low, tx_filter_high));
+                                let pkt = TxFilterBandPacket { low_hz: tx_filter_low, high_hz: tx_filter_high };
+                                let mut buf = [0u8; TxFilterBandPacket::SIZE];
+                                pkt.serialize(&mut buf);
+                                for addr in &all_addrs {
+                                    let _ = socket.try_send_to(&buf, *addr);
+                                }
+                            }
+
                             // TX profile names — only on change
                             if !tx_profile_names.is_empty() && tx_profile_names != prev_tx_profile_names {
                                 prev_tx_profile_names = tx_profile_names.clone();
@@ -1837,6 +1860,7 @@ impl NetworkService {
         let mut playout_tick = interval(Duration::from_millis(20));
         let mut pending_filter_low: Option<i32> = None;
         let mut pending_rx2_filter_low: Option<i32> = None;
+        let mut pending_tx_filter_low: Option<i32> = None;
 
         // Yaesu TX audio: forward AudioYaesu packets to a separate decode task
         let mut yaesu_ptt_active = false;
@@ -2258,7 +2282,16 @@ impl NetworkService {
                             self.ptt.lock().await.set_vfo_a_freq(freq_pkt.frequency_hz).await;
                         }
                         Packet::Mode(mode_pkt) => {
-                            self.ptt.lock().await.set_vfo_a_mode(mode_pkt.mode).await;
+                            // Thetis-bug workaround: a VFO-A mode change during TX
+                            // is shown by the indication but NOT applied by Thetis
+                            // → desync. Drop it while transmitting so Thetis never
+                            // gets a mid-TX mode change (covers stock + fork, any client).
+                            let mut ptt = self.ptt.lock().await;
+                            if ptt.is_transmitting() {
+                                info!("Client {} VFO-A mode change ignored during TX", addr);
+                            } else {
+                                ptt.set_vfo_a_mode(mode_pkt.mode).await;
+                            }
                         }
                         Packet::Smeter(_) => {} // server-only, ignore from clients
                         Packet::Spectrum(_) | Packet::FullSpectrum(_) => {} // server-only, ignore from clients
@@ -2566,7 +2599,8 @@ impl NetworkService {
                         | Packet::SmeterSig(_) | Packet::SmeterMaxBin(_)
                         | Packet::SmeterRx2Sig(_) | Packet::SmeterRx2MaxBin(_)
                         | Packet::AudioVrx(_)
-                        | Packet::SpectrumVrx1(_) | Packet::SpectrumVrx2(_) => {}
+                        | Packet::SpectrumVrx1(_) | Packet::SpectrumVrx2(_)
+                        | Packet::FrequencyVrxActual(_) | Packet::TxFilterBand(_) => {}
                         // Server→client only, ignore if received
                         Packet::Spot(_) | Packet::TxProfiles(_) | Packet::YaesuState(_)
                         | Packet::AmplitecPowerTable(_)
@@ -2767,6 +2801,24 @@ impl NetworkService {
                                         .unwrap_or(ptt.filter_low_hz());
                                     info!("Client {} filter: {} .. {} Hz", addr, low, high);
                                     ptt.set_filter(low, high).await;
+                                }
+                                ControlId::TxFilterLow => {
+                                    // Buffer low edge; apply combined with high edge.
+                                    pending_tx_filter_low = Some(ctrl.value as i16 as i32);
+                                }
+                                ControlId::TxFilterHigh => {
+                                    let high = ctrl.value as i16 as i32;
+                                    let low = pending_tx_filter_low.take()
+                                        .unwrap_or(ptt.tx_filter_low_hz());
+                                    // Defensive clamp/sort at the server boundary — the TX
+                                    // path is sensitive; an old/corrupt client could send
+                                    // out-of-range or reversed edges. Bound 0..=8000
+                                    // (TX audio is 16 kS/s → Nyquist 8 kHz), low<=high.
+                                    let lo = low.clamp(0, 8000);
+                                    let hi = high.clamp(0, 8000);
+                                    let (lo, hi) = (lo.min(hi), lo.max(hi));
+                                    info!("Client {} TX filter: {} .. {} Hz", addr, lo, hi);
+                                    ptt.set_tx_filter_band(lo, hi).await;
                                 }
                                 ControlId::ThetisStarting => {} // server→client only
                                 ControlId::Rx2Enable => {
@@ -3432,6 +3484,28 @@ impl NetworkService {
                                     if VRX2_HR_SPAN_KHZ.load(Ordering::Relaxed) != 0 {
                                         VRX2_HR_SPAN_KHZ.store(ctrl.value.max(1), Ordering::Relaxed);
                                     }
+                                }
+                                // --- VRX wide / synchronous-AM UX (PATCH-vrx-wide-sam-ux) ---
+                                ControlId::VrxAudioRate => {
+                                    // 0=NB, 1=WB, 2=Auto. One setting for both VRX;
+                                    // the audio loop resolves the per-VRX rate.
+                                    VRX_AUDIO_RATE_MODE.store((ctrl.value & 0xFF) as u8, Ordering::Relaxed);
+                                    info!("Client {} VRX audio-rate mode: {}", addr,
+                                        match ctrl.value { 0 => "NB", 1 => "WB", _ => "Auto" });
+                                }
+                                ControlId::VrxSamAutoTune => {
+                                    // Per-client subscription only — the audio loop
+                                    // derives the per-VRX AFC enable as the aggregate
+                                    // (any active subscriber) before each feed, so one
+                                    // client never flips another client's AFC.
+                                    let on = ctrl.value != 0;
+                                    self.session.lock().await.set_vrx_autotune(addr, 0, on);
+                                    info!("Client {} VRX1 SAM auto-tune: {}", addr, if on { "ON" } else { "OFF" });
+                                }
+                                ControlId::VrxSamAutoTune2 => {
+                                    let on = ctrl.value != 0;
+                                    self.session.lock().await.set_vrx_autotune(addr, 1, on);
+                                    info!("Client {} VRX2 SAM auto-tune: {}", addr, if on { "ON" } else { "OFF" });
                                 }
                                 // --- Dual-radio slot 1 controls (Optie B-prime) ---
                                 // Spiegel van de slot-0 Yaesu-controls, geroute naar yaesu2.

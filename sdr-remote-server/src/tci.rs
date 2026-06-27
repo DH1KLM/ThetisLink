@@ -187,6 +187,10 @@ pub struct TciConnection {
     /// Stock v2.10.3.14: tx_filter_band_ex (Hz)
     pub tx_filter_low_hz: i32,
     pub tx_filter_high_hz: i32,
+    /// True zodra Thetis ten minste één tx_filter_band_ex heeft gemeld →
+    /// TX-filter is instelbaar (stock 2.10.3.14+ / fork). De client gebruikt
+    /// dit (via de TxFilterBand-push) om de TX-bandbreedte-UI te activeren.
+    pub tx_filter_known: bool,
     pub diversity_enabled: bool,
     /// Last-known Thetis "Receive only" (RXOnly) state, tracked via the
     /// `rx_only_ex` echo. The TL-server snapshots this before taking over
@@ -374,6 +378,7 @@ impl TciConnection {
             preamp_att_rx2: 0,
             tx_filter_low_hz: 0,
             tx_filter_high_hz: 0,
+            tx_filter_known: false,
             ddc_sample_rate_rx1: 0,
             ddc_sample_rate_rx2: 0,
             ddc_sample_rates: Vec::new(),
@@ -1200,6 +1205,7 @@ impl TciConnection {
             TciNotification::TxFilterBandEx { low, high } => {
                 self.tx_filter_low_hz = low;
                 self.tx_filter_high_hz = high;
+                self.tx_filter_known = true;
                 log::debug!("TCI: tx_filter_band_ex = {} .. {} Hz", low, high);
             }
             TciNotification::TxFrequencyEx { freq, band, rx2_enabled, tx_vfob } => {
@@ -1394,6 +1400,13 @@ impl TciConnection {
         self.send("rx_ctun_ex:1;").await;
         self.send("agc_auto_ex;").await;
         self.send("vfo_sync_ex;").await;
+        // Read the current TX modulation filter band at connect so the desktop
+        // "Follow RX bandwidth" feature is available immediately. Without this
+        // the server only learns the band when the operator first changes it in
+        // Thetis (tx_filter_known stays false → no push → follow disabled until
+        // a server restart happened to catch a push). Stock v2.10.3.14+; echoes
+        // back via the tx_filter_band_ex notification.
+        self.send("tx_filter_band_ex;").await;
         // Sentinel cap: enable_ex is canonical "diversity-suite present" indicator on the
         // TL2-fork (advertises per-command caps; presence of enable implies the rest).
         if self.has_cap("diversity_enable_ex") {
