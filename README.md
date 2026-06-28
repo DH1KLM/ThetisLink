@@ -7,8 +7,8 @@
 > carrier). Each VRX gains its own **NB/WB/Auto audio rate**. **Settable TX
 > modulation bandwidth** in the desktop Thetis tab: follow the RX filter, or set
 > independent low/high edges (0–8 kHz). Built on the **virtual receivers
-> (VRX1/VRX2)** and **dual-radio** (second Yaesu FT-991A/FTX-1) introduced in
-> v2.2.0. Illustrated explainers are online — see **Documentation** below.
+> (VRX1/VRX2)** and **dual-radio** (up to two parallel Yaesu radios — FT-991A
+> and/or FTX-1 — alongside Thetis) introduced in v2.2.0. Illustrated explainers are online — see **Documentation** below.
 > **Backwards-compatible with v2.1.x / v2.2.0** — wire-protocol `VERSION` 3
 > unchanged (new types are additive and per-client gated); pair with **Thetis
 > fork PA3GHM TL2-4** for the full feature-set, stock Thetis remains supported.
@@ -33,7 +33,7 @@ radio control over the network via TCI WebSocket.
 - Spectrum and waterfall display (up to 1536 kHz with the PA3GHM Thetis fork)
 - Full RX2/VFO-B support with diversity reception
 - External device control: Amplitec 6/2 (auto-reconnect over USB), two StockCorner JC-4s/JC-3s tuners in parallel (MCP2221A USB-HID), SPE Expert 1.3K-FA, RF2K-S, UltraBeam RCU-06, and three rotor backends — EA7HG Visual Rotor, PstRotator, and direct Yaesu G-1000DXC via MCP2221A (5 V breakout, BST82 gate switches, position-feedback ADC)
-- Yaesu FT-991A as second radio (CAT + USB audio)
+- Up to two Yaesu radios (FT-991A and/or FTX-1, any mix) running in parallel as independent channels alongside the Thetis SDR — each with its own CAT COM port, USB audio, frequency, mode, PTT and memory channels (model auto-detected)
 - MIDI controller support (desktop + Android)
 - DX Cluster with spectrum overlay
 - Mandatory password authentication (HMAC-SHA256) with optional TOTP 2FA
